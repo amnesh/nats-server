@@ -16,6 +16,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -707,7 +708,11 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 					conn, err = establishHTTPProxyTunnel(proxyURL, targetHost, proxyTimeout, proxyUsername, proxyPassword)
 				} else {
 					// Direct connection
-					conn, err = natsDialTimeout("tcp", url, dialTimeout)
+					if opts.LeafNode.CustomDialer != nil {
+						conn, err = opts.LeafNode.CustomDialer.Dial("tcp", url)
+					} else {
+						conn, err = natsDialTimeout("tcp", url, dialTimeout)
+					}
 				}
 			}
 		}
@@ -887,7 +892,14 @@ func (s *Server) startLeafNodeAcceptLoop() {
 
 	s.mu.Lock()
 	hp := net.JoinHostPort(opts.LeafNode.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
+	var l net.Listener
+	var e error
+	// If we have a custom listen config, use that.
+	if opts.CustomLeafListenConfig != nil {
+		l, e = opts.CustomLeafListenConfig.Listen(context.Background(), "tcp", hp)
+	} else {
+		l, e = natsListen("tcp", hp)
+	}
 	s.leafNodeListenerErr = e
 	if e != nil {
 		s.mu.Unlock()
