@@ -18,6 +18,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"reflect"
 	"slices"
@@ -1566,6 +1567,7 @@ func imposeOrder(value any) error {
 		*OCSPConfig, map[string]string, map[string]bool, JSLimitOpts, StoreCipher, *OCSPResponseCacheConfig, *ProxiesConfig, WriteTimeoutPolicy:
 		// explicitly skipped types
 	case *AuthCallout:
+	case *net.ListenConfig:
 	case JSTpmOpts:
 	default:
 		// this will fail during unit tests
