@@ -1256,7 +1256,9 @@ func (s *Server) startWebsocketServer() {
 	if o.TLSConfig != nil {
 		proto = wsSchemePrefixTLS
 		config = o.TLSConfig.Clone()
-		config.GetConfigForClient = s.wsGetTLSConfig
+		if config.GetConfigForClient == nil {
+			config.GetConfigForClient = s.wsGetTLSConfig
+		}
 	} else {
 		proto = wsSchemePrefix
 	}

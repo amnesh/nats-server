@@ -201,12 +201,20 @@ type LeafNodeOpts struct {
 	IsolateLeafnodeInterest bool `json:"-"`
 
 	// Not exported, for tests.
-	resolver    netResolver
+	resolver netResolver
+	// when using custom dialer, dialTimeout is ignored
 	dialTimeout time.Duration
 	connDelay   time.Duration
 
 	// Snapshot of configured TLS options.
 	tlsConfigOpts *TLSConfigOpts
+
+	// CustomDialer is used to override the default dialer.
+	CustomDialer CustomDialer
+}
+
+type CustomDialer interface {
+	Dial(network, address string) (net.Conn, error)
 }
 
 // SignatureHandler is used to sign a nonce from the server while
@@ -484,6 +492,10 @@ type Options struct {
 
 	// Proxies configuration.
 	Proxies *ProxiesConfig
+
+	// CustomListenConfig
+	CustomListenConfig     *net.ListenConfig
+	CustomLeafListenConfig *net.ListenConfig
 
 	// private fields, used to know if bool options are explicitly
 	// defined in config and/or command line params.

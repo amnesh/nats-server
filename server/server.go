@@ -809,7 +809,7 @@ func NewServer(opts *Options) (*Server, error) {
 	}
 
 	if opts.TLSRateLimit > 0 {
-		s.connRateCounter = newRateCounter(opts.tlsConfigOpts.RateLimit)
+		s.connRateCounter = newRateCounter(opts.TLSRateLimit)
 	}
 
 	// Trusted root operator keys.
@@ -2864,6 +2864,9 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 func (s *Server) getServerListener(hp string) (net.Listener, error) {
 	if s.listener != nil {
 		return s.listener, s.listenerErr
+	}
+	if s.opts.CustomListenConfig != nil {
+		return s.opts.CustomListenConfig.Listen(context.Background(), "tcp", hp)
 	}
 
 	return natsListen("tcp", hp)
