@@ -707,9 +707,16 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 
 					conn, err = establishHTTPProxyTunnel(proxyURL, targetHost, proxyTimeout, proxyUsername, proxyPassword)
 				} else {
-					// Direct connection
-					if opts.LeafNode.CustomDialer != nil {
-						conn, err = opts.LeafNode.CustomDialer.Dial("tcp", url)
+					// Direct connection. Prefer the timeout-aware form of the custom
+					// dialer when it's available so a misbehaving dialer can't hang
+					// the reconnect loop. Implementations that only satisfy the base
+					// CustomDialer are responsible for honoring their own timeouts.
+					if cd := opts.LeafNode.CustomDialer; cd != nil {
+						if cdt, ok := cd.(CustomDialerWithTimeout); ok {
+							conn, err = cdt.DialTimeout("tcp", url, dialTimeout)
+						} else {
+							conn, err = cd.Dial("tcp", url)
+						}
 					} else {
 						conn, err = natsDialTimeout("tcp", url, dialTimeout)
 					}
