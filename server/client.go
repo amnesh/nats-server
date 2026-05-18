@@ -4316,6 +4316,8 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		c.mqttHandlePubRetain()
 	}
 
+	msg = c.stampRequestInfoHeaderIfNeeded(msg)
+
 	// Doing this inline as opposed to create a function (which otherwise has a measured
 	// performance impact reported in our bench)
 	var isGWRouted bool

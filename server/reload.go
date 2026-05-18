@@ -1298,6 +1298,19 @@ func (l *noFastProdStallReload) Apply(s *Server) {
 	s.Noticef("Reloaded: fast producers will %sbe stalled", not)
 }
 
+type stampRequestInfoReload struct {
+	noopOption
+	stamp bool
+}
+
+func (l *stampRequestInfoReload) Apply(s *Server) {
+	var not string
+	if !l.stamp {
+		not = "not "
+	}
+	s.Noticef("Reloaded: inbound requests will %sbe stamped with client info", not)
+}
+
 // Compares options and disconnects clients that are no longer listed in pinned certs. Lock must not be held.
 func (s *Server) recheckPinnedCerts(curOpts *Options, newOpts *Options) {
 	s.mu.Lock()
@@ -1959,6 +1972,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			continue
 		case "nofastproducerstall":
 			diffOpts = append(diffOpts, &noFastProdStallReload{noStall: newValue.(bool)})
+		case "stamprequestinfo":
+			diffOpts = append(diffOpts, &stampRequestInfoReload{stamp: newValue.(bool)})
 		case "proxies":
 			new := newValue.(*ProxiesConfig)
 			old := oldValue.(*ProxiesConfig)
