@@ -1530,6 +1530,14 @@ func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
 	// applications starting NATS Server programmatically).
 	newOpts.CustomClientAuthentication = curOpts.CustomClientAuthentication
 	newOpts.CustomRouterAuthentication = curOpts.CustomRouterAuthentication
+	// Programmatic-only hooks (cannot be expressed in the config file). Carry
+	// them forward so a file-based reload doesn't trip diffOptions, and so a
+	// caller using ReloadOptions doesn't have to re-supply them every time.
+	// These are bound at listener-create time and have no effect at reload, so
+	// preserving the previous value is the only meaningful behavior.
+	newOpts.CustomListenConfig = curOpts.CustomListenConfig
+	newOpts.CustomLeafListenConfig = curOpts.CustomLeafListenConfig
+	newOpts.LeafNode.CustomDialer = curOpts.LeafNode.CustomDialer
 
 	// Do the validation before checking for differences. We need to ensure
 	// that the new options are valid. Note that there are possible side
