@@ -378,6 +378,7 @@ type Options struct {
 	MaxPayload                 int32         `json:"max_payload"`
 	MaxPending                 int64         `json:"max_pending"`
 	NoFastProducerStall        bool          `json:"-"`
+	StampRequestInfo           bool          `json:"-"`
 	Cluster                    ClusterOpts   `json:"cluster,omitempty"`
 	Gateway                    GatewayOpts   `json:"gateway,omitempty"`
 	LeafNode                   LeafNodeOpts  `json:"leaf,omitempty"`
@@ -1802,6 +1803,8 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		}
 	case "no_fast_producer_stall":
 		o.NoFastProducerStall = v.(bool)
+	case "stamp_request_info":
+		o.StampRequestInfo = v.(bool)
 	case "max_closed_clients":
 		o.MaxClosedClients = int(v.(int64))
 	case "proxies":
