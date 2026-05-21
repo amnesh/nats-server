@@ -16,6 +16,7 @@ package server
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -787,8 +788,19 @@ func connectToRemoteLeafNode(s *Server, remote *leafNodeCfg, firstConnect bool) 
 
 					conn, err = establishHTTPProxyTunnel(proxyURL, targetHost, proxyTimeout, proxyUsername, proxyPassword)
 				} else {
-					// Direct connection
-					conn, err = natsDialTimeout("tcp", url, dialTimeout)
+					// Direct connection. Prefer the timeout-aware form of the custom
+					// dialer when it's available so a misbehaving dialer can't hang
+					// the reconnect loop. Implementations that only satisfy the base
+					// CustomDialer are responsible for honoring their own timeouts.
+					if cd := opts.LeafNode.CustomDialer; cd != nil {
+						if cdt, ok := cd.(CustomDialerWithTimeout); ok {
+							conn, err = cdt.DialTimeout("tcp", url, dialTimeout)
+						} else {
+							conn, err = cd.Dial("tcp", url)
+						}
+					} else {
+						conn, err = natsDialTimeout("tcp", url, dialTimeout)
+					}
 				}
 			}
 		}
@@ -978,7 +990,14 @@ func (s *Server) startLeafNodeAcceptLoop() {
 
 	s.mu.Lock()
 	hp := net.JoinHostPort(opts.LeafNode.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
+	var l net.Listener
+	var e error
+	// If we have a custom listen config, use that.
+	if opts.CustomLeafListenConfig != nil {
+		l, e = opts.CustomLeafListenConfig.Listen(context.Background(), "tcp", hp)
+	} else {
+		l, e = natsListen("tcp", hp)
+	}
 	s.leafNodeListenerErr = e
 	if e != nil {
 		s.mu.Unlock()
