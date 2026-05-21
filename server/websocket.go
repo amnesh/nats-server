@@ -1280,7 +1280,22 @@ func (s *Server) startWebsocketServer() {
 	if o.TLSConfig != nil {
 		proto = wsSchemePrefixTLS
 		config = o.TLSConfig.Clone()
-		config.GetConfigForClient = s.wsGetTLSConfig
+		// wsGetTLSConfig is how websocket TLS hot-reload reaches an already-bound
+		// listener — it re-reads opts.Websocket.TLSConfig per handshake. If the
+		// caller supplied their own GetConfigForClient (e.g. dynamic SNI), chain
+		// it so a nil (cfg, err) return falls back to the reload-aware default;
+		// non-nil cfg or non-nil err short-circuits to honor the caller's choice.
+		if userGCFC := config.GetConfigForClient; userGCFC != nil {
+			config.GetConfigForClient = func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+				cfg, err := userGCFC(hi)
+				if err != nil || cfg != nil {
+					return cfg, err
+				}
+				return s.wsGetTLSConfig(hi)
+			}
+		} else {
+			config.GetConfigForClient = s.wsGetTLSConfig
+		}
 	} else {
 		proto = wsSchemePrefix
 	}
