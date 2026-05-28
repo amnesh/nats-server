@@ -490,3 +490,344 @@ func TestLeafNodeDirectServiceRequestSharesRequestUserInfo(t *testing.T) {
 		t.Fatal("Did not receive service request")
 	}
 }
+
+// runStampReqInfoServer starts a single server with stamp_request_info enabled
+// and an account A holding a "req" (requestor) and "svc" (service) user.
+func runStampReqInfoServer(t *testing.T) (*server.Server, *server.Options) {
+	t.Helper()
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		stamp_request_info: true
+
+		accounts: {
+			A: {
+				users: [
+					{user: req, password: pwd}
+					{user: svc, password: pwd}
+				]
+			}
+		}
+	`))
+	t.Cleanup(func() { os.Remove(conf) })
+	srv, opts := RunServerWithConfig(conf)
+	t.Cleanup(srv.Shutdown)
+	return srv, opts
+}
+
+// A plain publish (no reply subject) is not a request, so even with the option
+// enabled the server must not stamp it.
+func TestStampRequestInfoNotStampedWithoutReply(t *testing.T) {
+	_, opts := runStampReqInfoServer(t)
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://svc:pwd@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	hdrCh := make(chan string, 1)
+	if _, err := svcNC.Subscribe("svc.event", func(msg *nats.Msg) {
+		hdrCh <- msg.Header.Get(server.ClientInfoHdr)
+	}); err != nil {
+		t.Fatalf("Error subscribing: %v", err)
+	}
+	svcNC.Flush()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://req:pwd@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	// Fire-and-forget: no reply subject.
+	if err := reqNC.Publish("svc.event", []byte("ping")); err != nil {
+		t.Fatalf("Error publishing: %v", err)
+	}
+	reqNC.Flush()
+
+	select {
+	case hdr := <-hdrCh:
+		if hdr != "" {
+			t.Fatalf("Expected no CI header on a non-request publish, got %q", hdr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive published message")
+	}
+}
+
+// Requests on the internal subject spaces ($JS./$KV./$O./$MQTT./$NRG.) must not
+// be stamped, while a request on any other $-prefixed subject is stamped.
+func TestStampRequestInfoSkippedSubjects(t *testing.T) {
+	_, opts := runStampReqInfoServer(t)
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://svc:pwd@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://req:pwd@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	check := func(t *testing.T, subject string, wantStamped bool) {
+		t.Helper()
+		hdrCh := make(chan string, 1)
+		sub, err := svcNC.Subscribe(subject, func(msg *nats.Msg) {
+			hdrCh <- msg.Header.Get(server.ClientInfoHdr)
+			_ = msg.Respond([]byte("ok"))
+		})
+		if err != nil {
+			t.Fatalf("Error subscribing to %q: %v", subject, err)
+		}
+		defer sub.Unsubscribe()
+		svcNC.Flush()
+
+		if _, err := reqNC.Request(subject, []byte("hello"), time.Second); err != nil {
+			t.Fatalf("Request to %q failed: %v", subject, err)
+		}
+		select {
+		case hdr := <-hdrCh:
+			if wantStamped && hdr == "" {
+				t.Fatalf("Subject %q: expected a CI header, got none", subject)
+			}
+			if !wantStamped && hdr != "" {
+				t.Fatalf("Subject %q: expected no CI header, got %q", subject, hdr)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("Subject %q: did not receive request", subject)
+		}
+	}
+
+	// Note: $NRG.* is also skipped, but a normal client is blocked from
+	// publishing there (pubPermissionViolation) before stamping is reached, so
+	// it cannot be exercised over the wire. It is covered by the unit tests
+	// TestSkipRequestInfoStamp and TestStampRequestInfoHeaderIfNeeded instead.
+	for _, subject := range []string{
+		"$JS.API.STREAM.INFO.foo",
+		"$KV.bucket.key",
+		"$O.obj.chunk",
+		"$MQTT.msgs.foo",
+	} {
+		t.Run("skipped/"+subject, func(t *testing.T) { check(t, subject, false) })
+	}
+
+	// A $-prefixed subject that is not one of the skipped spaces is stamped.
+	t.Run("stamped/$XYZ.req", func(t *testing.T) { check(t, "$XYZ.req", true) })
+}
+
+// A client must not be able to spoof the request info: a ClientInfoHdr supplied
+// by the requestor is overwritten with the server's authoritative value.
+func TestStampRequestInfoClientCannotSpoofHeader(t *testing.T) {
+	_, opts := runStampReqInfoServer(t)
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://svc:pwd@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	ciCh := make(chan string, 1)
+	if _, err := svcNC.Subscribe("svc.echo", func(msg *nats.Msg) {
+		ciCh <- msg.Header.Get(server.ClientInfoHdr)
+		_ = msg.Respond([]byte("ok"))
+	}); err != nil {
+		t.Fatalf("Error subscribing: %v", err)
+	}
+	svcNC.Flush()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://req:pwd@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	msg := nats.NewMsg("svc.echo")
+	msg.Data = []byte("hello")
+	// Attempt to impersonate the admin account/user.
+	msg.Header.Set(server.ClientInfoHdr, `{"acc":"SYS","user":"admin"}`)
+	if _, err := reqNC.RequestMsg(msg, time.Second); err != nil {
+		t.Fatalf("Unexpected request error: %v", err)
+	}
+
+	select {
+	case hdr := <-ciCh:
+		if hdr == "" {
+			t.Fatal("Expected server-stamped CI header")
+		}
+		var ci server.ClientInfo
+		if err := json.Unmarshal([]byte(hdr), &ci); err != nil {
+			t.Fatalf("Error unmarshaling CI %q: %v", hdr, err)
+		}
+		if ci.Account != "A" || ci.User != "req" {
+			t.Fatalf("Spoofed values not overwritten, got acc=%q user=%q", ci.Account, ci.User)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive service request")
+	}
+}
+
+// Stamping must preserve any other headers the requestor set on the message.
+func TestStampRequestInfoPreservesExistingHeaders(t *testing.T) {
+	_, opts := runStampReqInfoServer(t)
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://svc:pwd@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	type capture struct {
+		trace string
+		ci    string
+	}
+	ch := make(chan capture, 1)
+	if _, err := svcNC.Subscribe("svc.echo", func(msg *nats.Msg) {
+		ch <- capture{trace: msg.Header.Get("X-Trace-Id"), ci: msg.Header.Get(server.ClientInfoHdr)}
+		_ = msg.Respond([]byte("ok"))
+	}); err != nil {
+		t.Fatalf("Error subscribing: %v", err)
+	}
+	svcNC.Flush()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://req:pwd@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	msg := nats.NewMsg("svc.echo")
+	msg.Data = []byte("hello")
+	msg.Header.Set("X-Trace-Id", "abc123")
+	if _, err := reqNC.RequestMsg(msg, time.Second); err != nil {
+		t.Fatalf("Unexpected request error: %v", err)
+	}
+
+	select {
+	case c := <-ch:
+		if c.trace != "abc123" {
+			t.Fatalf("Existing header lost, X-Trace-Id=%q", c.trace)
+		}
+		if c.ci == "" {
+			t.Fatal("Expected CI header alongside existing headers")
+		}
+		var ci server.ClientInfo
+		if err := json.Unmarshal([]byte(c.ci), &ci); err != nil {
+			t.Fatalf("Error unmarshaling CI %q: %v", c.ci, err)
+		}
+		if ci.User != "req" {
+			t.Fatalf("Unexpected CI user %q", ci.User)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive service request")
+	}
+}
+
+// The trimmed CI carries the requestor's connection metadata: kind, client
+// type, language and host.
+func TestStampRequestInfoFullClientInfoFields(t *testing.T) {
+	_, opts := runStampReqInfoServer(t)
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://svc:pwd@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	ciCh := make(chan *server.ClientInfo, 1)
+	if _, err := svcNC.Subscribe("svc.echo", func(msg *nats.Msg) {
+		var ci server.ClientInfo
+		if hdr := msg.Header.Get(server.ClientInfoHdr); hdr != "" {
+			if err := json.Unmarshal([]byte(hdr), &ci); err != nil {
+				t.Errorf("Error unmarshaling CI: %v", err)
+			}
+		}
+		ciCh <- &ci
+		_ = msg.Respond([]byte("ok"))
+	}); err != nil {
+		t.Fatalf("Error subscribing: %v", err)
+	}
+	svcNC.Flush()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://req:pwd@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	if _, err := reqNC.Request("svc.echo", []byte("hello"), time.Second); err != nil {
+		t.Fatalf("Unexpected request error: %v", err)
+	}
+
+	select {
+	case ci := <-ciCh:
+		if ci.Kind != "Client" {
+			t.Fatalf("Expected kind Client, got %q", ci.Kind)
+		}
+		if ci.ClientType != "nats" {
+			t.Fatalf("Expected client type nats, got %q", ci.ClientType)
+		}
+		if ci.Lang != "go" {
+			t.Fatalf("Expected lang go, got %q", ci.Lang)
+		}
+		if ci.Host == "" {
+			t.Fatal("Expected non-empty host")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive service request")
+	}
+}
+
+// Token-based auth must never leak the token: the stamped CI user is redacted.
+func TestStampRequestInfoTokenAuthUserRedacted(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		listen: 127.0.0.1:-1
+		stamp_request_info: true
+		authorization { token: s3cr3t }
+	`))
+	defer os.Remove(conf)
+	srv, opts := RunServerWithConfig(conf)
+	defer srv.Shutdown()
+
+	svcNC, err := nats.Connect(fmt.Sprintf("nats://s3cr3t@%s:%d", opts.Host, opts.Port))
+	if err != nil {
+		t.Fatalf("Error connecting service: %v", err)
+	}
+	defer svcNC.Close()
+
+	ciCh := make(chan *server.ClientInfo, 1)
+	if _, err := svcNC.Subscribe("svc.echo", func(msg *nats.Msg) {
+		var ci server.ClientInfo
+		if hdr := msg.Header.Get(server.ClientInfoHdr); hdr != "" {
+			if err := json.Unmarshal([]byte(hdr), &ci); err != nil {
+				t.Errorf("Error unmarshaling CI: %v", err)
+			}
+		}
+		ciCh <- &ci
+		_ = msg.Respond([]byte("ok"))
+	}); err != nil {
+		t.Fatalf("Error subscribing: %v", err)
+	}
+	svcNC.Flush()
+
+	reqNC, err := nats.Connect(fmt.Sprintf("nats://s3cr3t@%s:%d", opts.Host, opts.Port), nats.Name("requestor"))
+	if err != nil {
+		t.Fatalf("Error connecting requester: %v", err)
+	}
+	defer reqNC.Close()
+
+	if _, err := reqNC.Request("svc.echo", []byte("hello"), time.Second); err != nil {
+		t.Fatalf("Unexpected request error: %v", err)
+	}
+
+	select {
+	case ci := <-ciCh:
+		if ci.User != "[REDACTED]" {
+			t.Fatalf("Expected redacted token user, got %q", ci.User)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Did not receive service request")
+	}
+}
