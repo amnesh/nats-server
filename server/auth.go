@@ -637,7 +637,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		// narrow its claims. Fails closed. Runs before the auth-callout handling
 		// below so a rejection flows through the normal auth-error event path.
 		if authorized && s.authVerificationApplies(c, juc, acc, opts) {
-			if ok, vreason := s.processAuthVerification(c, juc, acc, ujwt); !ok {
+			if ok, vreason := s.authVerifyConnection(c, juc, acc, ujwt); !ok {
 				c.Debugf("Auth verification rejected connection: %s", vreason)
 				authorized = false
 			}

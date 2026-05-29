@@ -336,6 +336,11 @@ type client struct {
 	// if we want to report a different error, we can now set this field
 	// and `authViolation()` will use that one.
 	authErr error
+
+	// Cached authentication-verification verdict (see auth_verification.go). Set
+	// once at admission so a reload re-auth can re-apply any narrowing locally
+	// instead of contacting the verification service again.
+	authVerify *authVerifyState
 }
 
 type rrTracking struct {

@@ -198,6 +198,66 @@ func TestAuthVerifyOperatorNarrow(t *testing.T) {
 	}
 }
 
+// A reload re-authenticates existing clients (reloadAuthorization -> per-client
+// isClientAuthorized). Verification must reuse the verdict cached at admission and
+// re-apply the narrowing locally, with no second network round-trip: a reload
+// re-registers from the raw JWT (dropping the narrowing) and a slow/absent
+// verifier would otherwise fail closed and disconnect an already-admitted client.
+// Here the verifier is stopped before the re-auth to prove no round-trip happens.
+func TestAuthVerifyReloadReusesCachedVerdict(t *testing.T) {
+	s, skp, tkp := runAuthVerifyOperatorServer(t)
+	defer s.Shutdown()
+	rc := startAuthVerifyResponder(t, s, skp)
+
+	errCh := make(chan error, 8)
+	nc, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, tkp), nats.Token("narrow"),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { errCh <- e }))
+	require_NoError(t, err)
+	defer nc.Close()
+	require_NoError(t, nc.Flush())
+
+	// Locate the server-side client for this (non system-account) connection.
+	var c *client
+	checkFor(t, 2*time.Second, 15*time.Millisecond, func() error {
+		sys := s.SystemAccount()
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		for _, cl := range s.clients {
+			cl.mu.Lock()
+			acc, kind := cl.acc, cl.kind
+			cl.mu.Unlock()
+			if kind == CLIENT && acc != nil && acc != sys {
+				c = cl
+				return nil
+			}
+		}
+		return fmt.Errorf("client not registered yet")
+	})
+
+	// Stop the verification service. A re-auth that did another round-trip would
+	// now fail closed.
+	rc.Close()
+
+	// Re-authenticate exactly as a config reload would.
+	if ok := s.isClientAuthorized(c); !ok {
+		t.Fatal("re-auth should reuse the cached verdict and admit without the verifier")
+	}
+
+	// Narrowing must still be in force after the re-auth.
+	require_NoError(t, nc.Publish("allowed.foo", nil))
+	require_NoError(t, nc.Flush())
+	require_NoError(t, nc.Publish("denied.foo", nil))
+	nc.Flush()
+	select {
+	case e := <-errCh:
+		if !strings.Contains(strings.ToLower(e.Error()), "permission") {
+			t.Fatalf("expected a permissions violation, got %v", e)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a permissions violation after reload (narrowing preserved)")
+	}
+}
+
 func TestAuthVerifyOperatorFailClosedOnTimeout(t *testing.T) {
 	s, _, tkp := runAuthVerifyOperatorServer(t)
 	defer s.Shutdown()

@@ -135,9 +135,36 @@ func narrowResponse(base, override *jwt.ResponsePermission) *jwt.ResponsePermiss
 	if override == nil {
 		return out
 	}
-	out.MaxMsgs = int(NarrowCount(int64(base.MaxMsgs), int64(override.MaxMsgs)))
-	out.Expires = time.Duration(NarrowExpiry(int64(base.Expires), int64(override.Expires)))
+	out.MaxMsgs = int(narrowRespLimit(int64(base.MaxMsgs), int64(override.MaxMsgs)))
+	out.Expires = time.Duration(narrowRespLimit(int64(base.Expires), int64(override.Expires)))
 	return out
+}
+
+// narrowRespLimit returns the more restrictive of two response-permission limits
+// (MaxMsgs or Expires) in the server's enforcement domain. There, a limit is
+// only applied when it is strictly positive: a negative value means "unlimited"
+// and 0 selects the server default (a small finite value). An override can
+// therefore only tighten the verified base: it may lower a positive base, and it
+// may replace an unlimited (negative) base with a concrete positive limit, but it
+// can never relax base. A 0 base is left untouched so the server default applies
+// and an override cannot raise it. This differs from NarrowCount/NarrowExpiry,
+// whose single-sentinel domains do not match these per-field "<= 0 == no limit"
+// semantics and would let a non-positive override escalate.
+func narrowRespLimit(base, override int64) int64 {
+	// A non-positive override imposes no concrete limit, so it can never tighten
+	// base: keep base.
+	if override <= 0 {
+		return base
+	}
+	// override is a concrete positive limit. It tightens an unlimited (negative)
+	// base or a larger positive base; a 0 base keeps the (smaller) default.
+	if base < 0 {
+		return override
+	}
+	if base > 0 && override < base {
+		return override
+	}
+	return base
 }
 
 // NarrowExpiry returns the sooner of two expirations where 0 means "never". An

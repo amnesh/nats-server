@@ -81,6 +81,36 @@ func TestAuthVerifyNarrowResponsePermission(t *testing.T) {
 	}
 }
 
+// A negative override response limit means "unlimited" at enforcement
+// (server enforces only when the limit is > 0), so it must not relax the
+// verified user's concrete limit. Regression: a negative override survived
+// narrowing and silently disabled the cap (an escalation).
+func TestAuthVerifyNarrowResponseNegativeNoEscalation(t *testing.T) {
+	base := &jwt.Permissions{Resp: &jwt.ResponsePermission{MaxMsgs: 5, Expires: 30 * time.Second}}
+	override := &jwt.Permissions{Resp: &jwt.ResponsePermission{MaxMsgs: -2, Expires: -1}}
+
+	got := NarrowPermissions(base, override)
+
+	if got.Resp == nil || got.Resp.MaxMsgs != 5 || got.Resp.Expires != 30*time.Second {
+		t.Fatalf("expected response {5, 30s} (negative override must not relax), got %+v", got.Resp)
+	}
+}
+
+// A base response limit of 0 selects the server default (a small finite value),
+// not "unlimited"; an override must not be able to raise it. Regression: base 0
+// was treated as the unlimited sentinel so a larger override escalated the
+// effective limit.
+func TestAuthVerifyNarrowResponseZeroBaseNoEscalation(t *testing.T) {
+	base := &jwt.Permissions{Resp: &jwt.ResponsePermission{MaxMsgs: 0, Expires: 0}}
+	override := &jwt.Permissions{Resp: &jwt.ResponsePermission{MaxMsgs: 100, Expires: time.Hour}}
+
+	got := NarrowPermissions(base, override)
+
+	if got.Resp == nil || got.Resp.MaxMsgs != 0 || got.Resp.Expires != 0 {
+		t.Fatalf("expected response {0, 0} (default preserved, override cannot raise), got %+v", got.Resp)
+	}
+}
+
 // A response grant the verified user never had cannot be added.
 func TestAuthVerifyNarrowResponsePermissionNotAdded(t *testing.T) {
 	base := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{">"}}}

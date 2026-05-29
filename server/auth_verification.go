@@ -55,6 +55,53 @@ func (s *Server) authVerificationApplies(c *client, juc *jwt.UserClaims, acc *Ac
 	return AuthVerifyInScope(c.kind, c.iproc, isSys, true)
 }
 
+// authVerifyState caches a connection's verification verdict so a reload re-auth
+// can re-apply the same narrowing locally instead of doing another network
+// round-trip (which would block the reload and, with a slow/absent verifier, fail
+// closed and disconnect an already-admitted connection). override is nil when the
+// connection was admitted without any narrowing.
+type authVerifyState struct {
+	done     bool
+	override *authverify.AuthVerifyResponse
+}
+
+// authVerifyConnection verifies an in-scope JWT connection. On the initial
+// connect it performs the network round-trip (processAuthVerification) and caches
+// the verdict; on a subsequent re-auth (config reload) it reuses the cached
+// verdict and re-applies any narrowing locally, never contacting the verifier
+// again. Returns (true, "") to admit or (false, reason) to reject.
+func (s *Server) authVerifyConnection(c *client, juc *jwt.UserClaims, acc *Account, ujwt string) (bool, string) {
+	c.mu.Lock()
+	st := c.authVerify
+	c.mu.Unlock()
+	if st != nil && st.done {
+		// Already verified at admission. A reload re-registered this connection
+		// from its raw JWT, dropping the narrowing; re-apply the cached override
+		// locally so the verdict persists without another round-trip.
+		if st.override != nil {
+			if err := s.applyAuthVerifyOverride(c, juc, acc, st.override); err != nil {
+				return false, fmt.Sprintf("could not re-apply auth verification override: %v", err)
+			}
+		}
+		return true, _EMPTY_
+	}
+	return s.processAuthVerification(c, juc, acc, ujwt)
+}
+
+// cacheAuthVerify records the admit verdict for c so a later reload re-auth can
+// re-apply it locally. Only the narrowing-relevant fields are kept; an admit with
+// no override caches a nil override, leaving the (already correct) raw-JWT
+// permissions in place on re-auth.
+func (c *client) cacheAuthVerify(resp *authverify.AuthVerifyResponse) {
+	var override *authverify.AuthVerifyResponse
+	if resp != nil && (resp.Permissions != nil || resp.Expires != 0) {
+		override = &authverify.AuthVerifyResponse{Permissions: resp.Permissions, Expires: resp.Expires}
+	}
+	c.mu.Lock()
+	c.authVerify = &authVerifyState{done: true, override: override}
+	c.mu.Unlock()
+}
+
 // processAuthVerification publishes a verification request for c in the system
 // account and waits for a verdict. It returns (true, "") to admit, or
 // (false, reason) to reject. It fails closed: a missing system account, transport
@@ -71,16 +118,26 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 
 	reply := s.newRespInbox()
 	respCh := make(chan string, 1)
+	// Non-blocking send: only the first response is consumed, so additional
+	// responses (e.g. several non-queue verification services replying to the same
+	// inbox) are dropped instead of blocking the internal delivery goroutine on a
+	// full channel.
+	send := func(reason string) {
+		select {
+		case respCh <- reason:
+		default:
+		}
+	}
 
 	processReply := func(_ *subscription, rc *client, _ *Account, _, _ string, rmsg []byte) {
 		_, msg := rc.msgParts(rmsg)
 		resp, err := authverify.ParseAuthVerifyResponse(msg)
 		if err != nil {
-			respCh <- fmt.Sprintf("invalid auth verification response: %v", err)
+			send(fmt.Sprintf("invalid auth verification response: %v", err))
 			return
 		}
 		if resp.Nonce != nonce {
-			respCh <- "auth verification response nonce mismatch"
+			send("auth verification response nonce mismatch")
 			return
 		}
 		if resp.Reject {
@@ -88,14 +145,17 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 			if reason == _EMPTY_ {
 				reason = "rejected by auth verification service"
 			}
-			respCh <- reason
+			send(reason)
 			return
 		}
 		if err := s.applyAuthVerifyOverride(c, juc, acc, resp); err != nil {
-			respCh <- fmt.Sprintf("could not apply auth verification override: %v", err)
+			send(fmt.Sprintf("could not apply auth verification override: %v", err))
 			return
 		}
-		respCh <- _EMPTY_
+		// Cache the admit verdict so a later reload re-auth can re-apply the same
+		// narrowing locally without another round-trip.
+		c.cacheAuthVerify(resp)
+		send(_EMPTY_)
 	}
 
 	sub, err := sys.subscribeInternal(reply, processReply)
@@ -112,10 +172,12 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 		return false, fmt.Sprintf("error sending auth verification request: %v", err)
 	}
 
+	timer := time.NewTimer(authverify.AuthVerificationTimeout)
+	defer timer.Stop()
 	select {
 	case reason := <-respCh:
 		return reason == _EMPTY_, reason
-	case <-time.After(authverify.AuthVerificationTimeout):
+	case <-timer.C:
 		return false, "auth verification response not received in time"
 	}
 }
