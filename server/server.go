@@ -378,6 +378,11 @@ type Server struct {
 	// Currently used by unit tests to simulate nodes not supporting account NRG.
 	accountNRGAllowed atomic.Bool
 
+	// Hot-path mirror of opts.StampRequestInfo so processInboundClientMsg and
+	// processInboundLeafMsg can avoid an optsMu RLock per message. Updated on
+	// startup and by stampRequestInfoReload.Apply.
+	stampReqInfo atomic.Bool
+
 	// List of proxies trusted keys in `KeyPair` form so we can do signature
 	// verification when processing incoming proxy connections.
 	proxiesKeyPairs []nkeys.KeyPair
@@ -782,6 +787,9 @@ func NewServer(opts *Options) (*Server, error) {
 
 	// By default we'll allow account NRG.
 	s.accountNRGAllowed.Store(true)
+
+	// Initialize hot-path mirror of opts.StampRequestInfo.
+	s.stampReqInfo.Store(opts.StampRequestInfo)
 
 	// Fill up the maximum in flight syncRequests for this server.
 	// Used in JetStream catchup semantics.
@@ -1198,6 +1206,10 @@ func (s *Server) setOpts(opts *Options) {
 	s.optsMu.Lock()
 	s.opts = opts
 	s.optsMu.Unlock()
+	// Keep the hot-path mirror in sync with opts. Reload's per-option Apply
+	// runs AFTER setOpts, so doing it here ensures stampRequestInfoHeaderIfNeeded
+	// never sees a stale value while opts already reflects the new config.
+	s.stampReqInfo.Store(opts.StampRequestInfo)
 }
 
 func (s *Server) globalAccount() *Account {
