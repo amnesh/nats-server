@@ -1828,6 +1828,36 @@ func reloadUpdateConfig(t *testing.T, s *Server, conf, content string) {
 	}
 }
 
+func TestConfigReloadAuthVerification(t *testing.T) {
+	template := `
+		listen: "127.0.0.1:-1"
+		authorization {
+		  auth_verification: %t
+		}
+	`
+	conf := createConfFile(t, []byte(fmt.Sprintf(template, false)))
+	s, _ := RunServerWithConfig(conf)
+	defer s.Shutdown()
+
+	if s.getOpts().AuthVerification {
+		t.Fatal("expected auth verification to be disabled initially")
+	}
+
+	// Enabling via reload must be supported. Regression: the option was missing
+	// from diffOptions, so toggling it hit the default case and failed the entire
+	// reload.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, true))
+	if !s.getOpts().AuthVerification {
+		t.Fatal("expected auth verification to be enabled after reload")
+	}
+
+	// And disabling again.
+	reloadUpdateConfig(t, s, conf, fmt.Sprintf(template, false))
+	if s.getOpts().AuthVerification {
+		t.Fatal("expected auth verification to be disabled after reload")
+	}
+}
+
 func TestConfigReloadClusterAdvertise(t *testing.T) {
 	s, _, conf := runReloadServerWithContent(t, []byte(`
 		listen: "0.0.0.0:-1"
