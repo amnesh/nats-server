@@ -305,6 +305,12 @@ type client struct {
 	rtt      time.Duration
 	rttStart time.Time
 
+	// Cached, pre-marshaled trimmed ClientInfo value used to stamp inbound
+	// requests when opts.StampRequestInfo is enabled. Lazily built on the
+	// first stamp, invalidated when any of its inputs change (account swap,
+	// RTT update). Nil means stale; rebuild on next stamp. Guarded by c.mu.
+	ciStampHdr []byte
+
 	route *route
 	gw    *gateway
 	leaf  *leaf
@@ -884,6 +890,8 @@ func (c *client) registerWithAccount(acc *Account) error {
 	kind := c.kind
 	srv := c.srv
 	c.acc = acc
+	// CI cache encodes c.acc.Name; rebuild it on next stamp under the new account.
+	c.ciStampHdr = nil
 	c.applyAccountLimits()
 	c.mu.Unlock()
 
@@ -2722,6 +2730,7 @@ func (c *client) processPong() {
 	c.mu.Lock()
 	c.ping.out = 0
 	c.rtt = computeRTT(c.rttStart)
+	c.ciStampHdr = nil
 	srv := c.srv
 	reorderGWs := c.kind == GATEWAY && c.gw.outbound
 	var ri *routeInfo
@@ -4350,6 +4359,8 @@ func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 		c.mqttHandlePubRetain()
 	}
 
+	msg = c.stampRequestInfoHeaderIfNeeded(msg)
+
 	// Doing this inline as opposed to create a function (which otherwise has a measured
 	// performance impact reported in our bench)
 	var isGWRouted bool
@@ -5963,6 +5974,11 @@ func (c *client) swapAccountAfterReload() {
 		if c.acc != acc {
 			c.acc = acc
 		}
+		// Invalidate the CI cache regardless of whether the account pointer
+		// actually changed: a prior step in the reload loop (e.g. reauth via
+		// registerWithAccount) may have already installed the new account,
+		// while the cached CI was built under the previous one.
+		c.ciStampHdr = nil
 		c.mu.Unlock()
 	}
 }
