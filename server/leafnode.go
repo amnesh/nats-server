@@ -3321,6 +3321,8 @@ func (c *client) processInboundLeafMsg(msg []byte) {
 		return
 	}
 
+	msg = c.stampRequestInfoHeaderIfNeeded(msg)
+
 	// Match the subscriptions. We will use our own L1 map if
 	// it's still valid, avoiding contention on the shared sublist.
 	var r *SublistResult
