@@ -24,10 +24,11 @@ import (
 //
 // A scoped signing key template entry that is exactly one macro token, for
 // example {{kvrw(tag(kv))}}, expands into the full set of subjects a client
-// needs to use one JetStream KV bucket or Object Store bucket. The macro
-// argument is a value-producing template operation (tag(x), account-tag(x),
-// name(), subject(), account-name(), account-subject()) or a literal bucket
-// name. One subject set is emitted per resolved value.
+// needs for one JetStream resource: a KV bucket, an Object Store bucket, or a
+// plain stream. The macro argument is a value-producing template operation
+// (tag(x), account-tag(x), name(), subject(), account-name(),
+// account-subject()) or a literal name. One subject set is emitted per
+// resolved value. {{jsinfo()}} takes no argument.
 //
 // Macros are expanded by expandPermissionMacros, which runs inside
 // processUserPermissionsTemplate before the upstream template pass. Entries
@@ -36,70 +37,133 @@ import (
 //
 // The subjects emitted depend on the list the macro appears in:
 //
-//   - In a publish list (allow or deny) the macro emits the JetStream API
-//     subjects for the bucket's backing stream. Read/write macros add the
-//     bucket's data subject and the stream purge API.
-//   - In a subscribe list the macro emits only the bucket's data subject.
+//   - In a publish list (allow or deny) a macro emits the JetStream API
+//     subjects for the resource's stream. Levels are cumulative: read,
+//     read+write, read+write+admin.
+//   - In a subscribe list a bucket macro emits only the bucket's data
+//     subject. Stream macros and jsinfo are errors there, because a stream
+//     has no derivable data subject.
 //
-// Inbox subjects (for JetStream API replies) and bucket create/delete APIs
-// are deliberately not part of any macro.
+// Inbox subjects (for JetStream API replies) are deliberately not part of
+// any macro. The design is documented in
+// docs/superpowers/specs/2026-09-17-permission-template-macros-v2-design.md.
 
 type permMacro struct {
-	streamPrefix  string // Prefix of the backing stream name, e.g. "KV_".
-	subjectPrefix string // Prefix of the data subjects, e.g. "$KV".
-	write         bool   // Whether the macro grants writes.
+	streamPrefix  string // Prefix of the backing stream name, e.g. "KV_"; empty for plain streams.
+	subjectPrefix string // Prefix of the data subjects, e.g. "$KV"; empty when there is no data subject.
+	args          int    // Number of positional arguments the macro takes.
+	write         bool   // Grants writes: purge and, for buckets, the data subject.
+	admin         bool   // Grants stream management.
+	info          bool   // Account-level JetStream discovery, no resource.
 }
 
 var permMacros = map[string]permMacro{
-	"kvro":  {streamPrefix: "KV_", subjectPrefix: "$KV", write: false},
-	"kvrw":  {streamPrefix: "KV_", subjectPrefix: "$KV", write: true},
-	"objro": {streamPrefix: "OBJ_", subjectPrefix: "$O", write: false},
-	"objrw": {streamPrefix: "OBJ_", subjectPrefix: "$O", write: true},
+	"kvro":     {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1},
+	"kvrw":     {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true},
+	"kvadmin":  {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true, admin: true},
+	"objro":    {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1},
+	"objrw":    {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true},
+	"objadmin": {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true, admin: true},
+	"jsread":   {args: 1},
+	"jsadmin":  {args: 1, write: true, admin: true},
+	"jsinfo":   {args: 0, info: true},
 }
 
-// Publish subjects a client needs to read a bucket. The verb is the backing
-// stream name. The set covers the nats.go legacy and new JetStream APIs:
-// stream info, message get (direct and non-direct), ordered consumers
-// (push and pull), and both flow control reply formats.
+// permMacroStream is replaced by the stream name in the subject templates.
+const permMacroStream = "{stream}"
+
+// Publish subjects a client needs to consume a stream. The set covers the
+// nats.go legacy and new JetStream APIs: stream info, message get (direct
+// and non-direct), consumer management on that stream, pull requests, and
+// the v1 and v2 ack and flow control reply formats.
+//
+// The ack and flow control patterns use exact token counts on purpose. The
+// v1 ack subject has 9 tokens with the stream name third, the v2 ack subject
+// has 11 or more tokens with the stream name fifth. A pattern with a trailing
+// ">" for one format could match the other format for another stream (for
+// example when a stream name is numeric and equals a v1 delivered count).
 var permMacroReadPubSubjects = []string{
-	"$JS.API.STREAM.INFO.%s",
-	"$JS.API.STREAM.MSG.GET.%s",
-	"$JS.API.DIRECT.GET.%s",
-	"$JS.API.DIRECT.GET.%s.>",
-	"$JS.API.CONSUMER.CREATE.%s",
-	"$JS.API.CONSUMER.CREATE.%s.>",
-	"$JS.API.CONSUMER.INFO.%s.>",
-	"$JS.API.CONSUMER.DELETE.%s.>",
-	"$JS.API.CONSUMER.MSG.NEXT.%s.>",
-	"$JS.FC.%s.>",
-	"$JS.FC.*.*.%s.>",
+	"$JS.API.STREAM.INFO.{stream}",
+	"$JS.API.STREAM.MSG.GET.{stream}",
+	"$JS.API.DIRECT.GET.{stream}",
+	"$JS.API.DIRECT.GET.{stream}.>",
+	"$JS.API.CONSUMER.CREATE.{stream}",
+	"$JS.API.CONSUMER.CREATE.{stream}.>",
+	"$JS.API.CONSUMER.DURABLE.CREATE.{stream}.>",
+	"$JS.API.CONSUMER.INFO.{stream}.>",
+	"$JS.API.CONSUMER.NAMES.{stream}",
+	"$JS.API.CONSUMER.LIST.{stream}",
+	"$JS.API.CONSUMER.DELETE.{stream}.>",
+	"$JS.API.CONSUMER.MSG.NEXT.{stream}.>",
+	"$JS.ACK.{stream}.*.*.*.*.*.*",
+	"$JS.ACK.*.*.{stream}.*.*.*.*.*.>",
+	"$JS.FC.{stream}.*.*",
+	"$JS.FC.*.*.{stream}.*.*",
 }
 
-// Additional publish subjects a client needs to write a bucket, besides the
-// data subject itself. Purge is used by KV PurgeDeletes and Object Store
-// Put/Delete. The verb is the backing stream name.
+// Additional publish subjects a client needs to write to a stream, besides
+// the data subjects. Purge is used by KV PurgeDeletes and Object Store
+// Put/Delete.
 var permMacroWritePubSubjects = []string{
-	"$JS.API.STREAM.PURGE.%s",
+	"$JS.API.STREAM.PURGE.{stream}",
 }
 
-// subjects returns the subjects the macro emits for one bucket.
-func (m permMacro) subjects(bucket string, isSub bool) []string {
-	data := m.subjectPrefix + "." + bucket + ".>"
+// Additional publish subjects a client needs to manage a stream. Account
+// info is included because clients call it before they create a bucket.
+var permMacroAdminPubSubjects = []string{
+	"$JS.API.STREAM.CREATE.{stream}",
+	"$JS.API.STREAM.UPDATE.{stream}",
+	"$JS.API.STREAM.DELETE.{stream}",
+	"$JS.API.STREAM.MSG.DELETE.{stream}",
+	"$JS.API.STREAM.SNAPSHOT.{stream}",
+	"$JS.API.STREAM.RESTORE.{stream}",
+	"$JS.API.INFO",
+}
+
+// Publish subjects for account-level JetStream discovery.
+var permMacroInfoPubSubjects = []string{
+	"$JS.API.INFO",
+	"$JS.API.STREAM.NAMES",
+	"$JS.API.STREAM.LIST",
+}
+
+// subjects returns the subjects the macro emits for one resource name. The
+// caller has checked that the macro is valid for a subscribe list.
+func (m permMacro) subjects(name string, isSub bool) []string {
+	if m.info {
+		return append([]string(nil), permMacroInfoPubSubjects...)
+	}
+	stream := m.streamPrefix + name
+	data := _EMPTY_
+	if m.subjectPrefix != _EMPTY_ {
+		data = m.subjectPrefix + "." + name + ".>"
+	}
 	if isSub {
 		return []string{data}
 	}
-	stream := m.streamPrefix + bucket
-	out := make([]string, 0, len(permMacroReadPubSubjects)+len(permMacroWritePubSubjects)+1)
-	for _, t := range permMacroReadPubSubjects {
-		out = append(out, fmt.Sprintf(t, stream))
-	}
-	if m.write {
-		out = append(out, data)
-		for _, t := range permMacroWritePubSubjects {
-			out = append(out, fmt.Sprintf(t, stream))
+	out := make([]string, 0, len(permMacroReadPubSubjects)+len(permMacroWritePubSubjects)+len(permMacroAdminPubSubjects)+1)
+	add := func(templates []string) {
+		for _, t := range templates {
+			out = append(out, strings.ReplaceAll(t, permMacroStream, stream))
 		}
 	}
+	add(permMacroReadPubSubjects)
+	if m.write {
+		add(permMacroWritePubSubjects)
+		if data != _EMPTY_ {
+			out = append(out, data)
+		}
+	}
+	if m.admin {
+		add(permMacroAdminPubSubjects)
+	}
 	return out
+}
+
+// validInSubscribeList reports whether the macro has a meaning in a
+// subscribe list, which requires a data subject.
+func (m permMacro) validInSubscribeList() bool {
+	return m.subjectPrefix != _EMPTY_
 }
 
 // parsePermMacro checks whether op, the trimmed content of one {{...}}
@@ -125,8 +189,9 @@ func permMacroTagKey(arg, call string) (string, bool) {
 	return strings.TrimSpace(arg[len(call) : len(arg)-1]), true
 }
 
-// permMacroArgValues resolves a macro argument to the list of bucket names.
-// The second result is false when the argument is not a known operation.
+// permMacroArgValues resolves a macro argument to the list of resource
+// names. The second result is false when the argument is not a known
+// operation.
 func permMacroArgValues(arg string, ujwt *jwt.UserClaims, acc *Account) ([]string, bool) {
 	switch {
 	case strings.EqualFold(arg, "name()"):
@@ -154,7 +219,7 @@ func permMacroArgValues(arg string, ujwt *jwt.UserClaims, acc *Account) ([]strin
 	} else if arg == _EMPTY_ || strings.ContainsAny(arg, "()") {
 		return nil, false
 	} else {
-		// A literal bucket name.
+		// A literal resource name.
 		return []string{arg}, true
 	}
 	if key == _EMPTY_ {
@@ -170,13 +235,13 @@ func permMacroArgValues(arg string, ujwt *jwt.UserClaims, acc *Account) ([]strin
 	return values, true
 }
 
-// isValidPermMacroBucket reports whether a resolved macro value is a bucket
+// isValidPermMacroName reports whether a resolved macro value is a resource
 // name a macro may expand. The rule is the one the official clients enforce
 // when they create a bucket: one or more of [A-Za-z0-9_-]. It is stricter than
 // the server's stream name rule on purpose: the emitted subjects go through
 // the upstream template pass afterwards, so a value must not be able to carry
 // a template token ({{...}}), a wildcard, or a subject separator.
-func isValidPermMacroBucket(name string) bool {
+func isValidPermMacroName(name string) bool {
 	if name == _EMPTY_ {
 		return false
 	}
@@ -194,8 +259,8 @@ func isValidPermMacroBucket(name string) bool {
 // expandPermMacroList replaces macro entries in one permission list by the
 // subjects they expand to. Other entries are kept as they are. When
 // failOnBadSubject is set (deny lists), an argument that resolves to no
-// value or to an invalid bucket name is an error; otherwise such values are
-// skipped, which mirrors how upstream treats unresolved tags.
+// value or to an invalid resource name is an error; otherwise such values
+// are skipped, which mirrors how upstream treats unresolved tags.
 func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt *jwt.UserClaims, acc *Account) (jwt.StringList, error) {
 	trimOp := func(tk string) string {
 		return strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(tk, "{{"), "}}"))
@@ -236,17 +301,28 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 		}
 		op := trimOp(tokens[0])
 		m, arg, _ := parsePermMacro(op)
-		values, ok := permMacroArgValues(arg, ujwt, acc)
-		if !ok {
-			return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
+		if isSub && !m.validInSubscribeList() {
+			return nil, fmt.Errorf("template macro in %q is not valid in a subscribe list", entry)
 		}
-		if len(values) == 0 && failOnBadSubject {
-			return nil, fmt.Errorf("generated invalid subject %q: %q is not defined", entry, arg)
+		var values []string
+		if m.args == 0 {
+			if arg != _EMPTY_ {
+				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
+			}
+			values = []string{_EMPTY_}
+		} else {
+			var ok bool
+			if values, ok = permMacroArgValues(arg, ujwt, acc); !ok {
+				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
+			}
+			if len(values) == 0 && failOnBadSubject {
+				return nil, fmt.Errorf("generated invalid subject %q: %q is not defined", entry, arg)
+			}
 		}
 		for _, v := range values {
-			if !isValidPermMacroBucket(v) {
+			if m.args > 0 && !isValidPermMacroName(v) {
 				if failOnBadSubject {
-					return nil, fmt.Errorf("generated invalid subject %q: %q is not a valid bucket name", entry, v)
+					return nil, fmt.Errorf("generated invalid subject %q: %q is not a valid name", entry, v)
 				}
 				continue
 			}

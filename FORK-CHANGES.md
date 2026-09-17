@@ -431,81 +431,92 @@ See commit `6f42d0a4f` for the exact `Options` fields and plumbing.
 
 ## 4.1 What it is
 
-Scoped signing key templates (`UserScope.Template` in an account JWT) get four
-new template operations. Each one expands a single template entry into the full
-set of subjects a client needs to use **one JetStream KV bucket or Object Store
-bucket**:
+Scoped signing key templates (`UserScope.Template` in an account JWT) get a
+set of new template operations, called macros. Each one expands a single
+template entry into the full set of subjects a client needs for **one
+JetStream resource**: a KV bucket, an Object Store bucket, a plain stream, or
+the account's JetStream discovery API. Design spec:
+`docs/superpowers/specs/2026-09-17-permission-template-macros-v2-design.md`.
 
-| Macro | Bucket type | Grants |
+| Macro | Resource | Grants |
 |---|---|---|
-| `{{kvro(ARG)}}` | KV (`KV_<b>` stream, `$KV.<b>.>` data) | read: get, watch, history, keys, status |
-| `{{kvrw(ARG)}}` | KV | read + put, create, update, delete, purge, purge deletes |
-| `{{objro(ARG)}}` | Object Store (`OBJ_<b>` stream, `$O.<b>.>` data) | read: get, get info, list, watch, status |
-| `{{objrw(ARG)}}` | Object Store | read + put, delete, update meta |
+| `{{kvro(ARG)}}` | KV bucket | read: get, watch, history, keys, status |
+| `{{kvrw(ARG)}}` | KV bucket | read + put, create, update, delete, purge, purge deletes |
+| `{{kvadmin(ARG)}}` | KV bucket | read + write + create, update, delete the bucket |
+| `{{objro(ARG)}}` | Object Store bucket | read: get, get info, list, watch, status |
+| `{{objrw(ARG)}}` | Object Store bucket | read + put, delete, update meta |
+| `{{objadmin(ARG)}}` | Object Store bucket | read + write + create, update, seal, delete the bucket |
+| `{{jsread(ARG)}}` | stream | consume with any consumer: create, info, pull, ack, delete |
+| `{{jsadmin(ARG)}}` | stream | read + purge + create, update, delete, message delete, snapshot, restore |
+| `{{jsinfo()}}` | account | account info, stream names, stream list |
 
-`ARG` names the bucket(s). It is any value-producing template operation the
-server already supports, or a literal bucket name:
+`ARG` names the resource(s). It is any value-producing template operation the
+server already supports, or a literal name:
 
-| Argument | Buckets |
+| Argument | Resources |
 |---|---|
-| `tag(key)` | one per user JWT tag `key:<bucket>` |
-| `account-tag(key)` | one per account JWT tag `key:<bucket>` |
+| `tag(key)` | one per user JWT tag `key:<name>` |
+| `account-tag(key)` | one per account JWT tag `key:<name>` |
 | `name()`, `subject()`, `account-name()`, `account-subject()` | the user name / user nkey / account name / account nkey |
-| `mybucket` (literal) | exactly that bucket |
+| `orders` (literal) | exactly that resource |
 
-Macro names and tag keys are matched case-insensitively. Tag values are used as
-they appear in the JWT; note that `nsc` and the `jwt` library lowercase tags
-when they add them, so buckets targeted through tags have lowercase names.
+Macro names and tag keys are matched case-insensitively. Tag **values** are
+used as they appear in the JWT. `nsc` and the `jwt` library lowercase tags
+when they add them, so a resource with an uppercase name (streams are
+case-sensitive) can only be named by a literal argument.
 
-**Motivation.** Without macros, a template needs about a dozen entries per
-bucket (`$KV.{{tag(kv)}}.>`, `$JS.API.STREAM.INFO.KV_{{tag(kv)}}`, ...), and a
-user JWT that lists buckets directly grows to 10 KB and more at 40 buckets.
-With macros the account JWT carries one entry per bucket role, and the user
-JWT carries only tags:
+**Motivation.** Without macros, a template needs a dozen entries per bucket
+(`$KV.{{tag(kv)}}.>`, `$JS.API.STREAM.INFO.KV_{{tag(kv)}}`, ...), and a user
+JWT that lists buckets directly grows to 10 KB and more at 40 buckets. With
+macros the account JWT carries one entry per resource role, and the user JWT
+carries only tags:
 
 ```jsonc
 // Account JWT: signing key scope template
 "template": {
-  "pub": { "allow": ["{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}", "{{objro(tag(obj))}}"] },
+  "pub": { "allow": ["{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}", "{{jsread(tag(js))}}", "{{jsinfo()}}"] },
   "sub": { "allow": ["_INBOX.>", "{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}"] }
 }
 // User JWT (signed by that scoped key): tags only, no permissions
-"tags": ["kv:orders", "kv:carts", "kvr:catalog", "obj:images"]
+"tags": ["kv:orders", "kv:carts", "kvr:catalog", "js:audit"]
 ```
 
-The server expands this at connect time into the subjects for four buckets.
-The user's nkey and JWT signature chain are untouched: identity is verified as
-before, only the *way permissions are written* in the account JWT changes.
+The server expands this at connect time. The user's nkey and JWT signature
+chain are untouched: identity is verified as before, only the *way
+permissions are written* in the account JWT changes.
 
 ## 4.2 Rules
 
 - A macro must be the **whole entry**. `foo.{{kvrw(tag(kv))}}` or two macros in
   one entry is an error, and the user's authentication fails (same as for any
   invalid template today).
-- Macros work in all four lists: `pub.allow`, `pub.deny`, `sub.allow`, `sub.deny`.
-  What they emit depends on the list, see §4.3.
+- Bucket macros work in all four lists. In `pub.allow` / `pub.deny` they emit
+  the API subjects of §4.3; in `sub.allow` / `sub.deny` they emit only the
+  bucket's data subject (`$KV.<b>.>` or `$O.<b>.>`).
+- Stream macros and `jsinfo` are only valid in publish lists. A stream has no
+  derivable data subject, so using them in a subscribe list is an error.
+- `jsinfo` takes no argument: `{{jsinfo()}}`.
 - Entries that are not macros pass through untouched and are then processed by
   the upstream template engine, so macros mix freely with `{{tag(x)}}` style
   entries and plain subjects.
 - An argument that resolves to **no value** (the user has no matching tag) or
-  to an **invalid bucket name** emits nothing in an **allow** list and is an
+  to an **invalid name** emits nothing in an **allow** list and is an
   **error** in a **deny** list. This mirrors upstream's handling of unresolved
-  tags. A valid bucket name is one or more of `A-Z a-z 0-9 _ -`, the rule the
-  official clients enforce when they create a bucket. As upstream, an allow list that
-  was non-empty and becomes empty after expansion gets a compensating `deny >`,
-  so a user without tags fails closed.
+  tags. A valid name is one or more of `A-Z a-z 0-9 _ -`, the rule the
+  official clients enforce when they create a bucket. As upstream, an allow
+  list that was non-empty and becomes empty after expansion gets a
+  compensating `deny >`, so a user without tags fails closed.
 - The total number of subjects per list is capped by the existing
-  `maxPermTemplateSubjectExpansions` (4096). At 13 subjects per read/write
-  bucket that is about 300 buckets per user.
+  `maxPermTemplateSubjectExpansions` (4096). With 16 subjects per read-only
+  resource that is 256 resources per user, 227 for read/write, 163 for admin.
 - Unknown macro names such as `{{kvxx(...)}}` are rejected by the upstream
   "template operation is not defined" path, exactly as today.
 
 ## 4.3 What a macro expands to
 
-`{stream}` is `KV_<b>` or `OBJ_<b>`, `{data}` is `$KV.<b>` or `$O.<b>`.
+`{stream}` is `KV_<b>`, `OBJ_<b>`, or the stream name. Levels are cumulative.
 
-**In a publish list**, read-only macros emit the JetStream API subjects a
-client needs to read the bucket:
+**read** (16 subjects), every macro except `jsinfo`:
 
 ```text
 $JS.API.STREAM.INFO.{stream}
@@ -514,48 +525,108 @@ $JS.API.DIRECT.GET.{stream}
 $JS.API.DIRECT.GET.{stream}.>
 $JS.API.CONSUMER.CREATE.{stream}         # legacy ephemeral create
 $JS.API.CONSUMER.CREATE.{stream}.>       # named create, with or without filter subject
+$JS.API.CONSUMER.DURABLE.CREATE.{stream}.>
 $JS.API.CONSUMER.INFO.{stream}.>
+$JS.API.CONSUMER.NAMES.{stream}
+$JS.API.CONSUMER.LIST.{stream}
 $JS.API.CONSUMER.DELETE.{stream}.>
-$JS.API.CONSUMER.MSG.NEXT.{stream}.>     # pull consumers (nats.go jetstream API)
-$JS.FC.{stream}.>                        # push flow control, v1 reply format
-$JS.FC.*.*.{stream}.>                    # push flow control, v2 reply format (js_ack_fc_v2)
+$JS.API.CONSUMER.MSG.NEXT.{stream}.>     # pull consumers
+$JS.ACK.{stream}.*.*.*.*.*.*             # acks, v1 reply format (9 tokens)
+$JS.ACK.*.*.{stream}.*.*.*.*.*.>         # acks, v2 reply format (js_ack_fc_v2, 11+ tokens)
+$JS.FC.{stream}.*.*                      # push flow control, v1 (5 tokens)
+$JS.FC.*.*.{stream}.*.*                  # push flow control, v2 (7 tokens)
 ```
 
-Read/write macros add:
+**write** adds, for `kvrw`, `objrw`, `kvadmin`, `objadmin`, `jsadmin`:
 
 ```text
-{data}.>                                 # put / delete / purge markers, object chunks and meta
 $JS.API.STREAM.PURGE.{stream}            # KV PurgeDeletes, Object Store Put/Delete cleanup
+$KV.<b>.>  or  $O.<b>.>                  # buckets only: put / delete / purge markers, object chunks and meta
 ```
 
-**In a subscribe list**, every macro emits only the data subject `{data}.>`
-(for raw core NATS subscriptions to the bucket).
+**admin** adds, for `kvadmin`, `objadmin`, `jsadmin`:
 
-The set was derived from what nats.go v1.51 (both the legacy `nats.KeyValue`
-API and the `jetstream` package) actually publishes, and is verified end to end
-by `TestJWTTemplateMacroKVObjectStoreEndToEnd`. Every subject is bound to the
-bucket's own stream, so the wider patterns (for example `CONSUMER.CREATE.{stream}.>`)
-cannot reach other streams.
+```text
+$JS.API.STREAM.CREATE.{stream}
+$JS.API.STREAM.UPDATE.{stream}           # Object Store Seal
+$JS.API.STREAM.DELETE.{stream}
+$JS.API.STREAM.MSG.DELETE.{stream}
+$JS.API.STREAM.SNAPSHOT.{stream}
+$JS.API.STREAM.RESTORE.{stream}
+$JS.API.INFO                             # clients call it before they create a bucket
+```
+
+**info**, for `jsinfo()`:
+
+```text
+$JS.API.INFO
+$JS.API.STREAM.NAMES
+$JS.API.STREAM.LIST
+```
+
+The read set was derived from what nats.go v1.51 (both the legacy
+`nats.KeyValue` API and the `jetstream` package) actually publishes, and is
+verified end to end by the `TestJWTTemplateMacro*EndToEnd` tests. Every
+subject is bound to the resource's own stream, so the wider patterns (for
+example `CONSUMER.CREATE.{stream}.>`) cannot reach other streams. The ack and
+flow control patterns use exact token counts so that a v1 pattern can never
+match a v2 subject of another stream and vice versa.
+
+**Operational notes:**
+
+- A `jsread`-only user must bind to the stream explicitly, for example
+  `nats.BindStream("orders")` in nats.go. Without it, the client resolves the
+  stream through `$JS.API.STREAM.NAMES`, which only `jsinfo` grants.
+- `jsinfo` is account-level discovery: `STREAM.NAMES` and `STREAM.LIST` return
+  every stream in the account, including streams the user cannot read.
+- The flow control patterns (`$JS.FC.`) are used by push consumers only when
+  the server detects a stall. They are covered by the subject-set unit tests,
+  not by the end-to-end tests.
 
 **Deliberately not included:**
 
 - `_INBOX.>` (or a custom inbox prefix) in `sub.allow`. JetStream API replies
   and consumer deliveries arrive on inboxes; add it once per template.
-- Bucket management: `$JS.API.STREAM.CREATE/UPDATE/DELETE.{stream}`,
-  `$JS.API.INFO`, stream listing. Buckets are created by an administrator.
+- Publish subjects of a plain stream. They come from the stream's
+  configuration, not its name, so they stay ordinary template entries.
 - JetStream domains and cross-account API imports with a custom prefix. Macros
-  always emit the default `$JS.API.` prefix.
+  emit the default `$JS.API.` prefix. Local-domain prefixes are covered
+  anyway, because the server maps `$JS.<domain>.API.>` to `$JS.API.>` before
+  the permission check.
 
-## 4.4 Security model
+## 4.4 Read-only users and consumers
+
+Reading a stream, and therefore a bucket, goes through a consumer, except
+for direct get. So the read set includes consumer creation, and a read-only
+user can, on the resource's stream:
+
+- create any consumer: push or pull, ephemeral or durable, any filter;
+- get info and list consumer names;
+- delete any consumer, including consumers other users created;
+- pull from and ack on any consumer, including consumers other users
+  created. This can take messages away from another user, or ack messages
+  that user did not process.
+
+The last two points are inherent to per-stream permissions: consumer names
+are one token, so no subject pattern can say "only consumers this user
+created". Push consumers deliver to an inbox chosen by the creating client
+and are not exposed this way; pull consumers are, because `MSG.NEXT` is
+addressed by consumer name. KV and Object Store clients use ephemeral push
+consumers only today, but nats.go plans to move KV watch to pull-based
+ordered consumers, so the read set keeps the pull and ack subjects. Users
+who must not interfere with each other should get a consumer-level macro
+(planned: `jsconsumer`) instead of a stream-wide read macro.
+
+## 4.5 Security model
 
 - Expansion runs inside the server from the **verified account JWT**. A user can
-  only obtain buckets that the account's template author routed through tags,
-  and only tags in the user's **signed** JWT count. No new trust is introduced.
-- A read-only macro lets the user create and delete consumers on the bucket's
-  stream (needed for watch), as the standard NATS KV permission guidance does.
-  It does not let the user write data or purge.
-- Bucket names from tags are restricted to `A-Z a-z 0-9 _ -`. This is stricter
-  than the server's stream name rule on purpose: the emitted subjects go through
+  only obtain resources that the account's template author routed through
+  tags, and only tags in the user's **signed** JWT count. No new trust is
+  introduced.
+- A read-only macro never emits the data subject or `STREAM.PURGE` in a
+  publish list, so it cannot write data or purge.
+- Names from tags are restricted to `A-Z a-z 0-9 _ -`. This is stricter than
+  the server's stream name rule on purpose: the emitted subjects go through
   the upstream template pass afterwards, so a value must not be able to carry a
   template token (`kv:{{name()}}`), a wildcard (`kv:*`) or a separator
   (`kv:a.b`). `TestJWTTemplateMacroRejectsTemplateInjection` guards this.
@@ -564,25 +635,28 @@ cannot reach other streams.
   and upstream servers reject templates that use macros (authentication fails),
   so a macro can never grant more on an old server.
 
-## 4.5 Code map & tests
+## 4.6 Code map & tests
 
 - `server/auth_perm_macros.go` — macro table (`permMacros`), subject sets
-  (`permMacroReadPubSubjects`, `permMacroWritePubSubjects`), argument resolution
-  and the per-list expansion (`expandPermMacroList`, `expandPermissionMacros`).
+  (`permMacroReadPubSubjects`, `permMacroWritePubSubjects`,
+  `permMacroAdminPubSubjects`, `permMacroInfoPubSubjects`), argument
+  resolution and the per-list expansion (`expandPermMacroList`,
+  `expandPermissionMacros`).
 - `server/auth.go` — one four-line hook in `processUserPermissionsTemplate`,
   placed after the fail-closed bookkeeping and before the upstream template
   pass. Both callers (operator-mode scoped signers and the auth callout) go
   through this function.
-- Tests: `server/auth_perm_macros_test.go` — unit tests for every macro,
-  argument form, list kind, failure mode and the expansion cap, plus the
-  operator-mode end-to-end test with real nats.go KV / Object Store clients.
+- Tests: `server/auth_perm_macros_test.go` and `server/auth_perm_macros_*_test.go`
+  — unit tests for every macro, argument form, list kind, failure mode and
+  the expansion cap, plus operator-mode end-to-end tests with real nats.go
+  KV / Object Store / stream clients.
 
 ```sh
 go test -run 'TestJWTTemplateMacro' ./server -count=1
 ```
 
-Adding a macro for another bucket-like resource is a one-line addition to
-`permMacros` (stream prefix, data subject prefix, write flag).
+Adding a macro for another resource is a one-line addition to `permMacros`
+(stream prefix, data subject prefix, argument count, level flags).
 
 ---
 

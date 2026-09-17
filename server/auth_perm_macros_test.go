@@ -29,7 +29,7 @@ import (
 )
 
 // The expected expansions are written out literally so that the tests do not
-// depend on the production table.
+// depend on the production table. See the v2 design spec, section 5.
 func macroReadPubSubjects(stream string) []string {
 	return []string{
 		"$JS.API.STREAM.INFO." + stream,
@@ -38,17 +38,41 @@ func macroReadPubSubjects(stream string) []string {
 		"$JS.API.DIRECT.GET." + stream + ".>",
 		"$JS.API.CONSUMER.CREATE." + stream,
 		"$JS.API.CONSUMER.CREATE." + stream + ".>",
+		"$JS.API.CONSUMER.DURABLE.CREATE." + stream + ".>",
 		"$JS.API.CONSUMER.INFO." + stream + ".>",
+		"$JS.API.CONSUMER.NAMES." + stream,
+		"$JS.API.CONSUMER.LIST." + stream,
 		"$JS.API.CONSUMER.DELETE." + stream + ".>",
 		"$JS.API.CONSUMER.MSG.NEXT." + stream + ".>",
-		"$JS.FC." + stream + ".>",
-		"$JS.FC.*.*." + stream + ".>",
+		"$JS.ACK." + stream + ".*.*.*.*.*.*",
+		"$JS.ACK.*.*." + stream + ".*.*.*.*.*.>",
+		"$JS.FC." + stream + ".*.*",
+		"$JS.FC.*.*." + stream + ".*.*",
 	}
 }
 
+// data is empty for plain streams, which have no derivable data subject.
 func macroWritePubSubjects(stream, data string) []string {
-	return append(macroReadPubSubjects(stream), data+".>", "$JS.API.STREAM.PURGE."+stream)
+	out := append(macroReadPubSubjects(stream), "$JS.API.STREAM.PURGE."+stream)
+	if data != "" {
+		out = append(out, data+".>")
+	}
+	return out
 }
+
+func macroAdminPubSubjects(stream, data string) []string {
+	return append(macroWritePubSubjects(stream, data),
+		"$JS.API.STREAM.CREATE."+stream,
+		"$JS.API.STREAM.UPDATE."+stream,
+		"$JS.API.STREAM.DELETE."+stream,
+		"$JS.API.STREAM.MSG.DELETE."+stream,
+		"$JS.API.STREAM.SNAPSHOT."+stream,
+		"$JS.API.STREAM.RESTORE."+stream,
+		"$JS.API.INFO",
+	)
+}
+
+var macroInfoPubSubjects = []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"}
 
 func macroTestUserClaims(t *testing.T, tags ...string) (*jwt.UserClaims, *Account) {
 	t.Helper()
@@ -256,18 +280,86 @@ func TestJWTTemplateMacroExpansionLimit(t *testing.T) {
 		}
 		return tags
 	}
-	// 300 buckets x 11 subjects fits under the cap.
-	uc, acc := macroTestUserClaims(t, mkTags(300)...)
+	// 250 buckets x 16 subjects fits under the cap.
+	uc, acc := macroTestUserClaims(t, mkTags(250)...)
 	lim := jwt.UserPermissionLimits{}
 	lim.Pub.Allow.Add("{{kvro(tag(kv))}}")
 	res, err := processUserPermissionsTemplate(lim, uc, acc)
 	require_NoError(t, err)
-	require_Len(t, len(res.Pub.Allow), 300*11)
+	require_Len(t, len(res.Pub.Allow), 250*16)
 
-	// 400 buckets x 11 subjects exceeds the cap.
-	uc, acc = macroTestUserClaims(t, mkTags(400)...)
+	// 260 buckets x 16 subjects exceeds the cap.
+	uc, acc = macroTestUserClaims(t, mkTags(260)...)
 	_, err = processUserPermissionsTemplate(lim, uc, acc)
 	require_Error(t, err, errPermTemplateExpansionLimit)
+}
+
+func TestJWTTemplateMacroBucketAdmin(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:cfg", "obj:blobs")
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("{{kvadmin(tag(kv))}}", "{{objadmin(tag(obj))}}")
+	lim.Sub.Allow.Add("{{kvadmin(tag(kv))}}", "{{objadmin(tag(obj))}}")
+
+	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	require_NoError(t, err)
+	expected := append(macroAdminPubSubjects("KV_cfg", "$KV.cfg"), macroAdminPubSubjects("OBJ_blobs", "$O.blobs")...)
+	requireSameSubjects(t, res.Pub.Allow, expected)
+	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.cfg.>", "$O.blobs.>"})
+}
+
+func TestJWTTemplateMacroStreamReadAndAdmin(t *testing.T) {
+	// The jwt library lowercases tag values, so a stream with an uppercase
+	// name can only be named by a literal argument.
+	uc, acc := macroTestUserClaims(t, "js:orders", "jsa:events")
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("{{jsread(tag(js))}}", "{{jsadmin(tag(jsa))}}", "{{jsread(AUDIT)}}")
+
+	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	require_NoError(t, err)
+	expected := append(macroReadPubSubjects("orders"), macroAdminPubSubjects("events", "")...)
+	expected = append(expected, macroReadPubSubjects("AUDIT")...)
+	requireSameSubjects(t, res.Pub.Allow, expected)
+	// A stream has no derivable data subject, so stream macros only grant API subjects.
+	for _, subj := range res.Pub.Allow {
+		require_True(t, strings.HasPrefix(subj, "$JS."))
+	}
+
+	// Stream macros have no meaning in subscribe lists.
+	for _, entry := range []string{"{{jsread(tag(js))}}", "{{jsadmin(tag(jsa))}}"} {
+		for _, mk := range []func(*jwt.UserPermissionLimits){
+			func(l *jwt.UserPermissionLimits) { l.Sub.Allow.Add(entry) },
+			func(l *jwt.UserPermissionLimits) { l.Sub.Deny.Add(entry) },
+		} {
+			lim := jwt.UserPermissionLimits{}
+			mk(&lim)
+			_, err := processUserPermissionsTemplate(lim, uc, acc)
+			require_Error(t, err)
+			require_Contains(t, err.Error(), "subscribe")
+		}
+	}
+}
+
+func TestJWTTemplateMacroInfo(t *testing.T) {
+	uc, acc := macroTestUserClaims(t)
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("{{jsinfo()}}", "plain.subject")
+
+	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	require_NoError(t, err)
+	requireSameSubjects(t, res.Pub.Allow, append(macroInfoPubSubjects, "plain.subject"))
+
+	// jsinfo takes no argument and is not valid in subscribe lists.
+	lim = jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("{{jsinfo(tag(kv))}}")
+	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "not defined")
+
+	lim = jwt.UserPermissionLimits{}
+	lim.Sub.Allow.Add("{{jsinfo()}}")
+	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "subscribe")
 }
 
 // The end-to-end test checks that the subject sets are sufficient for the

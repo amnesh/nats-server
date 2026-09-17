@@ -31,6 +31,7 @@ anything outside the named resource, and must stay simple to explain.
 | 6 | `jswrite` | No. Stream publish subjects are ordinary template entries |
 | 7 | Read set | One 16-subject read set shared by buckets and streams |
 | 8 | Read-only users and consumers | Keep consumer create/delete in the read set, document it, offer `jsconsumer` for isolation |
+| 9 | "All buckets" / "all streams" | `*` accepted as a literal argument only, never from a tag; bucket wildcards grant the API of every stream (§3) |
 
 ## 3. Grammar
 
@@ -53,6 +54,19 @@ anything outside the named resource, and must stay simple to explain.
   official clients and it is stricter than the server's stream name rule on
   purpose: the emitted subjects pass through the upstream template pass
   afterwards, so a value must not carry `{{`, a wildcard, or a separator.
+- Tag values are used as they appear in the JWT. `nsc` and the `jwt` library
+  lowercase tags on add, and stream names are case-sensitive, so a resource
+  with an uppercase name can only be named by a literal argument.
+- The literal `*` is accepted as a positional argument and means every
+  resource of that kind: `{{jsread(*)}}`, `{{kvrw(*)}}`,
+  `{{jsconsumer(orders, *)}}`. It is a template author's decision, so `*`
+  from a tag or any other value operation is still rejected. NATS wildcards
+  match whole tokens, so the stream token becomes `*` and the data subject
+  becomes `$KV.*.>` or `$O.*.>`. A bucket wildcard therefore grants the
+  JetStream API of **every stream in the account**, not only of buckets,
+  because the bucket name lives inside the stream token (`KV_*` is a literal,
+  not a wildcard). `jsread(*)` and `jsadmin(*)` are exact. Prefix forms such
+  as `team-*`, and `>`, are rejected. `*` is not accepted for `domain=`.
 - The macro token must be the whole entry. Two macro tokens, or a macro
   inside a longer subject, is an error.
 - Missing values (a tag with no match, or an invalid value) emit nothing in
@@ -321,3 +335,4 @@ Three commits on `release/v2.14.7`, each with tests and doc updates
    `objadmin`, `jsread`, `jsadmin`, `jsinfo`, subscribe-list rule, zero-argument macro.
 2. Argument list parsing, cartesian product, `jsconsumer`, `jsconsumeradmin`.
 3. `domain=` argument.
+4. Literal `*` argument.
