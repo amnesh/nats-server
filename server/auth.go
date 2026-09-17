@@ -631,6 +631,10 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 	pubAllowWasNotEmpty := len(lim.Permissions.Pub.Allow) > 0
 
 	var err error
+	// Fork: expand permission macros such as {{kvrw(tag(kv))}}, see auth_perm_macros.go.
+	if lim, err = expandPermissionMacros(lim, ujwt, acc); err != nil {
+		return jwt.UserPermissionLimits{}, err
+	}
 	if lim.Permissions.Sub.Allow, err = applyTemplate(lim.Permissions.Sub.Allow, false); err != nil {
 		return jwt.UserPermissionLimits{}, err
 	} else if lim.Permissions.Sub.Deny, err = applyTemplate(lim.Permissions.Sub.Deny, true); err != nil {

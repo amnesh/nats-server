@@ -18,8 +18,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 1 | **Authentication Verification Callout** (`authverify`) | `authorization { auth_verification: true }` | `server/authverify/` (pkg), `server/auth_verification.go` | `server/opts.go`, `server/auth.go` |
 | 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
+| 4 | **Permission Template Macros** (`{{kvrw(tag(kv))}}` etc.) | use a macro in a scoped signing key template | `server/auth_perm_macros.go` | `server/auth.go` |
 
-Features 1 and 2 are documented in full below. Feature 3 is summarized at the end.
+Features 1, 2 and 4 are documented in full below. Feature 3 is summarized in between.
 
 ---
 
@@ -426,18 +427,179 @@ See commit `6f42d0a4f` for the exact `Options` fields and plumbing.
 
 ---
 
+# 4. Permission Template Macros
+
+## 4.1 What it is
+
+Scoped signing key templates (`UserScope.Template` in an account JWT) get four
+new template operations. Each one expands a single template entry into the full
+set of subjects a client needs to use **one JetStream KV bucket or Object Store
+bucket**:
+
+| Macro | Bucket type | Grants |
+|---|---|---|
+| `{{kvro(ARG)}}` | KV (`KV_<b>` stream, `$KV.<b>.>` data) | read: get, watch, history, keys, status |
+| `{{kvrw(ARG)}}` | KV | read + put, create, update, delete, purge, purge deletes |
+| `{{objro(ARG)}}` | Object Store (`OBJ_<b>` stream, `$O.<b>.>` data) | read: get, get info, list, watch, status |
+| `{{objrw(ARG)}}` | Object Store | read + put, delete, update meta |
+
+`ARG` names the bucket(s). It is any value-producing template operation the
+server already supports, or a literal bucket name:
+
+| Argument | Buckets |
+|---|---|
+| `tag(key)` | one per user JWT tag `key:<bucket>` |
+| `account-tag(key)` | one per account JWT tag `key:<bucket>` |
+| `name()`, `subject()`, `account-name()`, `account-subject()` | the user name / user nkey / account name / account nkey |
+| `mybucket` (literal) | exactly that bucket |
+
+Macro names and tag keys are matched case-insensitively. Tag values are used as
+they appear in the JWT; note that `nsc` and the `jwt` library lowercase tags
+when they add them, so buckets targeted through tags have lowercase names.
+
+**Motivation.** Without macros, a template needs about a dozen entries per
+bucket (`$KV.{{tag(kv)}}.>`, `$JS.API.STREAM.INFO.KV_{{tag(kv)}}`, ...), and a
+user JWT that lists buckets directly grows to 10 KB and more at 40 buckets.
+With macros the account JWT carries one entry per bucket role, and the user
+JWT carries only tags:
+
+```jsonc
+// Account JWT: signing key scope template
+"template": {
+  "pub": { "allow": ["{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}", "{{objro(tag(obj))}}"] },
+  "sub": { "allow": ["_INBOX.>", "{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}"] }
+}
+// User JWT (signed by that scoped key): tags only, no permissions
+"tags": ["kv:orders", "kv:carts", "kvr:catalog", "obj:images"]
+```
+
+The server expands this at connect time into the subjects for four buckets.
+The user's nkey and JWT signature chain are untouched: identity is verified as
+before, only the *way permissions are written* in the account JWT changes.
+
+## 4.2 Rules
+
+- A macro must be the **whole entry**. `foo.{{kvrw(tag(kv))}}` or two macros in
+  one entry is an error, and the user's authentication fails (same as for any
+  invalid template today).
+- Macros work in all four lists: `pub.allow`, `pub.deny`, `sub.allow`, `sub.deny`.
+  What they emit depends on the list, see §4.3.
+- Entries that are not macros pass through untouched and are then processed by
+  the upstream template engine, so macros mix freely with `{{tag(x)}}` style
+  entries and plain subjects.
+- An argument that resolves to **no value** (the user has no matching tag) or
+  to an **invalid bucket name** emits nothing in an **allow** list and is an
+  **error** in a **deny** list. This mirrors upstream's handling of unresolved
+  tags. A valid bucket name is one or more of `A-Z a-z 0-9 _ -`, the rule the
+  official clients enforce when they create a bucket. As upstream, an allow list that
+  was non-empty and becomes empty after expansion gets a compensating `deny >`,
+  so a user without tags fails closed.
+- The total number of subjects per list is capped by the existing
+  `maxPermTemplateSubjectExpansions` (4096). At 13 subjects per read/write
+  bucket that is about 300 buckets per user.
+- Unknown macro names such as `{{kvxx(...)}}` are rejected by the upstream
+  "template operation is not defined" path, exactly as today.
+
+## 4.3 What a macro expands to
+
+`{stream}` is `KV_<b>` or `OBJ_<b>`, `{data}` is `$KV.<b>` or `$O.<b>`.
+
+**In a publish list**, read-only macros emit the JetStream API subjects a
+client needs to read the bucket:
+
+```text
+$JS.API.STREAM.INFO.{stream}
+$JS.API.STREAM.MSG.GET.{stream}          # non-direct get (legacy Object Store, buckets without allow_direct)
+$JS.API.DIRECT.GET.{stream}
+$JS.API.DIRECT.GET.{stream}.>
+$JS.API.CONSUMER.CREATE.{stream}         # legacy ephemeral create
+$JS.API.CONSUMER.CREATE.{stream}.>       # named create, with or without filter subject
+$JS.API.CONSUMER.INFO.{stream}.>
+$JS.API.CONSUMER.DELETE.{stream}.>
+$JS.API.CONSUMER.MSG.NEXT.{stream}.>     # pull consumers (nats.go jetstream API)
+$JS.FC.{stream}.>                        # push flow control, v1 reply format
+$JS.FC.*.*.{stream}.>                    # push flow control, v2 reply format (js_ack_fc_v2)
+```
+
+Read/write macros add:
+
+```text
+{data}.>                                 # put / delete / purge markers, object chunks and meta
+$JS.API.STREAM.PURGE.{stream}            # KV PurgeDeletes, Object Store Put/Delete cleanup
+```
+
+**In a subscribe list**, every macro emits only the data subject `{data}.>`
+(for raw core NATS subscriptions to the bucket).
+
+The set was derived from what nats.go v1.51 (both the legacy `nats.KeyValue`
+API and the `jetstream` package) actually publishes, and is verified end to end
+by `TestJWTTemplateMacroKVObjectStoreEndToEnd`. Every subject is bound to the
+bucket's own stream, so the wider patterns (for example `CONSUMER.CREATE.{stream}.>`)
+cannot reach other streams.
+
+**Deliberately not included:**
+
+- `_INBOX.>` (or a custom inbox prefix) in `sub.allow`. JetStream API replies
+  and consumer deliveries arrive on inboxes; add it once per template.
+- Bucket management: `$JS.API.STREAM.CREATE/UPDATE/DELETE.{stream}`,
+  `$JS.API.INFO`, stream listing. Buckets are created by an administrator.
+- JetStream domains and cross-account API imports with a custom prefix. Macros
+  always emit the default `$JS.API.` prefix.
+
+## 4.4 Security model
+
+- Expansion runs inside the server from the **verified account JWT**. A user can
+  only obtain buckets that the account's template author routed through tags,
+  and only tags in the user's **signed** JWT count. No new trust is introduced.
+- A read-only macro lets the user create and delete consumers on the bucket's
+  stream (needed for watch), as the standard NATS KV permission guidance does.
+  It does not let the user write data or purge.
+- Bucket names from tags are restricted to `A-Z a-z 0-9 _ -`. This is stricter
+  than the server's stream name rule on purpose: the emitted subjects go through
+  the upstream template pass afterwards, so a value must not be able to carry a
+  template token (`kv:{{name()}}`), a wildcard (`kv:*`) or a separator
+  (`kv:a.b`). `TestJWTTemplateMacroRejectsTemplateInjection` guards this.
+- Off by default in the sense of this fork: there is no config knob, the opt-in
+  is the account JWT. A template without macros is processed exactly as upstream,
+  and upstream servers reject templates that use macros (authentication fails),
+  so a macro can never grant more on an old server.
+
+## 4.5 Code map & tests
+
+- `server/auth_perm_macros.go` — macro table (`permMacros`), subject sets
+  (`permMacroReadPubSubjects`, `permMacroWritePubSubjects`), argument resolution
+  and the per-list expansion (`expandPermMacroList`, `expandPermissionMacros`).
+- `server/auth.go` — one four-line hook in `processUserPermissionsTemplate`,
+  placed after the fail-closed bookkeeping and before the upstream template
+  pass. Both callers (operator-mode scoped signers and the auth callout) go
+  through this function.
+- Tests: `server/auth_perm_macros_test.go` — unit tests for every macro,
+  argument form, list kind, failure mode and the expansion cap, plus the
+  operator-mode end-to-end test with real nats.go KV / Object Store clients.
+
+```sh
+go test -run 'TestJWTTemplateMacro' ./server -count=1
+```
+
+Adding a macro for another bucket-like resource is a one-line addition to
+`permMacros` (stream prefix, data subject prefix, write flag).
+
+---
+
 # Maintenance notes
 
-- All three features are gated **off by default**; an unconfigured server behaves
-  exactly like upstream.
-- Features 1 and 2 keep their logic in dedicated files (`server/authverify/`,
-  `server/soo-changes.go`) with minimal, stable hooks in upstream files, to
-  minimize merge conflicts when rebasing onto a newer upstream release.
+- Features 1–3 are gated **off by default**; feature 4 has no config knob and is
+  only active for account JWT templates that use a macro. An unconfigured server
+  behaves exactly like upstream.
+- Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
+  `server/soo-changes.go`, `server/auth_perm_macros.go`) with minimal, stable
+  hooks in upstream files, to minimize merge conflicts when rebasing onto a newer
+  upstream release.
 - When upgrading the fork to a new upstream release, cherry-pick the custom commits
   forward and re-run the feature tests:
 
   ```sh
-  # Feature 1 (authverify) + Feature 2 (request info stamping)
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo' \
+  # Feature 1 (authverify) + Feature 2 (request info stamping) + Feature 4 (template macros)
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|TemplateMacro' \
       ./server ./server/authverify ./test -count=1
   ```
