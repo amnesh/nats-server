@@ -35,6 +35,12 @@ import (
 // cartesian product of those lists, first argument first. {{jsinfo()}} takes
 // no argument.
 //
+// Every macro also accepts one trailing named argument, domain=VALUE, for a
+// remote JetStream domain the client reaches through a leaf node, for example
+// {{kvrw(tag(kv), domain=hub)}}. The value resolves like a positional
+// argument and is the innermost loop of the cartesian product. Without it the
+// macro covers the server's own JetStream, which is what a local client needs.
+//
 // Macros are expanded by expandPermissionMacros, which runs inside
 // processUserPermissionsTemplate before the upstream template pass. Entries
 // that are not macros pass through untouched, so templates without macros
@@ -56,6 +62,7 @@ import (
 type permMacro struct {
 	streamPrefix  string // Prefix of the backing stream name, e.g. "KV_"; empty for plain streams.
 	subjectPrefix string // Prefix of the data subjects, e.g. "$KV"; empty when there is no data subject.
+	dataViaAPI    bool   // The data publish subject of a remote domain goes through that domain's API prefix.
 	args          int    // Number of positional arguments the macro takes.
 	write         bool   // Grants writes: purge and, for buckets, the data subject.
 	admin         bool   // Grants stream management.
@@ -65,9 +72,9 @@ type permMacro struct {
 }
 
 var permMacros = map[string]permMacro{
-	"kvro":            {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1},
-	"kvrw":            {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true},
-	"kvadmin":         {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true, admin: true},
+	"kvro":            {streamPrefix: "KV_", subjectPrefix: "$KV", dataViaAPI: true, args: 1},
+	"kvrw":            {streamPrefix: "KV_", subjectPrefix: "$KV", dataViaAPI: true, args: 1, write: true},
+	"kvadmin":         {streamPrefix: "KV_", subjectPrefix: "$KV", dataViaAPI: true, args: 1, write: true, admin: true},
 	"objro":           {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1},
 	"objrw":           {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true},
 	"objadmin":        {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true, admin: true},
@@ -78,16 +85,21 @@ var permMacros = map[string]permMacro{
 	"jsconsumeradmin": {args: 2, consumer: true, consumerAdmin: true},
 }
 
-// permMacroStream and permMacroConsumer are replaced by the resolved stream
-// and consumer names in the subject templates.
+// Placeholders of the subject templates below. {stream} and {consumer} are
+// replaced by the resolved resource names, {api} by the JetStream API prefix
+// and {dom} by the domain token of the v2 ack and flow control formats.
 const (
 	permMacroStream   = "{stream}"
 	permMacroConsumer = "{consumer}"
+	permMacroAPI      = "{api}"
+	permMacroDom      = "{dom}"
 )
 
-// permMacroDomainArg is the only named argument the grammar defines. It is
-// parsed here so that it is reported as an unsupported operation instead of
-// being taken for a literal resource name.
+// permMacroLocalAPI is the JetStream API prefix of the server's own domain,
+// which is what {api} becomes when the macro carries no domain argument.
+const permMacroLocalAPI = "$JS.API"
+
+// permMacroDomainArg is the only named argument the grammar defines.
 const permMacroDomainArg = "domain"
 
 // Publish subjects a client needs to consume a stream. The set covers the
@@ -101,48 +113,48 @@ const permMacroDomainArg = "domain"
 // ">" for one format could match the other format for another stream (for
 // example when a stream name is numeric and equals a v1 delivered count).
 var permMacroReadPubSubjects = []string{
-	"$JS.API.STREAM.INFO.{stream}",
-	"$JS.API.STREAM.MSG.GET.{stream}",
-	"$JS.API.DIRECT.GET.{stream}",
-	"$JS.API.DIRECT.GET.{stream}.>",
-	"$JS.API.CONSUMER.CREATE.{stream}",
-	"$JS.API.CONSUMER.CREATE.{stream}.>",
-	"$JS.API.CONSUMER.DURABLE.CREATE.{stream}.>",
-	"$JS.API.CONSUMER.INFO.{stream}.>",
-	"$JS.API.CONSUMER.NAMES.{stream}",
-	"$JS.API.CONSUMER.LIST.{stream}",
-	"$JS.API.CONSUMER.DELETE.{stream}.>",
-	"$JS.API.CONSUMER.MSG.NEXT.{stream}.>",
+	"{api}.STREAM.INFO.{stream}",
+	"{api}.STREAM.MSG.GET.{stream}",
+	"{api}.DIRECT.GET.{stream}",
+	"{api}.DIRECT.GET.{stream}.>",
+	"{api}.CONSUMER.CREATE.{stream}",
+	"{api}.CONSUMER.CREATE.{stream}.>",
+	"{api}.CONSUMER.DURABLE.CREATE.{stream}.>",
+	"{api}.CONSUMER.INFO.{stream}.>",
+	"{api}.CONSUMER.NAMES.{stream}",
+	"{api}.CONSUMER.LIST.{stream}",
+	"{api}.CONSUMER.DELETE.{stream}.>",
+	"{api}.CONSUMER.MSG.NEXT.{stream}.>",
 	"$JS.ACK.{stream}.*.*.*.*.*.*",
-	"$JS.ACK.*.*.{stream}.*.*.*.*.*.>",
+	"$JS.ACK.{dom}.*.{stream}.*.*.*.*.*.>",
 	"$JS.FC.{stream}.*.*",
-	"$JS.FC.*.*.{stream}.*.*",
+	"$JS.FC.{dom}.*.{stream}.*.*",
 }
 
 // Additional publish subjects a client needs to write to a stream, besides
 // the data subjects. Purge is used by KV PurgeDeletes and Object Store
 // Put/Delete.
 var permMacroWritePubSubjects = []string{
-	"$JS.API.STREAM.PURGE.{stream}",
+	"{api}.STREAM.PURGE.{stream}",
 }
 
 // Additional publish subjects a client needs to manage a stream. Account
 // info is included because clients call it before they create a bucket.
 var permMacroAdminPubSubjects = []string{
-	"$JS.API.STREAM.CREATE.{stream}",
-	"$JS.API.STREAM.UPDATE.{stream}",
-	"$JS.API.STREAM.DELETE.{stream}",
-	"$JS.API.STREAM.MSG.DELETE.{stream}",
-	"$JS.API.STREAM.SNAPSHOT.{stream}",
-	"$JS.API.STREAM.RESTORE.{stream}",
-	"$JS.API.INFO",
+	"{api}.STREAM.CREATE.{stream}",
+	"{api}.STREAM.UPDATE.{stream}",
+	"{api}.STREAM.DELETE.{stream}",
+	"{api}.STREAM.MSG.DELETE.{stream}",
+	"{api}.STREAM.SNAPSHOT.{stream}",
+	"{api}.STREAM.RESTORE.{stream}",
+	"{api}.INFO",
 }
 
 // Publish subjects for account-level JetStream discovery.
 var permMacroInfoPubSubjects = []string{
-	"$JS.API.INFO",
-	"$JS.API.STREAM.NAMES",
-	"$JS.API.STREAM.LIST",
+	"{api}.INFO",
+	"{api}.STREAM.NAMES",
+	"{api}.STREAM.LIST",
 }
 
 // Publish subjects a client needs to bind to one named consumer of a stream
@@ -153,40 +165,39 @@ var permMacroInfoPubSubjects = []string{
 // given above permMacroReadPubSubjects. They pin both the stream token and
 // the consumer token.
 var permMacroConsumerPubSubjects = []string{
-	"$JS.API.STREAM.INFO.{stream}",
-	"$JS.API.CONSUMER.INFO.{stream}.{consumer}",
-	"$JS.API.CONSUMER.MSG.NEXT.{stream}.{consumer}",
+	"{api}.STREAM.INFO.{stream}",
+	"{api}.CONSUMER.INFO.{stream}.{consumer}",
+	"{api}.CONSUMER.MSG.NEXT.{stream}.{consumer}",
 	"$JS.ACK.{stream}.{consumer}.*.*.*.*.*",
-	"$JS.ACK.*.*.{stream}.{consumer}.*.*.*.*.>",
+	"$JS.ACK.{dom}.*.{stream}.{consumer}.*.*.*.*.>",
 	"$JS.FC.{stream}.{consumer}.*",
-	"$JS.FC.*.*.{stream}.{consumer}.*",
+	"$JS.FC.{dom}.*.{stream}.{consumer}.*",
 }
 
 // Additional publish subjects a client needs to own one named consumer of a
 // stream: create it with a filter of its choice, pause it, unpin it, reset it
 // and delete it.
 var permMacroConsumerAdminPubSubjects = []string{
-	"$JS.API.CONSUMER.CREATE.{stream}.{consumer}",
-	"$JS.API.CONSUMER.CREATE.{stream}.{consumer}.>",
-	"$JS.API.CONSUMER.DURABLE.CREATE.{stream}.{consumer}",
-	"$JS.API.CONSUMER.DELETE.{stream}.{consumer}",
-	"$JS.API.CONSUMER.PAUSE.{stream}.{consumer}",
-	"$JS.API.CONSUMER.UNPIN.{stream}.{consumer}",
-	"$JS.API.CONSUMER.RESET.{stream}.{consumer}",
+	"{api}.CONSUMER.CREATE.{stream}.{consumer}",
+	"{api}.CONSUMER.CREATE.{stream}.{consumer}.>",
+	"{api}.CONSUMER.DURABLE.CREATE.{stream}.{consumer}",
+	"{api}.CONSUMER.DELETE.{stream}.{consumer}",
+	"{api}.CONSUMER.PAUSE.{stream}.{consumer}",
+	"{api}.CONSUMER.UNPIN.{stream}.{consumer}",
+	"{api}.CONSUMER.RESET.{stream}.{consumer}",
 }
 
 // subjects returns the subjects the macro emits for one tuple of resolved
-// positional argument values. The caller has checked that the macro is valid
-// for a subscribe list and that the tuple has m.args values.
-func (m permMacro) subjects(values []string, isSub bool) []string {
-	if m.info {
-		return append([]string(nil), permMacroInfoPubSubjects...)
-	}
+// positional argument values and one resolved domain, which is empty when the
+// macro names no domain. The caller has checked that the macro is valid for a
+// subscribe list and that the tuple has m.args values.
+func (m permMacro) subjects(values []string, domain string, isSub bool) []string {
 	name := _EMPTY_
 	if len(values) > 0 {
 		name = values[0]
 	}
-	stream := m.streamPrefix + name
+	// A subscribe list names the bucket's own data subject. That subject is
+	// account local, so a remote domain does not change it.
 	data := _EMPTY_
 	if m.subjectPrefix != _EMPTY_ {
 		data = m.subjectPrefix + "." + name + ".>"
@@ -194,15 +205,35 @@ func (m permMacro) subjects(values []string, isSub bool) []string {
 	if isSub {
 		return []string{data}
 	}
+	// Without a domain the client talks to the JetStream of its own server,
+	// and the domain token of the v2 ack and flow control formats is unknown,
+	// so it stays a wildcard.
+	api, dom := permMacroLocalAPI, pwcs
+	if domain != _EMPTY_ {
+		api, dom = "$JS."+domain+".API", domain
+		// A remote KV write is published through the domain API prefix, which
+		// the remote maps back to $KV.<b>.>. An Object Store write is not:
+		// clients do not prefix it and there is no $O domain mapping.
+		if m.dataViaAPI && data != _EMPTY_ {
+			data = api + "." + data
+		}
+	}
+	stream := m.streamPrefix + name
 	out := make([]string, 0, len(permMacroReadPubSubjects)+len(permMacroWritePubSubjects)+len(permMacroAdminPubSubjects)+1)
 	add := func(templates []string) {
 		for _, t := range templates {
+			t = strings.ReplaceAll(t, permMacroAPI, api)
+			t = strings.ReplaceAll(t, permMacroDom, dom)
 			t = strings.ReplaceAll(t, permMacroStream, stream)
 			if len(values) > 1 {
 				t = strings.ReplaceAll(t, permMacroConsumer, values[1])
 			}
 			out = append(out, t)
 		}
+	}
+	if m.info {
+		add(permMacroInfoPubSubjects)
+		return out
 	}
 	if m.consumer {
 		add(permMacroConsumerPubSubjects)
@@ -438,13 +469,21 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 		if isSub && !m.validInSubscribeList() {
 			return nil, fmt.Errorf("template macro in %q is not valid in a subscribe list", entry)
 		}
-		// The "domain" argument is parsed but not supported yet.
-		if call.badArgs || call.domain != _EMPTY_ || len(call.args) != m.args {
+		if call.badArgs || len(call.args) != m.args {
 			return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
 		}
-		// Resolve every positional argument to its list of valid values.
-		lists := make([][]string, 0, len(call.args))
-		for _, arg := range call.args {
+		// Resolve every argument to its list of valid values. The domain is
+		// resolved like a positional argument and comes last, so it is the
+		// innermost loop of the cartesian product below. A domain value is
+		// held to the same name rule as a resource name, which also keeps the
+		// wildcard out: a macro may name one domain, never all of them, so a
+		// literal "*" argument must stay a positional-only exception.
+		args := call.args
+		if call.domain != _EMPTY_ {
+			args = append(append(make([]string, 0, len(call.args)+1), call.args...), call.domain)
+		}
+		lists := make([][]string, 0, len(args))
+		for _, arg := range args {
 			values, ok := permMacroArgValues(arg, ujwt, acc)
 			if !ok {
 				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
@@ -465,12 +504,17 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 			lists = append(lists, valid)
 		}
 		// Emit one subject set per element of the cartesian product, with the
-		// first argument as the outer loop.
+		// first positional argument as the outer loop and the domain as the
+		// innermost one.
 		tuple := make([]string, len(lists))
 		var emit func(int) error
 		emit = func(i int) error {
 			if i == len(lists) {
-				subjects := m.subjects(tuple, isSub)
+				values, domain := tuple, _EMPTY_
+				if call.domain != _EMPTY_ {
+					values, domain = tuple[:len(tuple)-1], tuple[len(tuple)-1]
+				}
+				subjects := m.subjects(values, domain, isSub)
 				if len(out) > maxPermTemplateSubjectExpansions-len(subjects) {
 					return fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
 				}

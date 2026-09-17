@@ -286,9 +286,11 @@ Users who must not interfere with each other get `jsconsumer` or
 `server/auth_perm_macros.go` stays the only feature file; the four-line hook
 in `server/auth.go` does not change.
 
-- `permMacro` describes one macro: `streamPrefix`, `subjectPrefix`, `args`
-  (positional count: 0, 1 or 2), and level flags `write`, `admin`, `info`,
-  `consumer`, `consumerAdmin`.
+- `permMacro` describes one macro: `streamPrefix`, `subjectPrefix`,
+  `dataViaAPI` (the data publish subject of a remote domain goes through that
+  domain's API prefix, which is true for KV only), `args` (positional count:
+  0, 1 or 2), and level flags `write`, `admin`, `info`, `consumer`,
+  `consumerAdmin`.
 - Subject groups are `[]string` templates with the placeholders of §5,
   expanded by `strings.ReplaceAll`.
 - `parsePermMacro(op)` returns the macro, the positional argument strings and
@@ -333,11 +335,12 @@ permission violation was seen:
 
 ## 11. Implementation plan
 
-Three commits on `release/v2.14.7`, each with tests and doc updates
+Four commits on `release/v2.14.7`, each with tests and doc updates
 (`FORK-CHANGES.md` §4):
 
 1. Shared read set with exact-token ack patterns, admin set, `kvadmin`,
-   `objadmin`, `jsread`, `jsadmin`, `jsinfo`, subscribe-list rule, zero-argument macro.
-2. Argument list parsing, cartesian product, `jsconsumer`, `jsconsumeradmin`.
-3. `domain=` argument.
-4. Literal `*` argument.
+   `objadmin`, `jsread`, `jsadmin`, `jsinfo`, subscribe-list rule, zero-argument macro. **Done.**
+2. Argument list parsing, cartesian product, `jsconsumer`, `jsconsumeradmin`. **Done.**
+3. `domain=` argument. **Done.**
+4. Literal `*` argument. Note that `*` stays invalid for `domain=` (§3), so
+   the literal wildcard exception must apply to positional arguments only.

@@ -143,9 +143,10 @@ func TestJWTTemplateMacroConsumerArgumentWhitespace(t *testing.T) {
 	requireSameSubjects(t, res.Pub.Allow, macroConsumerPubSubjects("orders", "workers"))
 }
 
-// A wrong number of positional arguments, a named argument, or an unknown
-// named argument is the upstream "is not defined" error. The "domain"
-// argument is reserved for the next commit and is not supported yet.
+// A wrong number of positional arguments, or an unknown, empty, repeated or
+// misplaced named argument, is the upstream "is not defined" error. The only
+// named argument the grammar defines is the trailing "domain", which
+// TestJWTTemplateMacroDomain* covers.
 func TestJWTTemplateMacroArgumentListErrors(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:foo", "js:orders", "c:workers")
 	for _, entry := range []string{
@@ -157,12 +158,11 @@ func TestJWTTemplateMacroArgumentListErrors(t *testing.T) {
 		"{{jsinfo(orders)}}",
 		"{{jsinfo(,)}}",
 		"{{kvro(foo, bar)}}",
-		"{{jsconsumer(orders, workers, domain=hub)}}",
 		"{{jsconsumer(orders, domain=hub)}}",
-		"{{jsread(orders, domain=hub)}}",
-		"{{kvrw(tag(kv), domain=hub)}}",
-		"{{jsinfo(domain=hub)}}",
+		"{{jsread(orders, workers, domain=hub)}}",
+		"{{jsinfo(hub, domain=hub)}}",
 		"{{jsread(orders, region=eu)}}",
+		"{{kvrw(tag(kv), region=eu)}}",
 		"{{jsconsumer(domain=hub, orders, workers)}}",
 		"{{jsconsumer(orders, workers, domain=)}}",
 		"{{jsconsumer(orders, workers, domain=a, domain=b)}}",

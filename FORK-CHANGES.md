@@ -511,10 +511,19 @@ permissions are written* in the account JWT changes.
   argument as the outer loop. So `{{jsconsumer(tag(s), tag(c))}}` with tags
   `s:a`, `s:b`, `c:1`, `c:2` emits four sets, in the order (a,1), (a,2),
   (b,1), (b,2).
-- The name `domain=` is **reserved** for a trailing named argument that a
-  later commit adds for remote JetStream domains. Today a macro that carries
-  `domain=` is rejected, as is any other named argument and any positional
-  argument that follows a named one.
+- Every macro also takes one optional **trailing named argument**,
+  `domain=ARG`, which points the macro at a JetStream domain the client
+  reaches through a leaf node: `{{kvrw(tag(kv), domain=hub)}}`. `ARG` is a
+  literal or a value operation, exactly like a positional argument, so
+  `domain=tag(dom)` gives one subject set per domain tag. The domain is the
+  **innermost** loop of the cartesian product, so
+  `{{jsread(tag(s), domain=tag(d))}}` with tags `s:a`, `s:b`, `d:1`, `d:2`
+  emits the sets (a,1), (a,2), (b,1), (b,2). A domain value follows the same
+  name rule and the same allow/deny rules as a resource name, so a user
+  without the domain tag fails closed. `domain=` must follow every positional
+  argument, may appear once, may not be empty, and is the only named argument
+  the grammar defines: any other named key, a repeated or empty `domain=`, or
+  a positional argument after a named one, is an error.
 - Entries that are not macros pass through untouched and are then processed by
   the upstream template engine, so macros mix freely with `{{tag(x)}}` style
   entries and plain subjects.
@@ -616,6 +625,29 @@ the consumer, so a filter the administrator set holds. With
 `jsconsumeradmin` the user owns that one consumer and picks its filter, which
 isolates users from each other but does not restrict the data they read.
 
+**With a domain**, for example `domain=hub`, every set above changes in five
+ways and in no other way:
+
+1. `$JS.API.` becomes `$JS.hub.API.` in every API subject, `$JS.API.INFO`
+   included.
+2. The domain token of the **v2** ack and flow control patterns becomes the
+   domain name: `$JS.ACK.hub.*.{stream}.*.*.*.*.*.>` and
+   `$JS.FC.hub.*.{stream}.*.*`. The account hash stays a wildcard, because the
+   remote may register the account under another name. The v1 patterns carry
+   no domain token and do not change.
+3. The KV data publish subject becomes `$JS.hub.API.$KV.<b>.>`. That is what
+   nats.go publishes to when an API prefix is set, and the remote maps it back
+   to `$KV.<b>.>`.
+4. The Object Store data publish subject stays `$O.<b>.>`. Clients do not
+   prefix it and the server has no `$O` domain mapping.
+5. Subscribe lists do not change. A bucket's data subject is account local, so
+   a bucket macro still emits `$KV.<b>.>` or `$O.<b>.>` there.
+
+So `{{kvrw(tag(kv), domain=hub)}}` with tag `kv:cfg` emits
+`$JS.hub.API.STREAM.INFO.KV_cfg` through `$JS.hub.API.STREAM.PURGE.KV_cfg`
+plus `$JS.hub.API.$KV.cfg.>` in a publish list, and `$KV.cfg.>` in a
+subscribe list.
+
 The read set was derived from what nats.go v1.51 (both the legacy
 `nats.KeyValue` API and the `jetstream` package) actually publishes, and is
 verified end to end by the `TestJWTTemplateMacro*EndToEnd` tests. Every
@@ -641,10 +673,12 @@ match a v2 subject of another stream and vice versa.
   and consumer deliveries arrive on inboxes; add it once per template.
 - Publish subjects of a plain stream. They come from the stream's
   configuration, not its name, so they stay ordinary template entries.
-- JetStream domains and cross-account API imports with a custom prefix. Macros
-  emit the default `$JS.API.` prefix. Local-domain prefixes are covered
-  anyway, because the server maps `$JS.<domain>.API.>` to `$JS.API.>` before
-  the permission check.
+- Cross-account JetStream API imports with a custom prefix. Macros emit the
+  default `$JS.API.` prefix, or `$JS.<domain>.API.` with `domain=`; an API
+  imported under an arbitrary prefix stays an ordinary template entry. A
+  client that targets the server's **own** domain needs no `domain=` either
+  way, because the server maps `$JS.<local domain>.API.>` to `$JS.API.>`
+  before the permission check.
 
 ## 4.4 Read-only users and consumers
 
@@ -692,10 +726,12 @@ who must not interfere with each other should get a consumer-level macro,
 - `server/auth_perm_macros.go` — macro table (`permMacros`), subject sets
   (`permMacroReadPubSubjects`, `permMacroWritePubSubjects`,
   `permMacroAdminPubSubjects`, `permMacroInfoPubSubjects`,
-  `permMacroConsumerPubSubjects`, `permMacroConsumerAdminPubSubjects`),
-  argument list parsing (`parsePermMacro`, `splitPermMacroArgs`), argument
-  resolution and the per-list expansion (`expandPermMacroList`,
-  `expandPermissionMacros`).
+  `permMacroConsumerPubSubjects`, `permMacroConsumerAdminPubSubjects`), which
+  are templates over the placeholders `{stream}`, `{consumer}`, `{api}` (the
+  JetStream API prefix) and `{dom}` (the domain token of the v2 ack and flow
+  control formats), argument list parsing (`parsePermMacro`,
+  `splitPermMacroArgs`), argument resolution and the per-list expansion
+  (`expandPermMacroList`, `expandPermissionMacros`).
 - `server/auth.go` — one four-line hook in `processUserPermissionsTemplate`,
   placed after the fail-closed bookkeeping and before the upstream template
   pass. Both callers (operator-mode scoped signers and the auth callout) go
