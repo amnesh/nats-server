@@ -342,5 +342,7 @@ Four commits on `release/v2.14.7`, each with tests and doc updates
    `objadmin`, `jsread`, `jsadmin`, `jsinfo`, subscribe-list rule, zero-argument macro. **Done.**
 2. Argument list parsing, cartesian product, `jsconsumer`, `jsconsumeradmin`. **Done.**
 3. `domain=` argument. **Done.**
-4. Literal `*` argument. Note that `*` stays invalid for `domain=` (§3), so
+4. Literal `*` argument. **Done.** Implemented as a positional-only
+   exception before value resolution, so `*` from tags and for `domain=`
+   still fails the name rule. Note that `*` stays invalid for `domain=` (§3), so
    the literal wildcard exception must apply to positional arguments only.

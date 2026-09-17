@@ -218,7 +218,14 @@ func (m permMacro) subjects(values []string, domain string, isSub bool) []string
 			data = api + "." + data
 		}
 	}
+	// The literal * names every stream. NATS wildcards match whole tokens, so
+	// the stream token becomes * on its own: KV_* would be a literal token that
+	// matches nothing. A bucket wildcard therefore grants the API of every
+	// stream in the account, which the documentation states.
 	stream := m.streamPrefix + name
+	if name == pwcs {
+		stream = pwcs
+	}
 	out := make([]string, 0, len(permMacroReadPubSubjects)+len(permMacroWritePubSubjects)+len(permMacroAdminPubSubjects)+1)
 	add := func(templates []string) {
 		for _, t := range templates {
@@ -350,7 +357,12 @@ func permMacroTagKey(arg, call string) (string, bool) {
 	if len(arg) <= len(call) || !strings.EqualFold(arg[:len(call)], call) || !strings.HasSuffix(arg, ")") {
 		return _EMPTY_, false
 	}
-	return strings.TrimSpace(arg[len(call) : len(arg)-1]), true
+	key := strings.TrimSpace(arg[len(call) : len(arg)-1])
+	// A stray parenthesis, as in tag(kv)), is a malformed call, not a key.
+	if strings.ContainsAny(key, "()") {
+		return _EMPTY_, false
+	}
+	return key, true
 }
 
 // permMacroArgValues resolves a macro argument to the list of resource
@@ -483,7 +495,15 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 			args = append(append(make([]string, 0, len(call.args)+1), call.args...), call.domain)
 		}
 		lists := make([][]string, 0, len(args))
-		for _, arg := range args {
+		for i, arg := range args {
+			// The literal * is a template author's decision and means every
+			// resource of that kind. It is accepted for positional arguments
+			// only: * from a tag or any value operation, and * as a domain,
+			// still fail the name rule below.
+			if arg == pwcs && i < len(call.args) {
+				lists = append(lists, []string{pwcs})
+				continue
+			}
 			values, ok := permMacroArgValues(arg, ujwt, acc)
 			if !ok {
 				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)

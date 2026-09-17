@@ -538,6 +538,12 @@ permissions are written* in the account JWT changes.
   `maxPermTemplateSubjectExpansions` (4096). With 16 subjects per read-only
   resource that is 256 resources per user, 227 for read/write, 163 for admin,
   585 for `jsconsumer` and 292 for `jsconsumeradmin`.
+- The literal `*` is accepted as a positional argument and means every
+  resource of that kind: `{{jsread(*)}}`, `{{kvrw(*)}}`,
+  `{{jsconsumer(orders, *)}}`. It is a template author's decision, so `*`
+  from a tag or from any other value operation stays an invalid value, and
+  `*` is not accepted for `domain=`. See §4.3 for what a bucket wildcard
+  grants.
 - Unknown macro names such as `{{kvxx(...)}}` are rejected by the upstream
   "template operation is not defined" path, exactly as today.
 
@@ -655,6 +661,16 @@ subject is bound to the resource's own stream, so the wider patterns (for
 example `CONSUMER.CREATE.{stream}.>`) cannot reach other streams. The ack and
 flow control patterns use exact token counts so that a v1 pattern can never
 match a v2 subject of another stream and vice versa.
+
+**With a wildcard.** NATS wildcards match whole tokens, so `*` replaces the
+whole stream token and the data subject becomes `$KV.*.>` or `$O.*.>`.
+`{{jsread(*)}}` and `{{jsadmin(*)}}` are exact: every stream. A bucket
+wildcard such as `{{kvrw(*)}}` grants all KV data **and the JetStream API of
+every stream in the account**, not only of buckets, because the bucket name
+lives inside the stream token and `KV_*` would be a literal, not a wildcard.
+There is no subject pattern that means "all KV buckets but no other stream".
+`{{jsconsumer(orders, *)}}` means every consumer of `orders`. Prefix forms
+such as `team-*` are impossible for the same reason and are rejected.
 
 **Operational notes:**
 

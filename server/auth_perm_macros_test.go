@@ -261,6 +261,8 @@ func TestJWTTemplateMacroUnknownOperationStillErrors(t *testing.T) {
 		"{{kvro(nope(kv))}}",
 		"{{kvro()}}",
 		"{{kvro(tag())}}",
+		"{{kvro(tag(kv)))}}",
+		"{{kvro(tag((kv)))}}",
 	} {
 		t.Run(entry, func(t *testing.T) {
 			lim := jwt.UserPermissionLimits{}
