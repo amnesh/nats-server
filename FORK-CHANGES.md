@@ -434,8 +434,8 @@ See commit `6f42d0a4f` for the exact `Options` fields and plumbing.
 Scoped signing key templates (`UserScope.Template` in an account JWT) get a
 set of new template operations, called macros. Each one expands a single
 template entry into the full set of subjects a client needs for **one
-JetStream resource**: a KV bucket, an Object Store bucket, a plain stream, or
-the account's JetStream discovery API. Design spec:
+JetStream resource**: a KV bucket, an Object Store bucket, a plain stream, one
+consumer of a stream, or the account's JetStream discovery API. Design spec:
 `docs/superpowers/specs/2026-09-17-permission-template-macros-v2-design.md`.
 
 | Macro | Resource | Grants |
@@ -449,6 +449,8 @@ the account's JetStream discovery API. Design spec:
 | `{{jsread(ARG)}}` | stream | consume with any consumer: create, info, pull, ack, delete |
 | `{{jsadmin(ARG)}}` | stream | read + purge + create, update, delete, message delete, snapshot, restore |
 | `{{jsinfo()}}` | account | account info, stream names, stream list |
+| `{{jsconsumer(STREAM, CONSUMER)}}` | one consumer | bind to that consumer: info, pull, ack |
+| `{{jsconsumeradmin(STREAM, CONSUMER)}}` | one consumer | consumer use + create, pause, unpin, reset, delete that consumer |
 
 `ARG` names the resource(s). It is any value-producing template operation the
 server already supports, or a literal name:
@@ -493,9 +495,26 @@ permissions are written* in the account JWT changes.
 - Bucket macros work in all four lists. In `pub.allow` / `pub.deny` they emit
   the API subjects of §4.3; in `sub.allow` / `sub.deny` they emit only the
   bucket's data subject (`$KV.<b>.>` or `$O.<b>.>`).
-- Stream macros and `jsinfo` are only valid in publish lists. A stream has no
-  derivable data subject, so using them in a subscribe list is an error.
+- Stream macros, consumer macros and `jsinfo` are only valid in publish lists.
+  A stream has no derivable data subject, so using them in a subscribe list is
+  an error.
 - `jsinfo` takes no argument: `{{jsinfo()}}`.
+- A macro takes a fixed number of **positional** arguments, separated by
+  commas: one for the bucket and stream macros, zero for `jsinfo`, two for the
+  consumer macros (stream first, consumer second). A wrong number of arguments
+  is an error. Whitespace around every part is trimmed, so
+  `{{ jsconsumer( tag(js) , workers ) }}` is the same entry as
+  `{{jsconsumer(tag(js),workers)}}`. Commas inside a value operation do not
+  split the list, because the split is made at parenthesis depth zero.
+- Each argument resolves to a **list** of values. The macro emits one subject
+  set per element of the **cartesian product** of all lists, with the first
+  argument as the outer loop. So `{{jsconsumer(tag(s), tag(c))}}` with tags
+  `s:a`, `s:b`, `c:1`, `c:2` emits four sets, in the order (a,1), (a,2),
+  (b,1), (b,2).
+- The name `domain=` is **reserved** for a trailing named argument that a
+  later commit adds for remote JetStream domains. Today a macro that carries
+  `domain=` is rejected, as is any other named argument and any positional
+  argument that follows a named one.
 - Entries that are not macros pass through untouched and are then processed by
   the upstream template engine, so macros mix freely with `{{tag(x)}}` style
   entries and plain subjects.
@@ -508,13 +527,15 @@ permissions are written* in the account JWT changes.
   compensating `deny >`, so a user without tags fails closed.
 - The total number of subjects per list is capped by the existing
   `maxPermTemplateSubjectExpansions` (4096). With 16 subjects per read-only
-  resource that is 256 resources per user, 227 for read/write, 163 for admin.
+  resource that is 256 resources per user, 227 for read/write, 163 for admin,
+  585 for `jsconsumer` and 292 for `jsconsumeradmin`.
 - Unknown macro names such as `{{kvxx(...)}}` are rejected by the upstream
   "template operation is not defined" path, exactly as today.
 
 ## 4.3 What a macro expands to
 
-`{stream}` is `KV_<b>`, `OBJ_<b>`, or the stream name. Levels are cumulative.
+`{stream}` is `KV_<b>`, `OBJ_<b>`, or the stream name. `{consumer}` is the
+consumer name of a consumer macro. Levels are cumulative.
 
 **read** (16 subjects), every macro except `jsinfo`:
 
@@ -563,6 +584,37 @@ $JS.API.INFO
 $JS.API.STREAM.NAMES
 $JS.API.STREAM.LIST
 ```
+
+**consumer use** (7 subjects), for `jsconsumer` and `jsconsumeradmin`:
+
+```text
+$JS.API.STREAM.INFO.{stream}
+$JS.API.CONSUMER.INFO.{stream}.{consumer}
+$JS.API.CONSUMER.MSG.NEXT.{stream}.{consumer}    # pull requests
+$JS.ACK.{stream}.{consumer}.*.*.*.*.*            # acks, v1 reply format (9 tokens)
+$JS.ACK.*.*.{stream}.{consumer}.*.*.*.*.>        # acks, v2 reply format (11+ tokens)
+$JS.FC.{stream}.{consumer}.*                     # push flow control, v1 (5 tokens)
+$JS.FC.*.*.{stream}.{consumer}.*                 # push flow control, v2 (7 tokens)
+```
+
+**consumer admin** adds 7 subjects, for `jsconsumeradmin`:
+
+```text
+$JS.API.CONSUMER.CREATE.{stream}.{consumer}
+$JS.API.CONSUMER.CREATE.{stream}.{consumer}.>    # create with a filter subject
+$JS.API.CONSUMER.DURABLE.CREATE.{stream}.{consumer}
+$JS.API.CONSUMER.DELETE.{stream}.{consumer}
+$JS.API.CONSUMER.PAUSE.{stream}.{consumer}
+$JS.API.CONSUMER.UNPIN.{stream}.{consumer}
+$JS.API.CONSUMER.RESET.{stream}.{consumer}
+```
+
+A consumer macro is not cumulative with the read set. It grants nothing on
+the stream except `STREAM.INFO`, so the user can bind to that one consumer
+and to no other. With `jsconsumer` the user cannot create, change or delete
+the consumer, so a filter the administrator set holds. With
+`jsconsumeradmin` the user owns that one consumer and picks its filter, which
+isolates users from each other but does not restrict the data they read.
 
 The read set was derived from what nats.go v1.51 (both the legacy
 `nats.KeyValue` API and the `jetstream` package) actually publishes, and is
@@ -614,8 +666,8 @@ and are not exposed this way; pull consumers are, because `MSG.NEXT` is
 addressed by consumer name. KV and Object Store clients use ephemeral push
 consumers only today, but nats.go plans to move KV watch to pull-based
 ordered consumers, so the read set keeps the pull and ack subjects. Users
-who must not interfere with each other should get a consumer-level macro
-(planned: `jsconsumer`) instead of a stream-wide read macro.
+who must not interfere with each other should get a consumer-level macro,
+`jsconsumer` or `jsconsumeradmin`, instead of a stream-wide read macro.
 
 ## 4.5 Security model
 
@@ -639,7 +691,9 @@ who must not interfere with each other should get a consumer-level macro
 
 - `server/auth_perm_macros.go` — macro table (`permMacros`), subject sets
   (`permMacroReadPubSubjects`, `permMacroWritePubSubjects`,
-  `permMacroAdminPubSubjects`, `permMacroInfoPubSubjects`), argument
+  `permMacroAdminPubSubjects`, `permMacroInfoPubSubjects`,
+  `permMacroConsumerPubSubjects`, `permMacroConsumerAdminPubSubjects`),
+  argument list parsing (`parsePermMacro`, `splitPermMacroArgs`), argument
   resolution and the per-list expansion (`expandPermMacroList`,
   `expandPermissionMacros`).
 - `server/auth.go` — one four-line hook in `processUserPermissionsTemplate`,

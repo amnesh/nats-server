@@ -174,13 +174,18 @@ a bucket. `jsadmin` is read + `STREAM.PURGE` + admin (no data subject).
 {api}.CONSUMER.INFO.{stream}.{consumer}
 {api}.CONSUMER.MSG.NEXT.{stream}.{consumer}
 $JS.ACK.{stream}.{consumer}.*.*.*.*.*
-$JS.ACK.{dom}.*.{stream}.{consumer}.*.*.*.*.*.>
+$JS.ACK.{dom}.*.{stream}.{consumer}.*.*.*.*.>
 $JS.FC.{stream}.{consumer}.*
 $JS.FC.{dom}.*.{stream}.{consumer}.*
 ```
 
 The user can bind to and consume from that one consumer. The user cannot
 create, change, or delete it, so a filter set by the administrator holds.
+
+The v2 ack pattern pins the consumer token, so it has one `*` less than the
+read set pattern of §5.1: a v2 ack subject has 11 tokens, the consumer token
+is the sixth, and the trailing `>` matches the last one.
+`TestJWTTemplateMacroConsumerEndToEnd/ack_v2` proves the pattern.
 
 ### 5.6 consumer admin (adds 7 subjects)
 

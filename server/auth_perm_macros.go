@@ -24,11 +24,16 @@ import (
 //
 // A scoped signing key template entry that is exactly one macro token, for
 // example {{kvrw(tag(kv))}}, expands into the full set of subjects a client
-// needs for one JetStream resource: a KV bucket, an Object Store bucket, or a
-// plain stream. The macro argument is a value-producing template operation
-// (tag(x), account-tag(x), name(), subject(), account-name(),
-// account-subject()) or a literal name. One subject set is emitted per
-// resolved value. {{jsinfo()}} takes no argument.
+// needs for one JetStream resource: a KV bucket, an Object Store bucket, a
+// plain stream, or one consumer of a stream. Each macro argument is a
+// value-producing template operation (tag(x), account-tag(x), name(),
+// subject(), account-name(), account-subject()) or a literal name.
+//
+// Arguments are positional and separated by commas at parenthesis depth zero,
+// for example {{jsconsumer(orders, tag(worker))}}. Every argument resolves to
+// a list of values, and the macro emits one subject set per element of the
+// cartesian product of those lists, first argument first. {{jsinfo()}} takes
+// no argument.
 //
 // Macros are expanded by expandPermissionMacros, which runs inside
 // processUserPermissionsTemplate before the upstream template pass. Entries
@@ -41,8 +46,8 @@ import (
 //     subjects for the resource's stream. Levels are cumulative: read,
 //     read+write, read+write+admin.
 //   - In a subscribe list a bucket macro emits only the bucket's data
-//     subject. Stream macros and jsinfo are errors there, because a stream
-//     has no derivable data subject.
+//     subject. Stream macros, consumer macros and jsinfo are errors there,
+//     because a stream has no derivable data subject.
 //
 // Inbox subjects (for JetStream API replies) are deliberately not part of
 // any macro. The design is documented in
@@ -55,22 +60,35 @@ type permMacro struct {
 	write         bool   // Grants writes: purge and, for buckets, the data subject.
 	admin         bool   // Grants stream management.
 	info          bool   // Account-level JetStream discovery, no resource.
+	consumer      bool   // Grants the use of one named consumer of the stream.
+	consumerAdmin bool   // Grants the management of that one consumer.
 }
 
 var permMacros = map[string]permMacro{
-	"kvro":     {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1},
-	"kvrw":     {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true},
-	"kvadmin":  {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true, admin: true},
-	"objro":    {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1},
-	"objrw":    {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true},
-	"objadmin": {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true, admin: true},
-	"jsread":   {args: 1},
-	"jsadmin":  {args: 1, write: true, admin: true},
-	"jsinfo":   {args: 0, info: true},
+	"kvro":            {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1},
+	"kvrw":            {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true},
+	"kvadmin":         {streamPrefix: "KV_", subjectPrefix: "$KV", args: 1, write: true, admin: true},
+	"objro":           {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1},
+	"objrw":           {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true},
+	"objadmin":        {streamPrefix: "OBJ_", subjectPrefix: "$O", args: 1, write: true, admin: true},
+	"jsread":          {args: 1},
+	"jsadmin":         {args: 1, write: true, admin: true},
+	"jsinfo":          {args: 0, info: true},
+	"jsconsumer":      {args: 2, consumer: true},
+	"jsconsumeradmin": {args: 2, consumer: true, consumerAdmin: true},
 }
 
-// permMacroStream is replaced by the stream name in the subject templates.
-const permMacroStream = "{stream}"
+// permMacroStream and permMacroConsumer are replaced by the resolved stream
+// and consumer names in the subject templates.
+const (
+	permMacroStream   = "{stream}"
+	permMacroConsumer = "{consumer}"
+)
+
+// permMacroDomainArg is the only named argument the grammar defines. It is
+// parsed here so that it is reported as an unsupported operation instead of
+// being taken for a literal resource name.
+const permMacroDomainArg = "domain"
 
 // Publish subjects a client needs to consume a stream. The set covers the
 // nats.go legacy and new JetStream APIs: stream info, message get (direct
@@ -127,11 +145,46 @@ var permMacroInfoPubSubjects = []string{
 	"$JS.API.STREAM.LIST",
 }
 
-// subjects returns the subjects the macro emits for one resource name. The
-// caller has checked that the macro is valid for a subscribe list.
-func (m permMacro) subjects(name string, isSub bool) []string {
+// Publish subjects a client needs to bind to one named consumer of a stream
+// and to consume from it. The client cannot create, change or delete that
+// consumer, so a filter the administrator set holds.
+//
+// The ack and flow control patterns use exact token counts, for the reason
+// given above permMacroReadPubSubjects. They pin both the stream token and
+// the consumer token.
+var permMacroConsumerPubSubjects = []string{
+	"$JS.API.STREAM.INFO.{stream}",
+	"$JS.API.CONSUMER.INFO.{stream}.{consumer}",
+	"$JS.API.CONSUMER.MSG.NEXT.{stream}.{consumer}",
+	"$JS.ACK.{stream}.{consumer}.*.*.*.*.*",
+	"$JS.ACK.*.*.{stream}.{consumer}.*.*.*.*.>",
+	"$JS.FC.{stream}.{consumer}.*",
+	"$JS.FC.*.*.{stream}.{consumer}.*",
+}
+
+// Additional publish subjects a client needs to own one named consumer of a
+// stream: create it with a filter of its choice, pause it, unpin it, reset it
+// and delete it.
+var permMacroConsumerAdminPubSubjects = []string{
+	"$JS.API.CONSUMER.CREATE.{stream}.{consumer}",
+	"$JS.API.CONSUMER.CREATE.{stream}.{consumer}.>",
+	"$JS.API.CONSUMER.DURABLE.CREATE.{stream}.{consumer}",
+	"$JS.API.CONSUMER.DELETE.{stream}.{consumer}",
+	"$JS.API.CONSUMER.PAUSE.{stream}.{consumer}",
+	"$JS.API.CONSUMER.UNPIN.{stream}.{consumer}",
+	"$JS.API.CONSUMER.RESET.{stream}.{consumer}",
+}
+
+// subjects returns the subjects the macro emits for one tuple of resolved
+// positional argument values. The caller has checked that the macro is valid
+// for a subscribe list and that the tuple has m.args values.
+func (m permMacro) subjects(values []string, isSub bool) []string {
 	if m.info {
 		return append([]string(nil), permMacroInfoPubSubjects...)
+	}
+	name := _EMPTY_
+	if len(values) > 0 {
+		name = values[0]
 	}
 	stream := m.streamPrefix + name
 	data := _EMPTY_
@@ -144,8 +197,19 @@ func (m permMacro) subjects(name string, isSub bool) []string {
 	out := make([]string, 0, len(permMacroReadPubSubjects)+len(permMacroWritePubSubjects)+len(permMacroAdminPubSubjects)+1)
 	add := func(templates []string) {
 		for _, t := range templates {
-			out = append(out, strings.ReplaceAll(t, permMacroStream, stream))
+			t = strings.ReplaceAll(t, permMacroStream, stream)
+			if len(values) > 1 {
+				t = strings.ReplaceAll(t, permMacroConsumer, values[1])
+			}
+			out = append(out, t)
 		}
+	}
+	if m.consumer {
+		add(permMacroConsumerPubSubjects)
+		if m.consumerAdmin {
+			add(permMacroConsumerAdminPubSubjects)
+		}
+		return out
 	}
 	add(permMacroReadPubSubjects)
 	if m.write {
@@ -166,18 +230,87 @@ func (m permMacro) validInSubscribeList() bool {
 	return m.subjectPrefix != _EMPTY_
 }
 
+// permMacroCall is one parsed macro token.
+type permMacroCall struct {
+	macro   permMacro
+	args    []string // Raw positional arguments, in the order they were written.
+	domain  string   // Value of the named "domain" argument, empty when absent.
+	badArgs bool     // The argument list does not follow the grammar.
+}
+
+// splitPermMacroArgs splits an argument list on commas at parenthesis depth
+// zero and trims every part. An unbalanced list is not an error here: the
+// parts are returned as they are and the caller rejects them.
+func splitPermMacroArgs(list string) []string {
+	var parts []string
+	depth, start := 0, 0
+	for i := 0; i < len(list); i++ {
+		switch list[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case ',':
+			if depth == 0 {
+				parts = append(parts, strings.TrimSpace(list[start:i]))
+				start = i + 1
+			}
+		}
+	}
+	return append(parts, strings.TrimSpace(list[start:]))
+}
+
+// permMacroNamedArg splits a "key=value" argument. A "=" that comes after a
+// "(" belongs to a value operation, not to a named argument.
+func permMacroNamedArg(part string) (string, string, bool) {
+	for i := 0; i < len(part); i++ {
+		switch part[i] {
+		case '=':
+			return strings.TrimSpace(part[:i]), strings.TrimSpace(part[i+1:]), true
+		case '(':
+			return _EMPTY_, _EMPTY_, false
+		}
+	}
+	return _EMPTY_, _EMPTY_, false
+}
+
 // parsePermMacro checks whether op, the trimmed content of one {{...}}
-// token, is a macro call and returns the macro and its raw argument.
-func parsePermMacro(op string) (permMacro, string, bool) {
+// token, is a macro call and returns the parsed call. The second result
+// reports whether op names a macro at all; a call whose argument list is
+// malformed is still a macro call, and the caller reports it.
+func parsePermMacro(op string) (permMacroCall, bool) {
 	i := strings.IndexByte(op, '(')
 	if i <= 0 || !strings.HasSuffix(op, ")") {
-		return permMacro{}, _EMPTY_, false
+		return permMacroCall{}, false
 	}
 	m, ok := permMacros[strings.ToLower(strings.TrimSpace(op[:i]))]
 	if !ok {
-		return permMacro{}, _EMPTY_, false
+		return permMacroCall{}, false
 	}
-	return m, strings.TrimSpace(op[i+1 : len(op)-1]), true
+	call := permMacroCall{macro: m}
+	list := strings.TrimSpace(op[i+1 : len(op)-1])
+	if list == _EMPTY_ {
+		return call, true
+	}
+	for _, part := range splitPermMacroArgs(list) {
+		key, value, named := permMacroNamedArg(part)
+		if !named {
+			// Positional arguments come before the named argument.
+			if call.domain != _EMPTY_ {
+				call.badArgs = true
+			}
+			call.args = append(call.args, part)
+			continue
+		}
+		if !strings.EqualFold(key, permMacroDomainArg) || value == _EMPTY_ || call.domain != _EMPTY_ {
+			call.badArgs = true
+			continue
+		}
+		call.domain = value
+	}
+	return call, true
 }
 
 // permMacroTagKey returns the key of a tag(key) or account-tag(key) style
@@ -271,7 +404,7 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 			continue
 		}
 		for _, tk := range mustacheRE.FindAllString(entry, -1) {
-			if _, _, ok := parsePermMacro(trimOp(tk)); ok {
+			if _, ok := parsePermMacro(trimOp(tk)); ok {
 				hasMacro = true
 				break
 			}
@@ -288,7 +421,7 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 		tokens := mustacheRE.FindAllString(entry, -1)
 		macroTokens := 0
 		for _, tk := range tokens {
-			if _, _, ok := parsePermMacro(trimOp(tk)); ok {
+			if _, ok := parsePermMacro(trimOp(tk)); ok {
 				macroTokens++
 			}
 		}
@@ -300,37 +433,60 @@ func expandPermMacroList(list jwt.StringList, isSub, failOnBadSubject bool, ujwt
 			return nil, fmt.Errorf("template macro in %q must be the whole entry", entry)
 		}
 		op := trimOp(tokens[0])
-		m, arg, _ := parsePermMacro(op)
+		call, _ := parsePermMacro(op)
+		m := call.macro
 		if isSub && !m.validInSubscribeList() {
 			return nil, fmt.Errorf("template macro in %q is not valid in a subscribe list", entry)
 		}
-		var values []string
-		if m.args == 0 {
-			if arg != _EMPTY_ {
-				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
-			}
-			values = []string{_EMPTY_}
-		} else {
-			var ok bool
-			if values, ok = permMacroArgValues(arg, ujwt, acc); !ok {
+		// The "domain" argument is parsed but not supported yet.
+		if call.badArgs || call.domain != _EMPTY_ || len(call.args) != m.args {
+			return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
+		}
+		// Resolve every positional argument to its list of valid values.
+		lists := make([][]string, 0, len(call.args))
+		for _, arg := range call.args {
+			values, ok := permMacroArgValues(arg, ujwt, acc)
+			if !ok {
 				return nil, fmt.Errorf("template operation in %q: %q is not defined", entry, op)
 			}
 			if len(values) == 0 && failOnBadSubject {
 				return nil, fmt.Errorf("generated invalid subject %q: %q is not defined", entry, arg)
 			}
-		}
-		for _, v := range values {
-			if m.args > 0 && !isValidPermMacroName(v) {
-				if failOnBadSubject {
-					return nil, fmt.Errorf("generated invalid subject %q: %q is not a valid name", entry, v)
+			valid := make([]string, 0, len(values))
+			for _, v := range values {
+				if !isValidPermMacroName(v) {
+					if failOnBadSubject {
+						return nil, fmt.Errorf("generated invalid subject %q: %q is not a valid name", entry, v)
+					}
+					continue
 				}
-				continue
+				valid = append(valid, v)
 			}
-			subjects := m.subjects(v, isSub)
-			if len(out) > maxPermTemplateSubjectExpansions-len(subjects) {
-				return nil, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
+			lists = append(lists, valid)
+		}
+		// Emit one subject set per element of the cartesian product, with the
+		// first argument as the outer loop.
+		tuple := make([]string, len(lists))
+		var emit func(int) error
+		emit = func(i int) error {
+			if i == len(lists) {
+				subjects := m.subjects(tuple, isSub)
+				if len(out) > maxPermTemplateSubjectExpansions-len(subjects) {
+					return fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
+				}
+				out = append(out, subjects...)
+				return nil
 			}
-			out = append(out, subjects...)
+			for _, v := range lists[i] {
+				tuple[i] = v
+				if err := emit(i + 1); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		if err := emit(0); err != nil {
+			return nil, err
 		}
 	}
 	return out, nil
