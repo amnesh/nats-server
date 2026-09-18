@@ -24,12 +24,10 @@ import (
 // tokens, so the stream token becomes * (never KV_*), and the data subject
 // becomes $KV.*.> or $O.*.>. Expected lists are written literally.
 
-func TestJWTTemplateMacroWildcardStream(t *testing.T) {
+func TestJWTXPermissionsWildcardStream(t *testing.T) {
 	uc, acc := macroTestUserClaims(t)
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsread(*)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"stream":[{"op":"ro","stream":"*"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, []string{
 		"$JS.API.STREAM.INFO.*",
@@ -50,20 +48,16 @@ func TestJWTTemplateMacroWildcardStream(t *testing.T) {
 		"$JS.FC.*.*.*.*.*",
 	})
 
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsadmin(*)}}")
-	res, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp = mustXPermissions(t, `{"stream":[{"op":"admin","stream":"*"}]}`)
+	res, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, macroAdminPubSubjects("*", ""))
 }
 
-func TestJWTTemplateMacroWildcardBucket(t *testing.T) {
+func TestJWTXPermissionsWildcardBucket(t *testing.T) {
 	uc, acc := macroTestUserClaims(t)
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvrw(*)}}")
-	lim.Sub.Allow.Add("{{kvrw(*)}}", "{{objro(*)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"*"}],"obj":[{"op":"ro","bucket":"*"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	// The stream token is *, not KV_*: KV_* would be a literal token and
 	// would match nothing.
@@ -78,12 +72,10 @@ func TestJWTTemplateMacroWildcardBucket(t *testing.T) {
 	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.*.>", "$O.*.>"})
 }
 
-func TestJWTTemplateMacroWildcardConsumer(t *testing.T) {
+func TestJWTXPermissionsWildcardConsumer(t *testing.T) {
 	uc, acc := macroTestUserClaims(t)
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(orders, *)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"orders","consumer":"*"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, []string{
 		"$JS.API.STREAM.INFO.orders",
@@ -95,20 +87,17 @@ func TestJWTTemplateMacroWildcardConsumer(t *testing.T) {
 		"$JS.FC.*.*.orders.*.*",
 	})
 
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumeradmin(*, *)}}")
-	res, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp = mustXPermissions(t, `{"consumer":[{"op":"admin","stream":"*","consumer":"*"}]}`)
+	res, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	require_Len(t, len(res.Pub.Allow), 14)
 	require_True(t, res.Pub.Allow.Contains("$JS.API.CONSUMER.DELETE.*.*"))
 }
 
-func TestJWTTemplateMacroWildcardWithDomain(t *testing.T) {
+func TestJWTXPermissionsWildcardWithDomain(t *testing.T) {
 	uc, acc := macroTestUserClaims(t)
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvrw(*, domain=hub)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"*","domain":"hub"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	require_Len(t, len(res.Pub.Allow), 18)
 	require_True(t, res.Pub.Allow.Contains("$JS.hub.API.STREAM.INFO.*"))
@@ -116,30 +105,24 @@ func TestJWTTemplateMacroWildcardWithDomain(t *testing.T) {
 	require_True(t, res.Pub.Allow.Contains("$JS.ACK.hub.*.*.*.*.*.*.*.>"))
 }
 
-func TestJWTTemplateMacroWildcardOnlyAsLiteral(t *testing.T) {
+func TestJWTXPermissionsWildcardOnlyAsLiteral(t *testing.T) {
 	// A wildcard that comes from a tag, or a wildcard domain, is an invalid
 	// value: skipped in allow lists (fail closed), an error in deny lists.
 	uc, acc := macroTestUserClaims(t, "kv:*", "dom:*")
-	for _, entry := range []string{
-		"{{kvrw(tag(kv))}}",
-		"{{kvrw(cfg, domain=*)}}",
-		"{{kvrw(cfg, domain=tag(dom))}}",
-		"{{jsread(team-*)}}",
-		"{{jsread(>)}}",
+	for _, raw := range []string{
+		`{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`,
+		`{"kv":[{"op":"rw","bucket":"cfg","domain":"*"}]}`,
+		`{"kv":[{"op":"rw","bucket":"cfg","domain":"{{tag(dom)}}"}]}`,
+		`{"stream":[{"op":"ro","stream":"team-*"}]}`,
+		`{"stream":[{"op":"ro","stream":">"}]}`,
 	} {
-		t.Run(entry, func(t *testing.T) {
-			lim := jwt.UserPermissionLimits{}
-			lim.Pub.Allow.Add(entry)
-			res, err := processUserPermissionsTemplate(lim, uc, acc)
-			require_NoError(t, err)
-			require_Len(t, len(res.Pub.Allow), 0)
-			require_True(t, res.Pub.Deny.Contains(">"))
-
-			lim = jwt.UserPermissionLimits{}
-			lim.Pub.Deny.Add(entry)
-			_, err = processUserPermissionsTemplate(lim, uc, acc)
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, extensions, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
+			if err == nil {
+				_, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, extensions[f.signer], uc, acc)
+			}
 			require_Error(t, err)
-			require_Contains(t, err.Error(), "generated invalid subject")
 		})
 	}
 }

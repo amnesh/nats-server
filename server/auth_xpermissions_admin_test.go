@@ -35,7 +35,7 @@ import (
 // The run is repeated with the v1 and the v2 ack and flow control formats,
 // because the read set carries one pattern per format and only a real ack
 // proves the pattern matches.
-func TestJWTTemplateMacroAdminStreamInfoEndToEnd(t *testing.T) {
+func TestJWTXPermissionsAdminStreamInfoEndToEnd(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		// Number of tokens in the ack reply subject of that format. v1 is
@@ -48,12 +48,12 @@ func TestJWTTemplateMacroAdminStreamInfoEndToEnd(t *testing.T) {
 		{"ack_v2", 11, "feature_flags { js_ack_fc_v2: true }"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			testJWTTemplateMacroAdminStreamInfo(t, test.ackTokens, test.extra)
+			testJWTXPermissionsAdminStreamInfo(t, test.ackTokens, test.extra)
 		})
 	}
 }
 
-func testJWTTemplateMacroAdminStreamInfo(t *testing.T, ackTokens int, extraConf string) {
+func testJWTXPermissionsAdminStreamInfo(t *testing.T, ackTokens int, extraConf string) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
@@ -68,13 +68,15 @@ func testJWTTemplateMacroAdminStreamInfo(t *testing.T, ackTokens int, extraConf 
 	scopedKp, scopedPub := createKey(t)
 	scope := jwt.NewUserScope()
 	scope.Key = scopedPub
-	scope.Template.Pub.Allow.Add(
-		"{{kvadmin(tag(kva))}}", "{{objadmin(tag(obja))}}",
-		"{{jsread(tag(js))}}", "{{jsadmin(tag(jsa))}}", "{{jsinfo()}}",
-		"orders.>", "events.>")
+	scope.Template.Pub.Allow.Add("orders.>", "events.>")
 	scope.Template.Sub.Allow.Add("_INBOX.>")
 	accClaim.SigningKeys.AddScopedSigner(scope)
-	accJwt := encodeClaim(t, accClaim, accPub)
+	accJwt := encodeAccountClaimWithXPermissions(t, accClaim, map[string]string{scopedPub: `{
+		"kv":[{"op":"admin","bucket":"{{tag(kva)}}"}],
+		"obj":[{"op":"admin","bucket":"{{tag(obja)}}"}],
+		"stream":[{"op":"ro","stream":"{{tag(js)}}"},{"op":"admin","stream":"{{tag(jsa)}}"}],
+		"jsinfo":true
+	}`})
 	adminCreds := newUser(t, accKp)
 
 	ukp, _ := nkeys.CreateUser()

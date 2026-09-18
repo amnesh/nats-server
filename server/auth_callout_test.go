@@ -1248,7 +1248,7 @@ func TestAuthCalloutOperatorModeBasics(t *testing.T) {
 
 }
 
-func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount bool) {
+func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount, withXPermissions bool) {
 	_, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
 	sysClaim.Name = "$SYS"
@@ -1265,8 +1265,13 @@ func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount bool) {
 	scope.Template.Limits.Subs = 10
 	scope.Template.Limits.Payload = 512
 	accClaim.SigningKeys.AddScopedSigner(scope)
-	accJwt, err := accClaim.Encode(oKp)
-	require_NoError(t, err)
+	var accJwt string
+	if withXPermissions {
+		accJwt = encodeAccountClaimWithXPermissions(t, accClaim, map[string]string{scope.Key: `{"stream":[{"op":"ro","stream":"orders"}]}`})
+	} else {
+		accJwt, err = accClaim.Encode(oKp)
+		require_NoError(t, err)
+	}
 
 	// AUTH service account.
 	akp, err := nkeys.FromSeed([]byte(authCalloutIssuerSeed))
@@ -1316,6 +1321,9 @@ func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount bool) {
 		if opts.Token == scopedToken {
 			// must have no limits set
 			ujwt := createAuthUser(t, user, "scoped", tpub, tpub, scopedKp, 0, &jwt.UserPermissionLimits{})
+			if withXPermissions {
+				ujwt = injectJWTXPermissions(t, ujwt, scopedKp, `{"stream":[{"op":"ro","stream":"injected"}]}`)
+			}
 			m.Respond(serviceResponse(t, user, si.ID, ujwt, "", 0))
 		} else {
 			m.Respond(nil)
@@ -1367,9 +1375,14 @@ func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount bool) {
 	if userInfo.Account != tpub {
 		t.Fatalf("Expected to be switched to %q, but got %q", tpub, userInfo.Account)
 	}
-	require_True(t, len(userInfo.Permissions.Publish.Allow) == 2)
+	if withXPermissions {
+		require_True(t, slices.Contains(userInfo.Permissions.Publish.Allow, "$JS.API.STREAM.INFO.orders"))
+		require_False(t, slices.Contains(userInfo.Permissions.Publish.Allow, "$JS.API.STREAM.INFO.injected"))
+	} else {
+		require_True(t, len(userInfo.Permissions.Publish.Allow) == 2)
+	}
 	slices.Sort(userInfo.Permissions.Publish.Allow)
-	require_Equal(t, "foo.>", userInfo.Permissions.Publish.Allow[1])
+	require_True(t, slices.Contains(userInfo.Permissions.Publish.Allow, "foo.>"))
 	slices.Sort(userInfo.Permissions.Subscribe.Allow)
 	require_True(t, len(userInfo.Permissions.Subscribe.Allow) == 2)
 	require_Equal(t, "foo.>", userInfo.Permissions.Subscribe.Allow[1])
@@ -1389,11 +1402,15 @@ func testAuthCalloutScopedUser(t *testing.T, allowAnyAccount bool) {
 }
 
 func TestAuthCalloutScopedUserAssignedAccount(t *testing.T) {
-	testAuthCalloutScopedUser(t, false)
+	testAuthCalloutScopedUser(t, false, false)
 }
 
 func TestAuthCalloutScopedUserAllAccount(t *testing.T) {
-	testAuthCalloutScopedUser(t, true)
+	testAuthCalloutScopedUser(t, true, false)
+}
+
+func TestJWTXPermissionsAuthCallout(t *testing.T) {
+	testAuthCalloutScopedUser(t, false, true)
 }
 
 const (

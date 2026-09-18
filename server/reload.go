@@ -2275,7 +2275,7 @@ func (s *Server) reloadAuthorization() {
 				accName := acc.GetName()
 				// Release server lock for following actions
 				s.mu.Unlock()
-				accClaims, claimJWT, _ := s.fetchAccountClaims(accName)
+				accClaims, _, claimJWT, _ := s.fetchAccountClaims(accName)
 				if accClaims != nil {
 					if err := s.updateAccountWithClaimJWT(acc, claimJWT); err != nil {
 						s.Noticef("Reloaded: deleting account [bad claims]: %q", accName)

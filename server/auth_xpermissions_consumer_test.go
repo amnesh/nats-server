@@ -55,12 +55,10 @@ func macroConsumerAdminPubSubjects(stream, consumer string) []string {
 	)
 }
 
-func TestJWTTemplateMacroConsumerSubjectSets(t *testing.T) {
+func TestJWTXPermissionsConsumerSubjectSets(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "s:orders", "c:workers")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(tag(s), tag(c))}}", "{{jsconsumeradmin(ORDERS, own)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"{{tag(s)}}","consumer":"{{tag(c)}}"},{"op":"admin","stream":"ORDERS","consumer":"own"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	expected := append(macroConsumerPubSubjects("orders", "workers"),
 		macroConsumerAdminPubSubjects("ORDERS", "own")...)
@@ -80,18 +78,16 @@ func TestJWTTemplateMacroConsumerSubjectSets(t *testing.T) {
 
 // The cartesian product expands in argument order, with the first argument as
 // the outer loop.
-func TestJWTTemplateMacroConsumerCartesianProduct(t *testing.T) {
+func TestJWTXPermissionsConsumerCartesianProduct(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "s:alpha", "s:beta", "c:one", "c:two")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(tag(s), tag(c))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"{{tag(s)}}","consumer":"{{tag(c)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	var expected []string
 	for _, s := range []string{"alpha", "beta"} {
-		for _, c := range []string{"one", "two"} {
-			expected = append(expected, macroConsumerPubSubjects(s, c)...)
-		}
+		expected = append(expected, macroConsumerPubSubjects(s, "one")...)
+		second := macroConsumerPubSubjects(s, "two")
+		expected = append(expected, second[1:]...)
 	}
 	require_Len(t, len(res.Pub.Allow), len(expected))
 	for i, subj := range expected {
@@ -99,12 +95,11 @@ func TestJWTTemplateMacroConsumerCartesianProduct(t *testing.T) {
 	}
 
 	// A literal mixed with a tag gives one set per tag value.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumeradmin(orders, tag(c))}}")
-	res, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp = mustXPermissions(t, `{"consumer":[{"op":"admin","stream":"orders","consumer":"{{tag(c)}}"}]}`)
+	res, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
-	expected = append(macroConsumerAdminPubSubjects("orders", "one"),
-		macroConsumerAdminPubSubjects("orders", "two")...)
+	second := macroConsumerAdminPubSubjects("orders", "two")
+	expected = append(macroConsumerAdminPubSubjects("orders", "one"), second[1:]...)
 	require_Len(t, len(res.Pub.Allow), len(expected))
 	for i, subj := range expected {
 		require_Equal(t, res.Pub.Allow[i], subj)
@@ -113,32 +108,20 @@ func TestJWTTemplateMacroConsumerCartesianProduct(t *testing.T) {
 
 // A consumer has no derivable data subject, so the consumer macros are
 // rejected in subscribe lists, as the stream macros are.
-func TestJWTTemplateMacroConsumerNotInSubscribeList(t *testing.T) {
+func TestJWTXPermissionsConsumerNotInSubscribeList(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "s:orders", "c:workers")
-	for _, entry := range []string{
-		"{{jsconsumer(tag(s), tag(c))}}",
-		"{{jsconsumeradmin(tag(s), tag(c))}}",
-	} {
-		for _, mk := range []func(*jwt.UserPermissionLimits){
-			func(l *jwt.UserPermissionLimits) { l.Sub.Allow.Add(entry) },
-			func(l *jwt.UserPermissionLimits) { l.Sub.Deny.Add(entry) },
-		} {
-			lim := jwt.UserPermissionLimits{}
-			mk(&lim)
-			_, err := processUserPermissionsTemplate(lim, uc, acc)
-			require_Error(t, err)
-			require_Contains(t, err.Error(), "subscribe")
-		}
-	}
+	xp := mustXPermissions(t, `{"consumer":[{"op":"admin","stream":"{{tag(s)}}","consumer":"{{tag(c)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	require_Len(t, len(res.Sub.Allow), 0)
+	require_Len(t, len(res.Sub.Deny), 0)
 }
 
 // Whitespace around every part of the argument list is trimmed.
-func TestJWTTemplateMacroConsumerArgumentWhitespace(t *testing.T) {
+func TestJWTXPermissionsConsumerArgumentWhitespace(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "js:orders")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{ jsconsumer( tag(js) , workers ) }}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"{{ tag(js) }}","consumer":"workers"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, macroConsumerPubSubjects("orders", "workers"))
 }
@@ -146,87 +129,42 @@ func TestJWTTemplateMacroConsumerArgumentWhitespace(t *testing.T) {
 // A wrong number of positional arguments, or an unknown, empty, repeated or
 // misplaced named argument, is the upstream "is not defined" error. The only
 // named argument the grammar defines is the trailing "domain", which
-// TestJWTTemplateMacroDomain* covers.
-func TestJWTTemplateMacroArgumentListErrors(t *testing.T) {
-	uc, acc := macroTestUserClaims(t, "kv:foo", "js:orders", "c:workers")
-	for _, entry := range []string{
-		"{{jsconsumer()}}",
-		"{{jsconsumer(orders)}}",
-		"{{jsconsumer(orders, workers, extra)}}",
-		"{{jsconsumeradmin(orders)}}",
-		"{{jsread(orders, workers)}}",
-		"{{jsinfo(orders)}}",
-		"{{jsinfo(,)}}",
-		"{{kvro(foo, bar)}}",
-		"{{jsconsumer(orders, domain=hub)}}",
-		"{{jsread(orders, workers, domain=hub)}}",
-		"{{jsinfo(hub, domain=hub)}}",
-		"{{jsread(orders, region=eu)}}",
-		"{{kvrw(tag(kv), region=eu)}}",
-		"{{jsconsumer(domain=hub, orders, workers)}}",
-		"{{jsconsumer(orders, workers, domain=)}}",
-		"{{jsconsumer(orders, workers, domain=a, domain=b)}}",
+// TestJWTXPermissionsDomain* covers.
+func TestJWTXPermissionsArgumentListErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"consumer":[{"op":"ro","stream":"orders"}]}`,
+		`{"consumer":[{"op":"ro","stream":"orders","consumer":"workers","extra":true}]}`,
+		`{"consumer":[{"op":"rw","stream":"orders","consumer":"workers"}]}`,
+		`{"stream":[{"op":"ro","stream":"orders","consumer":"workers"}]}`,
+		`{"jsinfo":{"domain":"hub"}}`,
 	} {
-		t.Run(entry, func(t *testing.T) {
-			lim := jwt.UserPermissionLimits{}
-			lim.Pub.Allow.Add(entry)
-			_, err := processUserPermissionsTemplate(lim, uc, acc)
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, _, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 			require_Error(t, err)
-			require_Contains(t, err.Error(), "not defined")
 		})
 	}
 }
 
 // A tag with no value emits nothing in an allow list and is an error in a
 // deny list, for every positional argument.
-func TestJWTTemplateMacroConsumerMissingValueFailsClosed(t *testing.T) {
+func TestJWTXPermissionsConsumerMissingValueFailsClosed(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "s:orders") // no "c:" tag at all
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(tag(s), tag(c))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	require_Len(t, len(res.Pub.Allow), 0)
-	require_True(t, res.Pub.Deny.Contains(">"))
-
-	for _, entry := range []string{
-		"{{jsconsumer(tag(s), tag(c))}}",
-		"{{jsconsumer(tag(nostream), tag(s))}}",
-		"{{jsconsumeradmin(tag(s), tag(c))}}",
-	} {
-		lim := jwt.UserPermissionLimits{}
-		lim.Pub.Deny.Add(entry)
-		_, err := processUserPermissionsTemplate(lim, uc, acc)
-		require_Error(t, err)
-		require_Contains(t, err.Error(), "generated invalid subject")
-	}
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"{{tag(s)}}","consumer":"{{tag(c)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "not defined")
 }
 
 // A consumer name that carries a separator, a wildcard or a template token is
 // skipped in an allow list and is an error in a deny list.
-func TestJWTTemplateMacroConsumerInvalidName(t *testing.T) {
+func TestJWTXPermissionsConsumerInvalidName(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "s:orders",
 		"c:good", "c:bad.name", "c:wild*", "c:{{tag(s)}}", "c:")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(tag(s), tag(c))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	requireSameSubjects(t, res.Pub.Allow, macroConsumerPubSubjects("orders", "good"))
-
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Deny.Add("{{jsconsumeradmin(tag(s), tag(c))}}")
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"consumer":[{"op":"ro","stream":"{{tag(s)}}","consumer":"{{tag(c)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "generated invalid subject")
-
-	// An invalid literal consumer name emits nothing and fails closed.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsconsumer(orders, bad.name)}}")
-	res, err = processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	require_Len(t, len(res.Pub.Allow), 0)
-	require_True(t, res.Pub.Deny.Contains(">"))
 }
 
 // End-to-end coverage of the consumer level macros with real nats.go clients
@@ -235,7 +173,7 @@ func TestJWTTemplateMacroConsumerInvalidName(t *testing.T) {
 // The run is repeated with the v1 and the v2 ack and flow control formats,
 // because the consumer set carries one ack pattern per format and only a real
 // ack proves the pattern matches.
-func TestJWTTemplateMacroConsumerEndToEnd(t *testing.T) {
+func TestJWTXPermissionsConsumerEndToEnd(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		// Number of tokens in the ack reply subject of that format. v1 is
@@ -268,11 +206,11 @@ func testJWTTemplateMacroConsumer(t *testing.T, ackTokens int, extraConf string)
 	scopedKp, scopedPub := createKey(t)
 	scope := jwt.NewUserScope()
 	scope.Key = scopedPub
-	scope.Template.Pub.Allow.Add(
-		"{{jsconsumer(orders, shared)}}", "{{jsconsumeradmin(orders, tag(own))}}")
 	scope.Template.Sub.Allow.Add("_INBOX.>")
 	accClaim.SigningKeys.AddScopedSigner(scope)
-	accJwt := encodeClaim(t, accClaim, accPub)
+	accJwt := encodeAccountClaimWithXPermissions(t, accClaim, map[string]string{scopedPub: `{
+		"consumer":[{"op":"ro","stream":"orders","consumer":"shared"},{"op":"admin","stream":"orders","consumer":"{{tag(own)}}"}]
+	}`})
 	adminCreds := newUser(t, accKp)
 
 	ukp, _ := nkeys.CreateUser()

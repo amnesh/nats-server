@@ -4527,7 +4527,7 @@ func TestJWTTemplates(t *testing.T) {
 	lim.Sub.Deny.Add("foo.{{name()}}.{{subject()}}.{{account-name()}}.{{account-subject()}}.bar")
 	acc := &Account{nameTag: "accname", tags: []string{"acc:acc1", "acc:acc2"}}
 
-	resLim, err := processUserPermissionsTemplate(lim, uclaim, acc)
+	resLim, err := processUserPermissionsTemplate(lim, nil, uclaim, acc)
 	require_NoError(t, err)
 
 	test := func(expectedSubjects []string, res jwt.StringList) {
@@ -4550,7 +4550,7 @@ func TestJWTTemplates(t *testing.T) {
 	require_Contains(t, resLim.Sub.Deny[1], ">")
 
 	lim.Pub.Deny.Add("{{tag(NOT_THERE)}}")
-	_, err = processUserPermissionsTemplate(lim, uclaim, acc)
+	_, err = processUserPermissionsTemplate(lim, nil, uclaim, acc)
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "generated invalid subject")
 }
@@ -4571,7 +4571,7 @@ func TestJWTInLineTemplates(t *testing.T) {
 	lim.Pub.Allow.Add("$JS.API.STREAM.INFO.KV_{{tag(bucket)}}")
 	acc := &Account{nameTag: "accname", tags: []string{"acc:acc1", "acc:acc2"}}
 
-	resLim, err := processUserPermissionsTemplate(lim, uclaim, acc)
+	resLim, err := processUserPermissionsTemplate(lim, nil, uclaim, acc)
 	require_NoError(t, err)
 
 	test := func(expectedSubjects []string, res jwt.StringList) {
@@ -4601,7 +4601,7 @@ func TestJWTTemplateGoodTagAfterBadTag(t *testing.T) {
 	lim.Pub.Deny.Add("{{tag(NOT_THERE)}}.{{tag(foo)}}")
 	acc := &Account{nameTag: "accname", tags: []string{"acc:acc1", "acc:acc2"}}
 
-	_, err := processUserPermissionsTemplate(lim, uclaim, acc)
+	_, err := processUserPermissionsTemplate(lim, nil, uclaim, acc)
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "generated invalid subject")
 }
@@ -5110,6 +5110,55 @@ func createKey(t *testing.T) (nkeys.KeyPair, string) {
 	kp, _ := nkeys.CreateAccount()
 	syspub, _ := kp.PublicKey()
 	return kp, syspub
+}
+
+func TestJWTXPermissionsAccountLifecycle(t *testing.T) {
+	f := newXPermissionsRawFixture(t, `{"kv":[{"op":"ro","bucket":"cfg"}]}`)
+	s := opTrustBasicSetup()
+	defer s.Shutdown()
+
+	claim, firstGeneration, _, err := s.verifyAccountClaimsWithXPermissions(f.token)
+	require_NoError(t, err)
+	acc := s.buildInternalAccount(claim, firstGeneration)
+	scope, installed, ok := acc.issuerScopeAndXPermissions(f.signer)
+	require_True(t, ok)
+	require_NotNil(t, scope)
+	require_NotNil(t, installed)
+	require_Len(t, len(installed.KV), 1)
+	require_Equal(t, installed.KV[0].Bucket, "cfg")
+
+	secondToken := encodeAccountClaimWithXPermissions(t, f.claim, map[string]string{
+		f.signer: `{"stream":[{"op":"ro","stream":"orders"}]}`,
+	})
+	secondClaim, secondGeneration, _, err := s.verifyAccountClaimsWithXPermissions(secondToken)
+	require_NoError(t, err)
+	s.updateAccountClaimsWithRefresh(acc, secondClaim, secondGeneration, true)
+	_, installed, ok = acc.issuerScopeAndXPermissions(f.signer)
+	require_True(t, ok)
+	require_Len(t, len(installed.KV), 0)
+	require_Len(t, len(installed.Stream), 1)
+	require_Equal(t, installed.Stream[0].Stream, "orders")
+	// Replacing the account generation must not mutate a pointer retained by
+	// an authentication attempt from the prior generation.
+	require_Len(t, len(firstGeneration[f.signer].KV), 1)
+
+	invalidToken := encodeAccountClaimWithXPermissions(t, f.claim, map[string]string{f.signer: `{"kv":[]}`})
+	_, _, _, err = s.verifyAccountClaimsWithXPermissions(invalidToken)
+	require_Error(t, err)
+	_, installed, _ = acc.issuerScopeAndXPermissions(f.signer)
+	require_Len(t, len(installed.Stream), 1)
+
+	withoutExtension := encodeAccountClaimWithXPermissions(t, f.claim, nil)
+	typedClaim, noExtensions, _, err := s.verifyAccountClaimsWithXPermissions(withoutExtension)
+	require_NoError(t, err)
+	s.updateAccountClaimsWithRefresh(acc, typedClaim, noExtensions, true)
+	_, installed, _ = acc.issuerScopeAndXPermissions(f.signer)
+	require_True(t, installed == nil)
+
+	s.updateAccountClaimsWithRefresh(acc, secondClaim, secondGeneration, true)
+	s.UpdateAccountClaims(acc, secondClaim)
+	_, installed, _ = acc.issuerScopeAndXPermissions(f.signer)
+	require_True(t, installed == nil)
 }
 
 func encodeClaim(t *testing.T, claim *jwt.AccountClaims, _ string) string {

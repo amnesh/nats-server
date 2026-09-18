@@ -1786,12 +1786,12 @@ func (s *Server) SetSystemAccount(accName string) error {
 
 	// If we are here we do not have local knowledge of this account.
 	// Do this one by hand to return more useful error.
-	ac, jwt, err := s.fetchAccountClaims(accName)
+	ac, xp, claimJWT, err := s.fetchAccountClaims(accName)
 	if err != nil {
 		return err
 	}
-	acc := s.buildInternalAccount(ac)
-	acc.claimJWT = jwt
+	acc := s.buildInternalAccount(ac, xp)
+	acc.claimJWT = claimJWT
 	// Due to race, we need to make sure that we are not
 	// registering twice.
 	if racc := s.registerAccount(acc); racc != nil {
@@ -2139,7 +2139,7 @@ func (s *Server) updateAccountWithClaimJWT(acc *Account, claimJWT string) error 
 		s.Debugf("Requested account update for [%s], same claims detected", acc.Name)
 		return nil
 	}
-	accClaims, _, err := s.verifyAccountClaims(claimJWT)
+	accClaims, xp, _, err := s.verifyAccountClaimsWithXPermissions(claimJWT)
 	if err == nil && accClaims != nil {
 		acc.mu.Lock()
 		// if an account is updated with a different operator signing key, we want to
@@ -2150,7 +2150,7 @@ func (s *Server) updateAccountWithClaimJWT(acc *Account, claimJWT string) error 
 			return ErrAccountValidation
 		}
 		acc.mu.Unlock()
-		s.UpdateAccountClaims(acc, accClaims)
+		s.updateAccountClaimsWithRefresh(acc, accClaims, xp, true)
 		acc.mu.Lock()
 		// needs to be set after update completed.
 		// This causes concurrent calls to return with sameClaim=true if the change is effective.
@@ -2186,17 +2186,18 @@ func (s *Server) fetchRawAccountClaims(name string) (string, error) {
 
 // fetchAccountClaims will attempt to fetch new claims if a resolver is present.
 // Lock is NOT held upon entry.
-func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, string, error) {
+func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, accountXPermissions, string, error) {
 	claimJWT, err := s.fetchRawAccountClaims(name)
 	if err != nil {
-		return nil, _EMPTY_, err
+		return nil, nil, _EMPTY_, err
 	}
 	var claim *jwt.AccountClaims
-	claim, claimJWT, err = s.verifyAccountClaims(claimJWT)
+	var xp accountXPermissions
+	claim, xp, claimJWT, err = s.verifyAccountClaimsWithXPermissions(claimJWT)
 	if claim != nil && claim.Subject != name {
-		return nil, _EMPTY_, ErrAccountValidation
+		return nil, nil, _EMPTY_, ErrAccountValidation
 	}
-	return claim, claimJWT, err
+	return claim, xp, claimJWT, err
 }
 
 // verifyAccountClaims will decode and validate any account claims.
@@ -2216,14 +2217,29 @@ func (s *Server) verifyAccountClaims(claimJWT string) (*jwt.AccountClaims, strin
 	return accClaims, claimJWT, nil
 }
 
+func (s *Server) verifyAccountClaimsWithXPermissions(claimJWT string) (*jwt.AccountClaims, accountXPermissions, string, error) {
+	accClaims, verifiedJWT, err := s.verifyAccountClaims(claimJWT)
+	if err != nil {
+		return nil, nil, _EMPTY_, err
+	}
+	if err := validateNoLegacyPermissionMacros(accClaims); err != nil {
+		return nil, nil, _EMPTY_, err
+	}
+	xp, err := decodeAccountXPermissions(verifiedJWT, accClaims)
+	if err != nil {
+		return nil, nil, _EMPTY_, err
+	}
+	return accClaims, xp, verifiedJWT, nil
+}
+
 // This will fetch an account from a resolver if defined.
 // Lock is NOT held upon entry.
 func (s *Server) fetchAccount(name string) (*Account, error) {
-	accClaims, claimJWT, err := s.fetchAccountClaims(name)
+	accClaims, xp, claimJWT, err := s.fetchAccountClaims(name)
 	if accClaims == nil {
 		return nil, err
 	}
-	acc := s.buildInternalAccount(accClaims)
+	acc := s.buildInternalAccount(accClaims, xp)
 	// Due to possible race, if registerAccount() returns a non
 	// nil account, it means the same account was already
 	// registered and we should use this one.

@@ -229,7 +229,7 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 		if isOperatorMode {
 			// this will validate the signing key that emitted the user, and if it is a signing
 			// key it assigns the permissions from the target account
-			if scope, ok := targetAcc.hasIssuer(arc.Issuer); !ok {
+			if scope, xp, ok := targetAcc.issuerScopeAndXPermissions(arc.Issuer); !ok {
 				return nil, fmt.Errorf("user JWT issuer %q is not known", arc.Issuer)
 			} else if scope != nil {
 				// this possibly has to be different because it could just be a plain issued by a non-scoped signing key
@@ -237,8 +237,8 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 					return nil, fmt.Errorf("user JWT is not valid: %v", err)
 				} else if uSc, ok := scope.(*jwt.UserScope); !ok {
 					return nil, fmt.Errorf("user JWT is not a valid scoped user")
-				} else if arc.User.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, arc, targetAcc); err != nil {
-					return nil, fmt.Errorf("user JWT generated invalid permissions: %v", err)
+				} else if arc.User.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, xp, arc, targetAcc); err != nil {
+					return nil, fmt.Errorf("user JWT issuer %q generated invalid permissions: %v", arc.Issuer, err)
 				}
 			}
 		}

@@ -95,6 +95,7 @@ type Account struct {
 	expired      atomic.Bool
 	incomplete   bool
 	signingKeys  map[string]jwt.Scope
+	xpermissions accountXPermissions
 	extAuth      *jwt.ExternalAuthorization
 	srv          *Server // server this account is registered with (possibly nil)
 	lds          string  // loop detection subject for leaf nodes
@@ -3344,6 +3345,17 @@ func (a *Account) hasIssuer(issuer string) (jwt.Scope, bool) {
 	return scope, ok
 }
 
+func (a *Account) issuerScopeAndXPermissions(issuer string) (jwt.Scope, *xPermissions, bool) {
+	a.mu.RLock()
+	scope, ok := a.hasIssuerNoLock(issuer)
+	var xp *xPermissions
+	if ok {
+		xp = a.xpermissions[issuer]
+	}
+	a.mu.RUnlock()
+	return scope, xp, ok
+}
+
 // hasIssuerNoLock is the unlocked version of hasIssuer
 func (a *Account) hasIssuerNoLock(issuer string) (jwt.Scope, bool) {
 	scope, ok := a.signingKeys[issuer]
@@ -3393,7 +3405,7 @@ func (a *Account) isClaimAccount() bool {
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
-	s.updateAccountClaimsWithRefresh(a, ac, true)
+	s.updateAccountClaimsWithRefresh(a, ac, nil, true)
 }
 
 func (a *Account) traceLabel() string {
@@ -3476,7 +3488,7 @@ func (a *Account) isAllowedAcount(acc string) bool {
 // If refreshImportingAccounts is true it will also update incomplete dependent accounts
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
-func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, refreshImportingAccounts bool) {
+func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, xp accountXPermissions, refreshImportingAccounts bool) {
 	if a == nil {
 		return
 	}
@@ -3490,6 +3502,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		exports:      a.exports,
 		limits:       a.limits,
 		signingKeys:  a.signingKeys,
+		xpermissions: a.xpermissions,
 		defaultPerms: a.defaultPerms.clone(),
 	}
 
@@ -3554,6 +3567,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	for k, scope := range ac.SigningKeys {
 		a.signingKeys[k] = scope
 	}
+	a.xpermissions = xp
 	if !strict {
 		a.signingKeys[a.Name] = nil
 	}
@@ -3564,6 +3578,10 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		if oldScope, ok := old.signingKeys[k]; !ok {
 			signersChanged = true
 		} else if !reflect.DeepEqual(scope, oldScope) {
+			signersChanged = true
+			alteredScope[k] = struct{}{}
+		}
+		if !reflect.DeepEqual(a.xpermissions[k], old.xpermissions[k]) {
 			signersChanged = true
 			alteredScope[k] = struct{}{}
 		}
@@ -4054,10 +4072,10 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 			claimJWT := acc.claimJWT
 			acc.mu.RUnlock()
 			if incomplete && name != old.Name {
-				if accClaims, _, err := s.verifyAccountClaims(claimJWT); err == nil {
+				if accClaims, extensions, _, err := s.verifyAccountClaimsWithXPermissions(claimJWT); err == nil {
 					// Since claimJWT has not changed, acc can become complete
 					// but it won't alter incomplete for it's dependents accounts.
-					s.updateAccountClaimsWithRefresh(acc, accClaims, false)
+					s.updateAccountClaimsWithRefresh(acc, accClaims, extensions, false)
 					// old.Name was deleted before ranging over accounts
 					// If it exists again, UpdateAccountClaims set it for failed imports of acc.
 					// So there was one import of acc that imported this account and failed again.
@@ -4075,7 +4093,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 // Helper to build an internal account structure from a jwt.AccountClaims.
 // Lock MUST NOT be held upon entry.
-func (s *Server) buildInternalAccount(ac *jwt.AccountClaims) *Account {
+func (s *Server) buildInternalAccount(ac *jwt.AccountClaims, xp accountXPermissions) *Account {
 	acc := NewAccount(ac.Subject)
 	acc.Issuer = ac.Issuer
 	// Set this here since we are placing in s.tmpAccounts below and may be
@@ -4090,7 +4108,7 @@ func (s *Server) buildInternalAccount(ac *jwt.AccountClaims) *Account {
 	}
 
 	// Update based on claims.
-	s.UpdateAccountClaims(acc, ac)
+	s.updateAccountClaimsWithRefresh(acc, ac, xp, true)
 
 	return acc
 }

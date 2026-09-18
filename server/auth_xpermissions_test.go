@@ -104,13 +104,10 @@ func requireSameSubjects(t *testing.T, res jwt.StringList, expected []string) {
 	}
 }
 
-func TestJWTTemplateMacroKVReadWrite(t *testing.T) {
+func TestJWTXPermissionsKVReadWrite(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:foo")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvrw(tag(kv))}}")
-	lim.Sub.Allow.Add("{{kvrw(tag(kv))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, macroWritePubSubjects("KV_foo", "$KV.foo"))
 	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.foo.>"})
@@ -118,13 +115,10 @@ func TestJWTTemplateMacroKVReadWrite(t *testing.T) {
 	require_Len(t, len(res.Sub.Deny), 0)
 }
 
-func TestJWTTemplateMacroKVReadOnly(t *testing.T) {
+func TestJWTXPermissionsKVReadOnly(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:foo")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvro(tag(kv))}}")
-	lim.Sub.Allow.Add("{{kvro(tag(kv))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, macroReadPubSubjects("KV_foo"))
 	require_False(t, res.Pub.Allow.Contains("$KV.foo.>"))
@@ -132,15 +126,13 @@ func TestJWTTemplateMacroKVReadOnly(t *testing.T) {
 	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.foo.>"})
 }
 
-func TestJWTTemplateMacroObjectStore(t *testing.T) {
+func TestJWTXPermissionsObjectStore(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "obj:img")
 	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{objrw(tag(obj))}}")
-	lim.Pub.Deny.Add("{{objro(tag(obj))}}")
-	lim.Sub.Allow.Add("{{objro(tag(obj))}}")
-	lim.Sub.Deny.Add("{{objrw(tag(obj))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	lim.Pub.Deny.Add(macroReadPubSubjects("OBJ_img")...)
+	lim.Sub.Deny.Add("$O.img.>")
+	xp := mustXPermissions(t, `{"obj":[{"op":"rw","bucket":"{{tag(obj)}}"}]}`)
+	res, err := processUserPermissionsTemplate(lim, xp, uc, acc)
 	require_NoError(t, err)
 	requireSameSubjects(t, res.Pub.Allow, macroWritePubSubjects("OBJ_img", "$O.img"))
 	requireSameSubjects(t, res.Pub.Deny, macroReadPubSubjects("OBJ_img"))
@@ -148,21 +140,21 @@ func TestJWTTemplateMacroObjectStore(t *testing.T) {
 	requireSameSubjects(t, res.Sub.Deny, []string{"$O.img.>"})
 }
 
-func TestJWTTemplateMacroMultipleValuesAndPassthrough(t *testing.T) {
+func TestJWTXPermissionsMultipleValuesAndPassthrough(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:a", "kv:b")
 	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvro(tag(kv))}}", "plain.subject", "tpl.{{tag(kv)}}")
-	lim.Sub.Allow.Add("_INBOX.>", "{{kvro(tag(kv))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	lim.Pub.Allow.Add("plain.subject", "tpl.{{tag(kv)}}")
+	lim.Sub.Allow.Add("_INBOX.>")
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(lim, xp, uc, acc)
 	require_NoError(t, err)
-	expected := append(macroReadPubSubjects("KV_a"), macroReadPubSubjects("KV_b")...)
-	expected = append(expected, "plain.subject", "tpl.a", "tpl.b")
+	expected := append([]string{"plain.subject", "tpl.a", "tpl.b"}, macroReadPubSubjects("KV_a")...)
+	expected = append(expected, macroReadPubSubjects("KV_b")...)
 	requireSameSubjects(t, res.Pub.Allow, expected)
 	requireSameSubjects(t, res.Sub.Allow, []string{"_INBOX.>", "$KV.a.>", "$KV.b.>"})
 }
 
-func TestJWTTemplateMacroArgumentForms(t *testing.T) {
+func TestJWTXPermissionsArgumentForms(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:foo")
 	for _, test := range []struct{ arg, bucket string }{
 		{"config", "config"}, // literal bucket name
@@ -174,107 +166,64 @@ func TestJWTTemplateMacroArgumentForms(t *testing.T) {
 		{"account-subject()", uc.IssuerAccount},
 	} {
 		t.Run(test.arg, func(t *testing.T) {
-			lim := jwt.UserPermissionLimits{}
-			lim.Pub.Allow.Add(fmt.Sprintf("{{KVRO(%s)}}", test.arg))
-			res, err := processUserPermissionsTemplate(lim, uc, acc)
+			var xp *xPermissions
+			if test.arg == "config" {
+				xp = mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"config"}]}`)
+			} else {
+				xp = mustXPermissions(t, fmt.Sprintf(`{"kv":[{"op":"ro","bucket":"{{%s}}"}]}`, test.arg))
+			}
+			res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 			require_NoError(t, err)
 			requireSameSubjects(t, res.Pub.Allow, macroReadPubSubjects("KV_"+test.bucket))
 		})
 	}
 }
 
-func TestJWTTemplateMacroMissingValueFailsClosed(t *testing.T) {
+func TestJWTXPermissionsMissingValueFailsClosed(t *testing.T) {
 	uc, acc := macroTestUserClaims(t) // no tags at all
-	lim := jwt.UserPermissionLimits{}
-	lim.Sub.Allow.Add("{{kvro(tag(kv))}}")
-	lim.Pub.Allow.Add("{{kvrw(tag(kv))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	require_Len(t, len(res.Sub.Allow), 0)
-	require_True(t, res.Sub.Deny.Contains(">"))
-	require_Len(t, len(res.Pub.Allow), 0)
-	require_True(t, res.Pub.Deny.Contains(">"))
-
-	// In deny lists a missing value is an error, as for plain tags.
-	for _, mk := range []func(*jwt.UserPermissionLimits){
-		func(l *jwt.UserPermissionLimits) { l.Pub.Deny.Add("{{kvrw(tag(kv))}}") },
-		func(l *jwt.UserPermissionLimits) { l.Sub.Deny.Add("{{kvrw(tag(kv))}}") },
-	} {
-		lim := jwt.UserPermissionLimits{}
-		mk(&lim)
-		_, err := processUserPermissionsTemplate(lim, uc, acc)
-		require_Error(t, err)
-		require_Contains(t, err.Error(), "generated invalid subject")
-	}
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "not defined")
 }
 
-func TestJWTTemplateMacroInvalidBucketName(t *testing.T) {
+func TestJWTXPermissionsInvalidBucketName(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:good", "kv:bad.name", "kv:wild*", "kv:full>", "kv:")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvro(tag(kv))}}")
-
-	// Allow lists skip invalid values.
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	requireSameSubjects(t, res.Pub.Allow, macroReadPubSubjects("KV_good"))
-
-	// Deny lists fail on invalid values.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Deny.Add("{{kvro(tag(kv))}}")
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "generated invalid subject")
-
-	// An invalid literal in an allow list emits nothing and fails closed.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvro(bad.literal)}}")
-	res, err = processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	require_Len(t, len(res.Pub.Allow), 0)
-	require_True(t, res.Pub.Deny.Contains(">"))
 }
 
-func TestJWTTemplateMacroMustBeWholeEntry(t *testing.T) {
-	uc, acc := macroTestUserClaims(t, "kv:foo")
-	for _, entry := range []string{
-		"foo.{{kvrw(tag(kv))}}",
-		"{{kvrw(tag(kv))}}.bar",
-		"{{kvrw(tag(kv))}}{{kvro(tag(kv))}}",
-		"{{kvrw(tag(kv))}}.{{tag(kv)}}",
+func TestJWTXPermissionsMustBeWholeEntry(t *testing.T) {
+	for _, raw := range []string{
+		`{"kv":[{"op":"rw","bucket":"foo.{{tag(kv)}}"}]}`,
+		`{"kv":[{"op":"rw","bucket":"{{tag(kv)}}.bar"}]}`,
+		`{"kv":[{"op":"rw","bucket":"{{tag(kv)}}*"}]}`,
 	} {
-		t.Run(entry, func(t *testing.T) {
-			lim := jwt.UserPermissionLimits{}
-			lim.Pub.Allow.Add(entry)
-			_, err := processUserPermissionsTemplate(lim, uc, acc)
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, _, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 			require_Error(t, err)
-			require_Contains(t, err.Error(), "macro")
 		})
 	}
 }
 
-func TestJWTTemplateMacroUnknownOperationStillErrors(t *testing.T) {
-	uc, acc := macroTestUserClaims(t, "kv:foo")
-	for _, entry := range []string{
-		"{{kvxx(tag(kv))}}",
-		"{{kvro(tag(kv)}}",
-		"{{kvro(nope(kv))}}",
-		"{{kvro()}}",
-		"{{kvro(tag())}}",
-		"{{kvro(tag(kv)))}}",
-		"{{kvro(tag((kv)))}}",
+func TestJWTXPermissionsUnknownOperationStillErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"kv":[{"op":"xx","bucket":"cfg"}]}`,
+		`{"kv":[{"op":"ro","bucket":"{{nope(kv)}}"}]}`,
+		`{"kv":[{"op":"ro","bucket":"{{tag()}}"}]}`,
 	} {
-		t.Run(entry, func(t *testing.T) {
-			lim := jwt.UserPermissionLimits{}
-			lim.Pub.Allow.Add(entry)
-			_, err := processUserPermissionsTemplate(lim, uc, acc)
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, _, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 			require_Error(t, err)
-			require_Contains(t, err.Error(), "not defined")
 		})
 	}
 }
 
-func TestJWTTemplateMacroExpansionLimit(t *testing.T) {
+func TestJWTXPermissionsExpansionLimit(t *testing.T) {
 	mkTags := func(n int) []string {
 		tags := make([]string, 0, n)
 		for i := 0; i < n; i++ {
@@ -284,39 +233,34 @@ func TestJWTTemplateMacroExpansionLimit(t *testing.T) {
 	}
 	// 250 buckets x 16 subjects fits under the cap.
 	uc, acc := macroTestUserClaims(t, mkTags(250)...)
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvro(tag(kv))}}")
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	require_Len(t, len(res.Pub.Allow), 250*16)
 
 	// 260 buckets x 16 subjects exceeds the cap.
 	uc, acc = macroTestUserClaims(t, mkTags(260)...)
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	_, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_Error(t, err, errPermTemplateExpansionLimit)
 }
 
-func TestJWTTemplateMacroBucketAdmin(t *testing.T) {
+func TestJWTXPermissionsBucketAdmin(t *testing.T) {
 	uc, acc := macroTestUserClaims(t, "kv:cfg", "obj:blobs")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvadmin(tag(kv))}}", "{{objadmin(tag(obj))}}")
-	lim.Sub.Allow.Add("{{kvadmin(tag(kv))}}", "{{objadmin(tag(obj))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"admin","bucket":"{{tag(kv)}}"}],"obj":[{"op":"admin","bucket":"{{tag(obj)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
-	expected := append(macroAdminPubSubjects("KV_cfg", "$KV.cfg"), macroAdminPubSubjects("OBJ_blobs", "$O.blobs")...)
+	objExpected := macroAdminPubSubjects("OBJ_blobs", "$O.blobs")
+	expected := append(macroAdminPubSubjects("KV_cfg", "$KV.cfg"), objExpected[:len(objExpected)-1]...)
 	requireSameSubjects(t, res.Pub.Allow, expected)
 	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.cfg.>", "$O.blobs.>"})
 }
 
-func TestJWTTemplateMacroStreamReadAndAdmin(t *testing.T) {
+func TestJWTXPermissionsStreamReadAndAdmin(t *testing.T) {
 	// The jwt library lowercases tag values, so a stream with an uppercase
 	// name can only be named by a literal argument.
 	uc, acc := macroTestUserClaims(t, "js:orders", "jsa:events")
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsread(tag(js))}}", "{{jsadmin(tag(jsa))}}", "{{jsread(AUDIT)}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"stream":[{"op":"ro","stream":"{{tag(js)}}"},{"op":"admin","stream":"{{tag(jsa)}}"},{"op":"ro","stream":"AUDIT"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_NoError(t, err)
 	expected := append(macroReadPubSubjects("orders"), macroAdminPubSubjects("events", "")...)
 	expected = append(expected, macroReadPubSubjects("AUDIT")...)
@@ -326,48 +270,24 @@ func TestJWTTemplateMacroStreamReadAndAdmin(t *testing.T) {
 		require_True(t, strings.HasPrefix(subj, "$JS."))
 	}
 
-	// Stream macros have no meaning in subscribe lists.
-	for _, entry := range []string{"{{jsread(tag(js))}}", "{{jsadmin(tag(jsa))}}"} {
-		for _, mk := range []func(*jwt.UserPermissionLimits){
-			func(l *jwt.UserPermissionLimits) { l.Sub.Allow.Add(entry) },
-			func(l *jwt.UserPermissionLimits) { l.Sub.Deny.Add(entry) },
-		} {
-			lim := jwt.UserPermissionLimits{}
-			mk(&lim)
-			_, err := processUserPermissionsTemplate(lim, uc, acc)
-			require_Error(t, err)
-			require_Contains(t, err.Error(), "subscribe")
-		}
-	}
+	require_Len(t, len(res.Sub.Allow), 0)
+	require_Len(t, len(res.Sub.Deny), 0)
 }
 
-func TestJWTTemplateMacroInfo(t *testing.T) {
+func TestJWTXPermissionsInfo(t *testing.T) {
 	uc, acc := macroTestUserClaims(t)
 	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsinfo()}}", "plain.subject")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
+	lim.Pub.Allow.Add("plain.subject")
+	res, err := processUserPermissionsTemplate(lim, mustXPermissions(t, `{"jsinfo":true}`), uc, acc)
 	require_NoError(t, err)
-	requireSameSubjects(t, res.Pub.Allow, append(macroInfoPubSubjects, "plain.subject"))
-
-	// jsinfo takes no argument and is not valid in subscribe lists.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{jsinfo(tag(kv))}}")
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
-	require_Error(t, err)
-	require_Contains(t, err.Error(), "not defined")
-
-	lim = jwt.UserPermissionLimits{}
-	lim.Sub.Allow.Add("{{jsinfo()}}")
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
-	require_Error(t, err)
-	require_Contains(t, err.Error(), "subscribe")
+	requireSameSubjects(t, res.Pub.Allow, append([]string{"plain.subject"}, macroInfoPubSubjects...))
+	require_Len(t, len(res.Sub.Allow), 0)
 }
 
 // The end-to-end test checks that the subject sets are sufficient for the
 // nats.go legacy and new JetStream APIs, and that nothing outside the tagged
 // buckets is granted.
-func TestJWTTemplateMacroKVObjectStoreEndToEnd(t *testing.T) {
+func TestJWTXPermissionsKVObjectStoreEndToEnd(t *testing.T) {
 	sysKp, syspub := createKey(t)
 	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
 	sysCreds := newUser(t, sysKp)
@@ -382,12 +302,12 @@ func TestJWTTemplateMacroKVObjectStoreEndToEnd(t *testing.T) {
 	scopedKp, scopedPub := createKey(t)
 	scope := jwt.NewUserScope()
 	scope.Key = scopedPub
-	scope.Template.Pub.Allow.Add(
-		"{{kvrw(tag(kv))}}", "{{kvro(tag(kvr))}}",
-		"{{objrw(tag(obj))}}", "{{objro(tag(objr))}}")
-	scope.Template.Sub.Allow.Add("_INBOX.>", "{{kvrw(tag(kv))}}")
+	scope.Template.Sub.Allow.Add("_INBOX.>")
 	accClaim.SigningKeys.AddScopedSigner(scope)
-	accJwt := encodeClaim(t, accClaim, accPub)
+	accJwt := encodeAccountClaimWithXPermissions(t, accClaim, map[string]string{scopedPub: `{
+		"kv":[{"op":"rw","bucket":"{{tag(kv)}}"},{"op":"ro","bucket":"{{tag(kvr)}}"}],
+		"obj":[{"op":"rw","bucket":"{{tag(obj)}}"},{"op":"ro","bucket":"{{tag(objr)}}"}]
+	}`})
 	adminCreds := newUser(t, accKp)
 
 	ukp, _ := nkeys.CreateUser()
@@ -562,7 +482,7 @@ func TestJWTTemplateMacroKVObjectStoreEndToEnd(t *testing.T) {
 		_, err = sub.NextMsg(time.Second)
 		require_NoError(t, err)
 
-		denied, err := nc.SubscribeSync("$KV.ro.>")
+		denied, err := nc.SubscribeSync("$KV.none.>")
 		require_NoError(t, err)
 		_, err = denied.NextMsg(time.Second)
 		require_Error(t, err)
@@ -622,34 +542,15 @@ func TestJWTTemplateMacroKVObjectStoreEndToEnd(t *testing.T) {
 	require_True(t, violations.Load() >= 8)
 }
 
-// A tag value that contains a template token must not be expanded a second
-// time by the upstream template pass. Only the plain bucket name is granted.
-func TestJWTTemplateMacroRejectsTemplateInjection(t *testing.T) {
+// A tag value that contains a template token fails authentication instead of
+// being expanded a second time by the ordinary template pass.
+func TestJWTXPermissionsRejectsTemplateInjection(t *testing.T) {
 	uc, acc := macroTestUserClaims(t,
 		"kv:{{tag(y)}}", "y:*", "kv:{{name()}}", "kv:{{account-tag(kv)}}", "kv:a$b", "kv:good")
 	uc.Name = "*"
 	acc.tags = []string{"kv:*"}
-	lim := jwt.UserPermissionLimits{}
-	lim.Pub.Allow.Add("{{kvrw(tag(kv))}}")
-	lim.Sub.Allow.Add("{{kvrw(tag(kv))}}")
-
-	res, err := processUserPermissionsTemplate(lim, uc, acc)
-	require_NoError(t, err)
-	requireSameSubjects(t, res.Pub.Allow, macroWritePubSubjects("KV_good", "$KV.good"))
-	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.good.>"})
-	for _, s := range append(res.Pub.Allow, res.Sub.Allow...) {
-		if strings.ContainsAny(s, "{}$*") && !strings.HasPrefix(s, "$JS.") && !strings.HasPrefix(s, "$KV.good.") {
-			t.Fatalf("unexpected subject %q", s)
-		}
-		if strings.Contains(s, "KV_*") || strings.Contains(s, "$KV.*") || strings.Contains(s, "{{") {
-			t.Fatalf("template injection widened subject %q", s)
-		}
-	}
-
-	// In a deny list such a value is an error.
-	lim = jwt.UserPermissionLimits{}
-	lim.Pub.Deny.Add("{{kvrw(tag(kv))}}")
-	_, err = processUserPermissionsTemplate(lim, uc, acc)
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
 	require_Error(t, err)
 	require_Contains(t, err.Error(), "generated invalid subject")
 }

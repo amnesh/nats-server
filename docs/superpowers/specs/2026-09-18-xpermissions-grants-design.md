@@ -1,12 +1,12 @@
 # Design: Scoped Resource Permission Groups
 
 - **Date:** 2026-09-18
-- **Status:** Approved by the fork owner; implementation not started.
+- **Status:** Implemented.
 - **Component:** account JWT scoped signing-key templates and server permission compilation
 - **Supersedes:** `2026-09-17-permission-template-macros-design.md` and
   `2026-09-17-permission-template-macros-v2-design.md` as the design authority
-  for the next implementation. Those files remain historical descriptions of
-  the whole-entry macro implementation until it is replaced.
+  for the implementation. Those files remain historical descriptions of the
+  superseded whole-entry macro implementation.
 
 ## 1. Goal and constraints
 
@@ -147,7 +147,7 @@ generated subject is a subscribe subject or that every API operation is
 read-only.
 
 The bundles below are exactly the current sets in
-`server/auth_perm_macros.go:115-188`. `{api}` is `$JS.API` locally and
+`server/auth_xpermissions_compile.go`. `{api}` is `$JS.API` locally and
 `$JS.<domain>.API` with a domain. `{dom}` is `*` locally and the domain value
 when supplied.
 

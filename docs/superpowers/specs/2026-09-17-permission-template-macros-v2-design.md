@@ -1,12 +1,12 @@
 # Design: Permission Template Macros v2 (complete macro set)
 
 - **Date:** 2026-09-17
-- **Status:** Approved by the fork owner. Implementation in progress, see §11.
+- **Status:** Historical; superseded by `2026-09-18-xpermissions-grants-design.md`.
 - **Supersedes:** `2026-09-17-permission-template-macros-design.md` (v1: `kvro`,
   `kvrw`, `objro`, `objrw` only). Everything in v1 that is not restated here
   still holds: hook placement, fail-closed rules, whole-entry rule, no config
   knob, template-injection guard.
-- **Component:** `server/auth_perm_macros.go`, hook in `processUserPermissionsTemplate`
+- **Component:** Removed whole-entry macro implementation
 - **Author/driver:** chezgi (with Claude Code)
 
 ---

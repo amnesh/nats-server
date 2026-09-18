@@ -7,14 +7,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `origin` is a fork of nats-io/nats-server (`upstream`). Run `git remote -v` before any push. The fork keeps a small set of custom features as commits on top of an upstream `release/vX.Y.Z` branch. There is no fork development on `main`; work lands on the current release branch as small, self-contained commits.
 
 - The custom commits are exactly `git log upstream/release/vX.Y.Z..origin/release/vX.Y.Z`. Each feature is one squashed, signed-off commit, so it cherry-picks cleanly onto the next upstream release.
-- Keep feature logic in dedicated files and add only the smallest hooks to upstream files, so cherry-picks stay conflict-free. Existing examples: `server/authverify/` + `server/auth_verification.go` (post-auth verification callout), `server/soo-changes.go` (`Nats-Request-Info` stamping on inbound requests), `server/auth_perm_macros.go` (`{{kvrw(tag(kv))}}` style permission template macros), and the custom listener/dialer fields in `server/opts.go`.
+- Keep feature logic in dedicated files and add only the smallest hooks to upstream files, so cherry-picks stay conflict-free. Existing examples: `server/authverify/` + `server/auth_verification.go` (post-auth verification callout), `server/soo-changes.go` (`Nats-Request-Info` stamping on inbound requests), `server/auth_xpermissions.go` + `server/auth_xpermissions_compile.go` (scoped resource permission groups), and the custom listener/dialer fields in `server/opts.go`.
 - Every fork feature is off by default. An unconfigured server behaves like upstream.
 - `FORK-CHANGES.md` documents each feature: config keys, wire formats, code map, tests. `docs/superpowers/specs/` holds the design specs. Update both when a feature changes.
 - To move the fork to a newer upstream release, use the `update-fork` skill in `.claude/skills/`. The fork tag `vX.Y.Z` points at the fork's top commit, not at upstream's release commit, so `go get <fork>@vX.Y.Z` includes the patches.
 - Fork feature tests:
 
 ```sh
-go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|TemplateMacro' ./server ./server/authverify ./test -count=1
+go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions' ./server ./server/authverify ./test -count=1
 ```
 
 ## Build, lint, and test

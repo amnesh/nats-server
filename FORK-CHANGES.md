@@ -18,7 +18,7 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 1 | **Authentication Verification Callout** (`authverify`) | `authorization { auth_verification: true }` | `server/authverify/` (pkg), `server/auth_verification.go` | `server/opts.go`, `server/auth.go` |
 | 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
-| 4 | **Permission Template Macros** (`{{kvrw(tag(kv))}}` etc.) | use a macro in a scoped signing key template | `server/auth_perm_macros.go` | `server/auth.go` |
+| 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
 
 Features 1, 2 and 4 are documented in full below. Feature 3 is summarized in between.
 
@@ -434,7 +434,69 @@ See commit `6f42d0a4f` for the exact `Options` fields and plumbing.
 
 ---
 
-# 4. Permission Template Macros
+# 4. Scoped Resource Permission Groups
+
+Scoped user signing keys may carry a server extension at
+`nats.signing_keys[].template.xpermissions`. The extension adds the complete
+JetStream subject bundle for named resources while the typed JWT template keeps
+ordinary `pub`, `sub`, `resp`, limits, bearer/proxy flags, and connection types.
+
+```json
+{
+  "xpermissions": {
+    "kv": [{"op":"rw", "bucket":"{{tag(kv)}}"}],
+    "obj": [{"op":"ro", "bucket":"assets", "domain":"hub"}],
+    "stream": [{"op":"admin", "stream":"orders"}],
+    "consumer": [{"op":"ro", "stream":"orders", "consumer":"{{name()}}"}],
+    "jsinfo": true
+  }
+}
+```
+
+`kv` and `obj` accept `ro`, `rw`, and `admin`; `stream` and `consumer`
+accept `ro` and `admin`. Every supplied group is a nonempty array. `domain` is
+optional per entry. `jsinfo: true` adds the three local account-info subjects;
+`false` is a valid no-op. Resource selectors support the ordinary scoped
+template value operations and Cartesian expansion. Only the complete literal
+selector `*` is a wildcard; domains and resolved values cannot be wildcards.
+
+The extension is parsed only from the verified raw account JWT. It is strictly
+validated, correlated with the typed scoped signer, and installed atomically
+with the typed scope. Unknown or duplicate fields, wrong types, empty groups,
+bad operations, invalid selectors, and missing resolved selectors fail closed.
+Generated subjects are additive allows, standard denies still win, and each
+permission list retains the 4096 generated-subject budget. Account updates that
+change only `xpermissions` disconnect users of the affected signer.
+
+Legacy whole-entry resource calls such as `{{kvrw(tag(kv))}}` are rejected in
+all four standard subject lists during account claim ingestion. Migrate each
+call to its matching group and operation before upgrading. Mixed-version
+clusters are unsupported during migration: older servers ignore the raw
+extension, while upgraded servers reject the legacy calls.
+
+Implementation and tests:
+
+- `server/auth_xpermissions.go`: strict signed-payload parser and validation.
+- `server/auth_xpermissions_compile.go`: selector expansion and subject bundles.
+- `server/accounts.go` and `server/server.go`: atomic account lifecycle.
+- `server/auth.go` and `server/auth_callout.go`: scoped authentication paths.
+- `server/auth_xpermissions*_test.go`, `server/jwt_test.go`, and
+  `server/auth_callout_test.go`: schema, compilation, lifecycle, and real-client
+  coverage.
+
+```sh
+go test -run '^TestJWTXPermissions' ./server -count=1
+```
+
+The complete design and migration mapping are in
+`docs/superpowers/specs/2026-09-18-xpermissions-grants-design.md`.
+
+---
+
+# Historical: Permission Template Macros (superseded)
+
+The following section documents the removed whole-entry implementation for
+release archaeology only. It is not accepted by current servers.
 
 ## 4.1 What it is
 
@@ -776,17 +838,17 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 # Maintenance notes
 
 - Features 1–3 are gated **off by default**; feature 4 has no config knob and is
-  only active for account JWT templates that use a macro. An unconfigured server
-  behaves exactly like upstream.
+  active only for account JWTs carrying `template.xpermissions`. An unconfigured
+  server behaves exactly like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
-  `server/soo-changes.go`, `server/auth_perm_macros.go`) with minimal, stable
-  hooks in upstream files, to minimize merge conflicts when rebasing onto a newer
-  upstream release.
+  `server/soo-changes.go`, `server/auth_xpermissions.go`, and
+  `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
+  files, to minimize merge conflicts when rebasing onto a newer upstream release.
 - When upgrading the fork to a new upstream release, cherry-pick the custom commits
   forward and re-run the feature tests:
 
   ```sh
-  # Feature 1 (authverify) + Feature 2 (request info stamping) + Feature 4 (template macros)
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|TemplateMacro' \
+  # Feature 1 (authverify) + Feature 2 (request info stamping) + Feature 4 (xpermissions)
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions' \
       ./server ./server/authverify ./test -count=1
   ```

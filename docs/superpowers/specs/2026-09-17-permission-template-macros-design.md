@@ -1,8 +1,8 @@
 # Design: Permission Template Macros for KV and Object Store buckets
 
 - **Date:** 2026-09-17
-- **Status:** Implemented. See §9.
-- **Component:** `server/` scoped signing key template engine (`processUserPermissionsTemplate`)
+- **Status:** Historical; superseded by `2026-09-18-xpermissions-grants-design.md`.
+- **Component:** Removed whole-entry macro implementation
 - **Author/driver:** chezgi (with Claude Code)
 - **Origin:** `AUTHZ-REPORT.md` (not committed), approach 1 / phase 1
 

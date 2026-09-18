@@ -476,7 +476,11 @@ var (
 	errPermTemplateExpansionLimit    error = fmt.Errorf("template expansion exceeds limit")
 )
 
-func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.UserClaims, acc *Account) (jwt.UserPermissionLimits, error) {
+func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, xp *xPermissions, ujwt *jwt.UserClaims, acc *Account) (jwt.UserPermissionLimits, error) {
+	lim.Permissions.Pub.Allow = append(jwt.StringList(nil), lim.Permissions.Pub.Allow...)
+	lim.Permissions.Pub.Deny = append(jwt.StringList(nil), lim.Permissions.Pub.Deny...)
+	lim.Permissions.Sub.Allow = append(jwt.StringList(nil), lim.Permissions.Sub.Allow...)
+	lim.Permissions.Sub.Deny = append(jwt.StringList(nil), lim.Permissions.Sub.Deny...)
 	nArrayCartesianProduct := func(a ...[]string) [][]string {
 		c := 1
 		for _, a := range a {
@@ -519,7 +523,7 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 		}
 		return nil
 	}
-	applyTemplate := func(list jwt.StringList, failOnBadSubject bool) (jwt.StringList, error) {
+	applyTemplate := func(list jwt.StringList, failOnBadSubject bool) (jwt.StringList, int, error) {
 		found := false
 	FOR_FIND:
 		for i := 0; i < len(list); i++ {
@@ -530,10 +534,11 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 			}
 		}
 		if !found {
-			return list, nil
+			return list, 0, nil
 		}
 		// process the templates
 		emittedList := make([]string, 0, len(list))
+		candidateCount := 0
 		for i := 0; i < len(list); i++ {
 			// find all the templates {{}} in this acl
 			tokens := mustacheRE.FindAllString(list[i], -1)
@@ -576,16 +581,22 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 					if len(valueList) != 0 {
 						values[tokenNum] = valueList
 					} else if failOnBadSubject {
-						return nil, fmt.Errorf("generated invalid subject %q: %q is not defined", list[i], match[1])
+						return nil, 0, fmt.Errorf("generated invalid subject %q: %q is not defined", list[i], match[1])
 					} else {
 						// generate an invalid subject?
 						values[tokenNum] = []string{" "}
 					}
 				} else {
-					return nil, fmt.Errorf("template operation in %q: %q is not defined", list[i], op)
+					return nil, 0, fmt.Errorf("template operation in %q: %q is not defined", list[i], op)
 				}
 			}
 			if !hasTags {
+				if len(tokens) > 0 {
+					if candidateCount == maxPermTemplateSubjectExpansions {
+						return nil, 0, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
+					}
+					candidateCount++
+				}
 				subj := list[i]
 				for idx, m := range srcs {
 					subj = strings.Replace(subj, m, values[idx][0], -1)
@@ -593,7 +604,7 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 				if IsValidSubject(subj) {
 					emittedList = append(emittedList, subj)
 				} else if failOnBadSubject {
-					return nil, fmt.Errorf("generated invalid subject")
+					return nil, 0, fmt.Errorf("generated invalid subject")
 				}
 			} else {
 				expCount := 1
@@ -603,13 +614,14 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 						break
 					}
 					if expCount > maxPermTemplateSubjectExpansions/len(v) {
-						return nil, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
+						return nil, 0, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
 					}
 					expCount *= len(v)
 				}
-				if len(emittedList) > maxPermTemplateSubjectExpansions-expCount {
-					return nil, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
+				if candidateCount > maxPermTemplateSubjectExpansions-expCount {
+					return nil, 0, fmt.Errorf("%w: %d", errPermTemplateExpansionLimit, maxPermTemplateSubjectExpansions)
 				}
+				candidateCount += expCount
 				a := nArrayCartesianProduct(values...)
 				for _, aa := range a {
 					subj := list[i]
@@ -619,29 +631,29 @@ func processUserPermissionsTemplate(lim jwt.UserPermissionLimits, ujwt *jwt.User
 					if IsValidSubject(subj) {
 						emittedList = append(emittedList, subj)
 					} else if failOnBadSubject {
-						return nil, fmt.Errorf("generated invalid subject")
+						return nil, 0, fmt.Errorf("generated invalid subject")
 					}
 				}
 			}
 		}
-		return emittedList, nil
+		return emittedList, candidateCount, nil
 	}
 
 	subAllowWasNotEmpty := len(lim.Permissions.Sub.Allow) > 0
 	pubAllowWasNotEmpty := len(lim.Permissions.Pub.Allow) > 0
 
 	var err error
-	// Fork: expand permission macros such as {{kvrw(tag(kv))}}, see auth_perm_macros.go.
-	if lim, err = expandPermissionMacros(lim, ujwt, acc); err != nil {
+	var subGenerated, pubGenerated int
+	if lim.Permissions.Sub.Allow, subGenerated, err = applyTemplate(lim.Permissions.Sub.Allow, false); err != nil {
+		return jwt.UserPermissionLimits{}, err
+	} else if lim.Permissions.Sub.Deny, _, err = applyTemplate(lim.Permissions.Sub.Deny, true); err != nil {
+		return jwt.UserPermissionLimits{}, err
+	} else if lim.Permissions.Pub.Allow, pubGenerated, err = applyTemplate(lim.Permissions.Pub.Allow, false); err != nil {
+		return jwt.UserPermissionLimits{}, err
+	} else if lim.Permissions.Pub.Deny, _, err = applyTemplate(lim.Permissions.Pub.Deny, true); err != nil {
 		return jwt.UserPermissionLimits{}, err
 	}
-	if lim.Permissions.Sub.Allow, err = applyTemplate(lim.Permissions.Sub.Allow, false); err != nil {
-		return jwt.UserPermissionLimits{}, err
-	} else if lim.Permissions.Sub.Deny, err = applyTemplate(lim.Permissions.Sub.Deny, true); err != nil {
-		return jwt.UserPermissionLimits{}, err
-	} else if lim.Permissions.Pub.Allow, err = applyTemplate(lim.Permissions.Pub.Allow, false); err != nil {
-		return jwt.UserPermissionLimits{}, err
-	} else if lim.Permissions.Pub.Deny, err = applyTemplate(lim.Permissions.Pub.Deny, true); err != nil {
+	if lim, err = appendXPermissions(lim, xp, ujwt, acc, pubGenerated, subGenerated); err != nil {
 		return jwt.UserPermissionLimits{}, err
 	}
 
@@ -1042,7 +1054,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
-		if scope, ok := acc.hasIssuer(juc.Issuer); !ok {
+		if scope, xp, ok := acc.issuerScopeAndXPermissions(juc.Issuer); !ok {
 			c.Debugf("User JWT issuer is not known")
 			return false
 		} else if scope != nil {
@@ -1052,8 +1064,8 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			} else if uSc, ok := scope.(*jwt.UserScope); !ok {
 				c.Debugf("User JWT is not valid")
 				return false
-			} else if juc.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, juc, acc); err != nil {
-				c.Debugf("User JWT generated invalid permissions")
+			} else if juc.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, xp, juc, acc); err != nil {
+				c.Debugf("User JWT issuer %q generated invalid permissions: %v", juc.Issuer, err)
 				return false
 			}
 		}
