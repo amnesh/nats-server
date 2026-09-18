@@ -75,6 +75,7 @@ func (c *client) stampRequestInfoHeaderIfNeeded(msg []byte) []byte {
 			Account:    accForClient(c),
 			User:       c.getRawAuthUser(),
 			Name:       c.opts.Name,
+			Tags:       c.tags,
 			Kind:       c.kindString(),
 			ClientType: c.clientTypeString(),
 			Lang:       c.opts.Lang,
@@ -112,8 +113,8 @@ func (c *client) stampRequestInfoHeaderIfNeeded(msg []byte) []byte {
 
 // getClientInfoForRequest returns a trimmed ClientInfo used to stamp inbound
 // request messages. It carries enough to identify the requestor (account,
-// user, name, kind, client type, lang, host, RTT) without the heavier fields
-// of the detailed form (JWT, issuer key, tags, server/cluster, start time).
+// user, name, tags, kind, client type, lang, host, RTT) without the heavier
+// fields of the detailed form (JWT, issuer key, server/cluster, start time).
 func (c *client) getClientInfoForRequest() *ClientInfo {
 	if c == nil || (c.kind != CLIENT && c.kind != LEAF && c.kind != JETSTREAM && c.kind != ACCOUNT) {
 		return nil
@@ -123,6 +124,7 @@ func (c *client) getClientInfoForRequest() *ClientInfo {
 	ci.Account = accForClient(c)
 	ci.User = c.getRawAuthUser()
 	ci.Name = c.opts.Name
+	ci.Tags = c.tags
 	ci.Kind = c.kindString()
 	ci.ClientType = c.clientTypeString()
 	ci.Lang = c.opts.Lang

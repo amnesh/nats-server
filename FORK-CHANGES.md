@@ -286,8 +286,8 @@ When enabled, the server stamps a **`Nats-Request-Info` header** containing the
 requesting client's identity onto **every inbound request message** (any
 CLIENT/LEAF publish that carries a reply subject). Downstream subscribers — typical
 request/reply services — can then read *who* sent the request (account, user,
-name, kind, language, host, RTT) directly from the message header, without any
-application-level convention or extra round-trip.
+name, authenticated JWT tags, kind, language, host, RTT) directly from the
+message header, without any application-level convention or extra round-trip.
 
 ## 2.2 How this differs from upstream
 
@@ -331,13 +331,14 @@ Stamping is applied in the inbound publish path (`processInboundClientMsg`,
 
 The header value is a JSON `ClientInfo` (subset of the upstream type) carrying a
 **trimmed identity set** — enough to identify the requestor, without the heavier
-detailed fields (JWT, issuer key, tags, server/cluster, start time):
+detailed fields (JWT, issuer key, server/cluster, start time):
 
 | JSON field | Meaning |
 |---|---|
 | `acc` | account name / public key |
 | `user` | user id (raw auth user) |
 | `name` | client `name` from CONNECT |
+| `tags` | authenticated user JWT tags (omitted for non-JWT users or an empty tag list) |
 | `kind` | connection kind (e.g. `Client`, `Leafnode`) |
 | `client_type` | client type (e.g. `nats`, `mqtt`, `websocket`) |
 | `lang` | client language |
@@ -354,7 +355,9 @@ from a remote domain:
 
 - The **identity** portion is **replaced** with this leaf connection's own info —
   forwarded identity is not trusted (consistent with the server's existing
-  service-import security model).
+  service-import security model). This includes `tags`: the receiving server
+  stamps the authenticated leaf transport JWT tags, not the original caller's
+  forwarded tags.
 - The **`reply`** field of the forwarded header is **preserved**, because chained
   service-import response routing across the leaf boundary depends on it.
 
@@ -365,6 +368,9 @@ from a remote domain:
   (`client.ciStampHdr`) and reused across requests, since the identity is stable
   for the life of the connection. The cache is invalidated when identity-affecting
   state changes (account swap on reload, re-register, close).
+- Non-empty JWT tags increase each stamped request header by their JSON-encoded
+  size. They remain part of the cached JSON, so this does not add per-request
+  claim decoding or marshaling after the cache is populated.
 - The per-request `reply` value (LEAF) is spliced in for that one request only and
   is deliberately excluded from the cache so it does not defeat caching.
 
@@ -384,6 +390,7 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
             Account    string `json:"acc"`
             User       string `json:"user"`
             Name       string `json:"name"`
+            Tags       []string `json:"tags"`
             Kind       string `json:"kind"`
             ClientType string `json:"client_type"`
             Lang       string `json:"lang"`

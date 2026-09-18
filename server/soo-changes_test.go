@@ -2,8 +2,13 @@ package server
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nkeys"
 )
 
 // skipRequestInfoStamp must only skip the documented internal subject spaces,
@@ -68,6 +73,9 @@ func TestGetClientInfoForRequest(t *testing.T) {
 			t.Fatalf("kind %d: got non-nil=%v, want %v", tc.kind, ci != nil, tc.want)
 		}
 	}
+	if tags := (&client{kind: CLIENT}).getClientInfoForRequest().Tags; len(tags) != 0 {
+		t.Fatalf("Expected empty tags for an untagged client, got %v", tags)
+	}
 
 	// Identity and connection fields are copied from the client, and the
 	// heavier detailed fields are left unset (the trimmed form).
@@ -76,6 +84,7 @@ func TestGetClientInfoForRequest(t *testing.T) {
 	c.opts.Username = "alice"
 	c.opts.Name = "myapp"
 	c.opts.Lang = "go"
+	c.tags = []string{"role:org-admin"}
 
 	ci := c.getClientInfoForRequest()
 	if ci == nil {
@@ -90,7 +99,10 @@ func TestGetClientInfoForRequest(t *testing.T) {
 	if ci.Host != "10.0.0.1" || ci.RTT != 5*time.Millisecond {
 		t.Fatalf("Unexpected host/rtt: host=%q rtt=%v", ci.Host, ci.RTT)
 	}
-	if ci.Jwt != "" || ci.IssuerKey != "" || len(ci.Tags) != 0 || ci.Start != nil ||
+	if len(ci.Tags) != 1 || ci.Tags[0] != "role:org-admin" {
+		t.Fatalf("Unexpected tags: %v", ci.Tags)
+	}
+	if ci.Jwt != "" || ci.IssuerKey != "" || ci.Start != nil ||
 		ci.ID != 0 || ci.Version != "" || ci.Server != "" || ci.Cluster != "" {
 		t.Fatalf("Detailed fields unexpectedly set on trimmed CI: %+v", ci)
 	}
@@ -173,11 +185,13 @@ func TestStampRequestInfoHeaderIfNeeded(t *testing.T) {
 	// (mirrors the logic at client.go:4901-4926).
 	t.Run("leaf preserves forwarded Reply when replacing identity", func(t *testing.T) {
 		c := mkClient(LEAF, true)
+		c.tags = []string{"source:receiving-leaf"}
 		// Build a message carrying a forwarded CI from the remote domain:
 		// different account/user/name plus a Reply that came from the
 		// original requestor's service-import chain.
 		fwd, err := json.Marshal(&ClientInfo{
 			Account: "REMOTE", User: "alice", Name: "remote-app",
+			Tags:  []string{"source:original-client"},
 			Reply: "_INBOX.original.42",
 		})
 		if err != nil {
@@ -208,6 +222,9 @@ func TestStampRequestInfoHeaderIfNeeded(t *testing.T) {
 		if stamped.Account != "A" || stamped.User != "req" {
 			t.Fatalf("Identity not replaced with leaf connection's, got %+v", stamped)
 		}
+		if len(stamped.Tags) != 1 || stamped.Tags[0] != "source:receiving-leaf" {
+			t.Fatalf("Forwarded tags not replaced with leaf connection's, got %v", stamped.Tags)
+		}
 		// Reply from the forwarded CI must survive.
 		if stamped.Reply != "_INBOX.original.42" {
 			t.Fatalf("Forwarded Reply not preserved, got %q", stamped.Reply)
@@ -236,6 +253,7 @@ func TestStampRequestInfoHeaderIfNeeded(t *testing.T) {
 	t.Run("cache reused and invalidated on input change", func(t *testing.T) {
 		c := mkClient(CLIENT, true)
 		c.rtt = 7 * time.Millisecond
+		c.tags = []string{"role:org-admin"}
 
 		extract := func() ClientInfo {
 			t.Helper()
@@ -252,7 +270,7 @@ func TestStampRequestInfoHeaderIfNeeded(t *testing.T) {
 		}
 
 		ci1 := extract()
-		if ci1.RTT != 7*time.Millisecond || ci1.Account != "A" {
+		if ci1.RTT != 7*time.Millisecond || ci1.Account != "A" || len(ci1.Tags) != 1 || ci1.Tags[0] != "role:org-admin" {
 			t.Fatalf("Unexpected first CI: %+v", ci1)
 		}
 
@@ -300,6 +318,137 @@ func TestStampRequestInfoHeaderIfNeeded(t *testing.T) {
 				t.Fatalf("Expected message unchanged for %q, got %q", tc.name, out)
 			}
 		})
+	}
+}
+
+func newRequestInfoJWTAccount(t *testing.T) (nkeys.KeyPair, string, string) {
+	t.Helper()
+	akp, err := nkeys.CreateAccount()
+	if err != nil {
+		t.Fatalf("Error creating account key: %v", err)
+	}
+	apub, err := akp.PublicKey()
+	if err != nil {
+		t.Fatalf("Error reading account public key: %v", err)
+	}
+	nac := jwt.NewAccountClaims(apub)
+	ajwt, err := nac.Encode(oKp)
+	if err != nil {
+		t.Fatalf("Error encoding account JWT: %v", err)
+	}
+	return akp, apub, ajwt
+}
+
+func runRequestInfoJWTServer(t *testing.T, accountPub, accountJWT string, configure func(*Options)) (*Server, *Options) {
+	t.Helper()
+	op, err := oKp.PublicKey()
+	if err != nil {
+		t.Fatalf("Error reading operator public key: %v", err)
+	}
+	resolver := &MemAccResolver{}
+	if err := resolver.Store(accountPub, accountJWT); err != nil {
+		t.Fatalf("Error storing account JWT: %v", err)
+	}
+	opts := DefaultOptions()
+	opts.Host = "127.0.0.1"
+	opts.Port = -1
+	opts.StampRequestInfo = true
+	opts.TrustedKeys = []string{op}
+	opts.AccountResolver = resolver
+	if configure != nil {
+		configure(opts)
+	}
+	s := RunServer(opts)
+	t.Cleanup(s.Shutdown)
+	return s, opts
+}
+
+func requestInfoJWTUser(t *testing.T, akp nkeys.KeyPair, tags ...string) nats.Option {
+	t.Helper()
+	uc := jwt.NewUserClaims("temp")
+	uc.Tags = tags
+	return createUserCredsEx(t, uc, akp)
+}
+
+func TestStampRequestInfoJWTDirectTags(t *testing.T) {
+	akp, apub, ajwt := newRequestInfoJWTAccount(t)
+	s, _ := runRequestInfoJWTServer(t, apub, ajwt, nil)
+
+	svc := natsConnect(t, s.ClientURL(), requestInfoJWTUser(t, akp))
+	defer svc.Close()
+	ciCh := make(chan ClientInfo, 2)
+	_, err := svc.Subscribe("svc.echo", func(msg *nats.Msg) {
+		var ci ClientInfo
+		if err := json.Unmarshal([]byte(msg.Header.Get(ClientInfoHdr)), &ci); err != nil {
+			t.Errorf("Error unmarshaling client info: %v", err)
+		}
+		ciCh <- ci
+		_ = msg.Respond([]byte("ok"))
+	})
+	require_NoError(t, err)
+	require_NoError(t, svc.Flush())
+
+	req := natsConnect(t, s.ClientURL(), requestInfoJWTUser(t, akp, "role:org-admin"))
+	defer req.Close()
+	for i := 0; i < 2; i++ {
+		_, err := req.Request("svc.echo", nil, time.Second)
+		require_NoError(t, err)
+		ci := require_ChanRead(t, ciCh, time.Second)
+		if len(ci.Tags) != 1 || ci.Tags[0] != "role:org-admin" {
+			t.Fatalf("Request %d: tags = %v, want [role:org-admin]", i+1, ci.Tags)
+		}
+	}
+}
+
+func TestStampRequestInfoJWTLeafUsesTransportTags(t *testing.T) {
+	akp, apub, ajwt := newRequestInfoJWTAccount(t)
+	hub, hubOpts := runRequestInfoJWTServer(t, apub, ajwt, func(opts *Options) {
+		opts.LeafNode.Host = "127.0.0.1"
+		opts.LeafNode.Port = -1
+	})
+
+	leafKP, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	leafPub, err := leafKP.PublicKey()
+	require_NoError(t, err)
+	leafClaims := jwt.NewUserClaims(leafPub)
+	leafClaims.Tags = []string{"source:receiving-leaf"}
+	leafJWT, err := leafClaims.Encode(akp)
+	require_NoError(t, err)
+	leafSeed, err := leafKP.Seed()
+	require_NoError(t, err)
+	leafCreds := genCredsFile(t, leafJWT, leafSeed)
+	t.Cleanup(func() { os.Remove(leafCreds) })
+	leaf, _, leafConf := runSolicitWithCredentials(t, hubOpts, leafCreds)
+	t.Cleanup(leaf.Shutdown)
+	t.Cleanup(func() { os.Remove(leafConf) })
+	checkLeafNodeConnected(t, hub)
+	checkLeafNodeConnected(t, leaf)
+
+	svc := natsConnect(t, hub.ClientURL(), requestInfoJWTUser(t, akp))
+	defer svc.Close()
+	ciCh := make(chan ClientInfo, 1)
+	_, err = svc.Subscribe("svc.echo", func(msg *nats.Msg) {
+		var ci ClientInfo
+		if err := json.Unmarshal([]byte(msg.Header.Get(ClientInfoHdr)), &ci); err != nil {
+			t.Errorf("Error unmarshaling client info: %v", err)
+		}
+		ciCh <- ci
+		_ = msg.Respond([]byte("ok"))
+	})
+	require_NoError(t, err)
+	require_NoError(t, svc.Flush())
+	checkSubInterest(t, leaf, "$G", "svc.echo", time.Second)
+
+	req := natsConnect(t, leaf.ClientURL())
+	defer req.Close()
+	msg := nats.NewMsg("svc.echo")
+	msg.Header.Set(ClientInfoHdr, `{"tags":["source:original-client"]}`)
+	_, err = req.RequestMsg(msg, time.Second)
+	require_NoError(t, err)
+	ci := require_ChanRead(t, ciCh, time.Second)
+	if len(ci.Tags) != 1 || ci.Tags[0] != "source:receiving-leaf" {
+		t.Fatalf("Tags = %v, want receiving leaf transport tags", ci.Tags)
 	}
 }
 
