@@ -1,7 +1,7 @@
 # Design: Scoped Resource Permission Groups
 
 - **Date:** 2026-09-18
-- **Status:** Draft for fork-owner review; no implementation exists yet.
+- **Status:** Approved by the fork owner; implementation not started.
 - **Component:** account JWT scoped signing-key templates and server permission compilation
 - **Supersedes:** `2026-09-17-permission-template-macros-design.md` and
   `2026-09-17-permission-template-macros-v2-design.md` as the design authority
