@@ -230,7 +230,7 @@ func TestProcessUserPermissionsTemplateMalformedOpDoesNotPanic(t *testing.T) {
 	lim := jwt.UserPermissionLimits{}
 	lim.Permissions.Sub.Deny = jwt.StringList{"foo.{{x}}"}
 
-	_, err := processUserPermissionsTemplate(lim, &jwt.UserClaims{}, &Account{})
+	_, err := processUserPermissionsTemplate(lim, nil, &jwt.UserClaims{}, &Account{})
 	require_Error(t, err)
 }
 
@@ -240,7 +240,7 @@ func TestProcessUserPermissionsTemplateUnknownAllowOpDoesNotPanic(t *testing.T) 
 	lim := jwt.UserPermissionLimits{}
 	lim.Permissions.Pub.Allow = jwt.StringList{"foo.{{unknown()}}"}
 
-	_, err := processUserPermissionsTemplate(lim, &jwt.UserClaims{}, &Account{})
+	_, err := processUserPermissionsTemplate(lim, nil, &jwt.UserClaims{}, &Account{})
 	require_Error(t, err)
 }
 
@@ -256,7 +256,7 @@ func TestProcessUserPermissionsTemplateRejectsExcessiveTagExpansions(t *testing.
 		uc.Tags = append(uc.Tags, fmt.Sprintf("b:v%d", i))
 	}
 
-	_, err := processUserPermissionsTemplate(lim, uc, &Account{})
+	_, err := processUserPermissionsTemplate(lim, nil, uc, &Account{})
 	require_Error(t, err)
 }
 
