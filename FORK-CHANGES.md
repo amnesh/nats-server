@@ -19,7 +19,7 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
 | 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
-| 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation` | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go` |
+| 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation`. Optional: `leafnodes { sync_consumers_check_interval: "250ms" }` (off by default, hot-reloadable) | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go`, `server/leafnode_synccheck.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go`, `server/opts.go`, `server/reload.go` |
 
 Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between.
 
@@ -524,7 +524,37 @@ used all CPU, handshakes timed out, leaves connected again, and the load grew
 | `addLeafNodeConnection` searched for a previous connection from the same remote by walking all leaves under the server lock. | An index by (remote server, remote cluster, account, remote account) under the server lock, next to `s.leafs`. Each candidate is checked with the original condition. If a remote changes these fields after they were captured (an INFO to the accept side, or a second CONNECT, possibly into another account; both abnormal), the connection is marked before the change, the server logs a notice, and the check uses the full walk while that connection is open. |
 | `client.Debugf` and `client.Tracef` formatted the message before the level check. | They check the level first, as `Server.Debugf`/`Tracef` do. |
 
-## 5.3 Measured
+## 5.3 Optional: coalesced source and mirror check
+
+Upstream calls `checkInternalSyncConsumers` on the readloop of every leafnode
+connect (hub side) and of every INFO that a solicited leafnode receives. It
+locks every stream of the account that has a mirror or sources, and for each
+disconnected or stale source it cancels the backoff and schedules a new setup.
+A connect therefore costs O(sourcing streams + their sources). With one hub
+stream that sources from every leaf, a start of N leaves costs O(N²) and holds
+that stream's lock on the readloops.
+
+```
+leafnodes {
+  # Off when absent or 0 (upstream: a check on every connect).
+  sync_consumers_check_interval: "250ms"
+}
+```
+
+When set, the check runs on its own goroutine, at most once per interval for
+each account. The first trigger after an idle period runs it at once; a
+trigger during a check or the wait after it causes one more check after the
+wait. So every connect is still followed by a check that starts after it, at
+most one interval after the check that is running ends. Shutdown drops pending
+checks. The setup that a check schedules still waits for the
+upstream 2s request throttle and jitter. Streams are not filtered by domain,
+because a leaf can be the path to other domains. The value is read at each
+trigger and during each wait (at least every 100ms), so a config reload can
+change it or turn it off. When it is turned off, new triggers check
+synchronously as upstream; a goroutine that runs finishes its pending check.
+A negative value, or an integer (seconds) that does not fit, is a config error.
+
+## 5.4 Measured
 
 Hub with `isolate: true`, compression off, leaf user with permissions, 16 cores,
 raw leafnode connections with 16 subscriptions each from the same machine:
@@ -536,12 +566,16 @@ raw leafnode connections with 16 subscriptions each from the same machine:
 | 60k leaves at 10000/s | — | all connected in 6.1 s, 42 CPU-s, 4.4 GB, no errors |
 | Snapshot for one isolated leaf, 900k leaf subscriptions | 125–133 ms | 7 µs (first use: one walk, about 125 ms) |
 
-## 5.4 Code map & tests
+## 5.5 Code map & tests
 
 - `server/leafnode_isolation.go` — `isLeafInterest`, `Sublist.nonLeafSubs` and
   its `Insert`/`remove` hooks, `client.setLeafIsolated`,
   `client.loadIsolatedLeafDenyFilter`, and the `sharedLeafs` helpers.
 - `server/leafnode_dupindex.go` — duplicate-check index and fallback.
+- `server/leafnode_synccheck.go` — `syncCheckCoalescer` and
+  `scheduleInternalSyncConsumersCheck`; config key in `server/opts.go`
+  (`LeafNodeOpts.SyncConsumersCheckInterval`), reload allow-list entry in
+  `server/reload.go`, `Account.syncCheck`.
 - Hooks: `server/leafnode.go` (snapshot, `updateLeafNodesEx`,
   `addLeafNodeConnection`, `removeLeafNodeConnection`, isolation and identity
   writes), `server/sublist.go` (`Insert`, `remove`), `server/accounts.go`
@@ -551,7 +585,10 @@ raw leafnode connections with 16 subscriptions each from the same machine:
   leaf interest in a hub cluster; tracking across reload; requested isolation;
   deny filter; randomized set consistency; benchmark) and
   `server/leafnode_dupindex_test.go` (randomized index against the upstream walk;
-  fallback on identity and account change, and its end). Upstream tests `TestLeafNodeIsolatedLeafSubjectPropagation*`,
+  fallback on identity and account change, and its end),
+  `server/leafnode_synccheck_test.go` (config, reload, coalescer bounds and
+  ordering, shutdown) and `server/jetstream_leafnode_synccheck_test.go` (a leaf
+  connect cancels a long source backoff, with and without the option). Upstream tests `TestLeafNodeIsolatedLeafSubjectPropagation*`,
   `TestLeafNodeLoopDetectedDueToReconnect` and
   `TestLeafNodeHubRejectDuplicateRemotes` cover the unchanged behavior.
 
@@ -905,7 +942,9 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   active only for account JWTs carrying `template.xpermissions`. Feature 5 is
   always on but sends the same interest as upstream; its only visible
   difference is that an isolated leaf with subscribe denies always gets its
-  delivery deny filter. An unconfigured server behaves like upstream.
+  delivery deny filter. Its coalesced source/mirror check is off unless
+  `sync_consumers_check_interval` is set. An unconfigured server behaves like
+  upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
   `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
@@ -915,6 +954,6 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
   ```sh
   # Features 1, 2, 4 and 5
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex' \
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck' \
       ./server ./server/authverify ./test -count=1
   ```

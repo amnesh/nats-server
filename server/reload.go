@@ -942,6 +942,7 @@ func getLeafNodeOptionsChanges(s *Server, old, new *LeafNodeOpts) (*leafNodeOpti
 	if err := checkConfigsEqual(old, new, []string{
 		"Compression",
 		"Remotes",
+		"SyncConsumersCheckInterval", // Read at each use.
 		"TLSHandshakeFirst",
 		"TLSHandshakeFirstFallback",
 		"TLSConfig",

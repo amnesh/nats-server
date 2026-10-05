@@ -229,6 +229,11 @@ type LeafNodeOpts struct {
 	// east-west propagation.
 	IsolateLeafnodeInterest bool `json:"-"`
 
+	// If positive, the check of JetStream source and mirror consumers after a
+	// leafnode connect runs at most once per interval for each account, off
+	// the connection's readloop. See leafnode_synccheck.go.
+	SyncConsumersCheckInterval time.Duration `json:"-"`
+
 	// DialTimeout is the amount of time the server will wait for the TCP
 	// connection to a remote server to be established. This is useful on high
 	// latency links where the default (DEFAULT_ROUTE_DIAL, 1 second) is not
@@ -2954,6 +2959,19 @@ func parseLeafNodes(v any, opts *Options, errors *[]error, warnings *[]error) er
 			}
 		case "isolate_leafnode_interest", "isolate":
 			opts.LeafNode.IsolateLeafnodeInterest = mv.(bool)
+		case "sync_consumers_check_interval":
+			// An integer is in seconds; check it before it is converted, so
+			// that it cannot overflow into another value.
+			if n, ok := mv.(int64); ok && (n < 0 || n > int64(math.MaxInt64/time.Second)) {
+				*errors = append(*errors, &configErr{tk, fmt.Sprintf("%s out of range: %d", mk, n)})
+				continue
+			}
+			d := parseDuration(mk, tk, mv, errors, warnings)
+			if d < 0 {
+				*errors = append(*errors, &configErr{tk, fmt.Sprintf("%s can not be negative", mk)})
+				continue
+			}
+			opts.LeafNode.SyncConsumersCheckInterval = d
 		case "write_deadline":
 			opts.LeafNode.WriteDeadline = parseDuration("write_deadline", tk, mv, errors, warnings)
 		case "write_timeout":
