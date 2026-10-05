@@ -87,6 +87,7 @@ type Account struct {
 	lmu          sync.RWMutex
 	lleafs       []*client
 	sharedLeafs  map[*client]struct{} // Non-isolated leafs in lleafs, see leafnode_isolation.go.
+	syncCheck    syncCheckCoalescer   // See leafnode_synccheck.go.
 	leafClusters map[string]uint64
 	imports      importMap
 	exports      exportMap
