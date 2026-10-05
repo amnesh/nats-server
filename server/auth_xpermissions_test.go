@@ -1,0 +1,556 @@
+// Copyright 2026 The NATS Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nkeys"
+)
+
+// The expected expansions are written out literally so that the tests do not
+// depend on the production table. See the v2 design spec, section 5.
+func macroReadPubSubjects(stream string) []string {
+	return []string{
+		"$JS.API.STREAM.INFO." + stream,
+		"$JS.API.STREAM.MSG.GET." + stream,
+		"$JS.API.DIRECT.GET." + stream,
+		"$JS.API.DIRECT.GET." + stream + ".>",
+		"$JS.API.CONSUMER.CREATE." + stream,
+		"$JS.API.CONSUMER.CREATE." + stream + ".>",
+		"$JS.API.CONSUMER.DURABLE.CREATE." + stream + ".>",
+		"$JS.API.CONSUMER.INFO." + stream + ".>",
+		"$JS.API.CONSUMER.NAMES." + stream,
+		"$JS.API.CONSUMER.LIST." + stream,
+		"$JS.API.CONSUMER.DELETE." + stream + ".>",
+		"$JS.API.CONSUMER.MSG.NEXT." + stream + ".>",
+		"$JS.ACK." + stream + ".*.*.*.*.*.*",
+		"$JS.ACK.*.*." + stream + ".*.*.*.*.*.>",
+		"$JS.FC." + stream + ".*.*",
+		"$JS.FC.*.*." + stream + ".*.*",
+	}
+}
+
+// data is empty for plain streams, which have no derivable data subject.
+func macroWritePubSubjects(stream, data string) []string {
+	out := append(macroReadPubSubjects(stream), "$JS.API.STREAM.PURGE."+stream)
+	if data != "" {
+		out = append(out, data+".>")
+	}
+	return out
+}
+
+func macroAdminPubSubjects(stream, data string) []string {
+	return append(macroWritePubSubjects(stream, data),
+		"$JS.API.STREAM.CREATE."+stream,
+		"$JS.API.STREAM.UPDATE."+stream,
+		"$JS.API.STREAM.DELETE."+stream,
+		"$JS.API.STREAM.MSG.DELETE."+stream,
+		"$JS.API.STREAM.SNAPSHOT."+stream,
+		"$JS.API.STREAM.RESTORE."+stream,
+		"$JS.API.INFO",
+	)
+}
+
+var macroInfoPubSubjects = []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"}
+
+func macroTestUserClaims(t *testing.T, tags ...string) (*jwt.UserClaims, *Account) {
+	t.Helper()
+	kp, _ := nkeys.CreateAccount()
+	aPub, _ := kp.PublicKey()
+	ukp, _ := nkeys.CreateUser()
+	upub, _ := ukp.PublicKey()
+	uc := newJWTTestUserClaims()
+	uc.Name = "myname"
+	uc.Subject = upub
+	uc.SetScoped(true)
+	uc.IssuerAccount = aPub
+	for _, tag := range tags {
+		uc.Tags.Add(tag)
+	}
+	acc := &Account{nameTag: "accname", tags: []string{"kv:acckv"}}
+	return uc, acc
+}
+
+func requireSameSubjects(t *testing.T, res jwt.StringList, expected []string) {
+	t.Helper()
+	if len(res) != len(expected) {
+		t.Fatalf("expected %d subjects, got %d: %v", len(expected), len(res), res)
+	}
+	for _, s := range expected {
+		if !res.Contains(s) {
+			t.Fatalf("expected %q in %v", s, res)
+		}
+	}
+}
+
+func TestJWTXPermissionsKVReadWrite(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:foo")
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	requireSameSubjects(t, res.Pub.Allow, macroWritePubSubjects("KV_foo", "$KV.foo"))
+	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.foo.>"})
+	require_Len(t, len(res.Pub.Deny), 0)
+	require_Len(t, len(res.Sub.Deny), 0)
+}
+
+func TestJWTXPermissionsKVReadOnly(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:foo")
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	requireSameSubjects(t, res.Pub.Allow, macroReadPubSubjects("KV_foo"))
+	require_False(t, res.Pub.Allow.Contains("$KV.foo.>"))
+	require_False(t, res.Pub.Allow.Contains("$JS.API.STREAM.PURGE.KV_foo"))
+	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.foo.>"})
+}
+
+func TestJWTXPermissionsObjectStore(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "obj:img")
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Deny.Add(macroReadPubSubjects("OBJ_img")...)
+	lim.Sub.Deny.Add("$O.img.>")
+	xp := mustXPermissions(t, `{"obj":[{"op":"rw","bucket":"{{tag(obj)}}"}]}`)
+	res, err := processUserPermissionsTemplate(lim, xp, uc, acc)
+	require_NoError(t, err)
+	requireSameSubjects(t, res.Pub.Allow, macroWritePubSubjects("OBJ_img", "$O.img"))
+	requireSameSubjects(t, res.Pub.Deny, macroReadPubSubjects("OBJ_img"))
+	requireSameSubjects(t, res.Sub.Allow, []string{"$O.img.>"})
+	requireSameSubjects(t, res.Sub.Deny, []string{"$O.img.>"})
+}
+
+func TestJWTXPermissionsMultipleValuesAndPassthrough(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:a", "kv:b")
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("plain.subject", "tpl.{{tag(kv)}}")
+	lim.Sub.Allow.Add("_INBOX.>")
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(lim, xp, uc, acc)
+	require_NoError(t, err)
+	expected := append([]string{"plain.subject", "tpl.a", "tpl.b"}, macroReadPubSubjects("KV_a")...)
+	expected = append(expected, macroReadPubSubjects("KV_b")...)
+	requireSameSubjects(t, res.Pub.Allow, expected)
+	requireSameSubjects(t, res.Sub.Allow, []string{"_INBOX.>", "$KV.a.>", "$KV.b.>"})
+}
+
+func TestJWTXPermissionsArgumentForms(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:foo")
+	for _, test := range []struct{ arg, bucket string }{
+		{"config", "config"}, // literal bucket name
+		{"tag(KV)", "foo"},   // tag keys are case insensitive
+		{"account-tag(kv)", "acckv"},
+		{"name()", "myname"},
+		{"subject()", uc.Subject},
+		{"account-name()", "accname"},
+		{"account-subject()", uc.IssuerAccount},
+	} {
+		t.Run(test.arg, func(t *testing.T) {
+			var xp *xPermissions
+			if test.arg == "config" {
+				xp = mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"config"}]}`)
+			} else {
+				xp = mustXPermissions(t, fmt.Sprintf(`{"kv":[{"op":"ro","bucket":"{{%s}}"}]}`, test.arg))
+			}
+			res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+			require_NoError(t, err)
+			requireSameSubjects(t, res.Pub.Allow, macroReadPubSubjects("KV_"+test.bucket))
+		})
+	}
+}
+
+func TestJWTXPermissionsMissingValueFailsClosed(t *testing.T) {
+	uc, acc := macroTestUserClaims(t) // no tags at all
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "not defined")
+}
+
+func TestJWTXPermissionsInvalidBucketName(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:good", "kv:bad.name", "kv:wild*", "kv:full>", "kv:")
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "generated invalid subject")
+}
+
+func TestJWTXPermissionsMustBeWholeEntry(t *testing.T) {
+	for _, raw := range []string{
+		`{"kv":[{"op":"rw","bucket":"foo.{{tag(kv)}}"}]}`,
+		`{"kv":[{"op":"rw","bucket":"{{tag(kv)}}.bar"}]}`,
+		`{"kv":[{"op":"rw","bucket":"{{tag(kv)}}*"}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, _, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
+			require_Error(t, err)
+		})
+	}
+}
+
+func TestJWTXPermissionsUnknownOperationStillErrors(t *testing.T) {
+	for _, raw := range []string{
+		`{"kv":[{"op":"xx","bucket":"cfg"}]}`,
+		`{"kv":[{"op":"ro","bucket":"{{nope(kv)}}"}]}`,
+		`{"kv":[{"op":"ro","bucket":"{{tag()}}"}]}`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			f := newXPermissionsRawFixture(t, raw)
+			_, _, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
+			require_Error(t, err)
+		})
+	}
+}
+
+func TestJWTXPermissionsExpansionLimit(t *testing.T) {
+	mkTags := func(n int) []string {
+		tags := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			tags = append(tags, fmt.Sprintf("kv:b%d", i))
+		}
+		return tags
+	}
+	// 250 buckets x 16 subjects fits under the cap.
+	uc, acc := macroTestUserClaims(t, mkTags(250)...)
+	xp := mustXPermissions(t, `{"kv":[{"op":"ro","bucket":"{{tag(kv)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	require_Len(t, len(res.Pub.Allow), 250*16)
+
+	// 260 buckets x 16 subjects exceeds the cap.
+	uc, acc = macroTestUserClaims(t, mkTags(260)...)
+	_, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err, errPermTemplateExpansionLimit)
+}
+
+func TestJWTXPermissionsBucketAdmin(t *testing.T) {
+	uc, acc := macroTestUserClaims(t, "kv:cfg", "obj:blobs")
+	xp := mustXPermissions(t, `{"kv":[{"op":"admin","bucket":"{{tag(kv)}}"}],"obj":[{"op":"admin","bucket":"{{tag(obj)}}"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	objExpected := macroAdminPubSubjects("OBJ_blobs", "$O.blobs")
+	expected := append(macroAdminPubSubjects("KV_cfg", "$KV.cfg"), objExpected[:len(objExpected)-1]...)
+	requireSameSubjects(t, res.Pub.Allow, expected)
+	requireSameSubjects(t, res.Sub.Allow, []string{"$KV.cfg.>", "$O.blobs.>"})
+}
+
+func TestJWTXPermissionsStreamReadAndAdmin(t *testing.T) {
+	// The jwt library lowercases tag values, so a stream with an uppercase
+	// name can only be named by a literal argument.
+	uc, acc := macroTestUserClaims(t, "js:orders", "jsa:events")
+	xp := mustXPermissions(t, `{"stream":[{"op":"ro","stream":"{{tag(js)}}"},{"op":"admin","stream":"{{tag(jsa)}}"},{"op":"ro","stream":"AUDIT"}]}`)
+	res, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_NoError(t, err)
+	expected := append(macroReadPubSubjects("orders"), macroAdminPubSubjects("events", "")...)
+	expected = append(expected, macroReadPubSubjects("AUDIT")...)
+	requireSameSubjects(t, res.Pub.Allow, expected)
+	// A stream has no derivable data subject, so stream macros only grant API subjects.
+	for _, subj := range res.Pub.Allow {
+		require_True(t, strings.HasPrefix(subj, "$JS."))
+	}
+
+	require_Len(t, len(res.Sub.Allow), 0)
+	require_Len(t, len(res.Sub.Deny), 0)
+}
+
+func TestJWTXPermissionsInfo(t *testing.T) {
+	uc, acc := macroTestUserClaims(t)
+	lim := jwt.UserPermissionLimits{}
+	lim.Pub.Allow.Add("plain.subject")
+	res, err := processUserPermissionsTemplate(lim, mustXPermissions(t, `{"jsinfo":true}`), uc, acc)
+	require_NoError(t, err)
+	requireSameSubjects(t, res.Pub.Allow, append([]string{"plain.subject"}, macroInfoPubSubjects...))
+	require_Len(t, len(res.Sub.Allow), 0)
+}
+
+// The end-to-end test checks that the subject sets are sufficient for the
+// nats.go legacy and new JetStream APIs, and that nothing outside the tagged
+// buckets is granted.
+func TestJWTXPermissionsKVObjectStoreEndToEnd(t *testing.T) {
+	sysKp, syspub := createKey(t)
+	sysJwt := encodeClaim(t, jwt.NewAccountClaims(syspub), syspub)
+	sysCreds := newUser(t, sysKp)
+
+	accKp, accPub := createKey(t)
+	accClaim := jwt.NewAccountClaims(accPub)
+	accClaim.Name = "acc"
+	accClaim.Limits.JetStreamTieredLimits["R1"] = jwt.JetStreamLimits{
+		DiskStorage: jwt.NoLimit, MemoryStorage: jwt.NoLimit,
+		Consumer: jwt.NoLimit, Streams: jwt.NoLimit,
+	}
+	scopedKp, scopedPub := createKey(t)
+	scope := jwt.NewUserScope()
+	scope.Key = scopedPub
+	scope.Template.Sub.Allow.Add("_INBOX.>")
+	accClaim.SigningKeys.AddScopedSigner(scope)
+	accJwt := encodeAccountClaimWithXPermissions(t, accClaim, map[string]string{scopedPub: `{
+		"kv":[{"op":"rw","bucket":"{{tag(kv)}}"},{"op":"ro","bucket":"{{tag(kvr)}}"}],
+		"obj":[{"op":"rw","bucket":"{{tag(obj)}}"},{"op":"ro","bucket":"{{tag(objr)}}"}]
+	}`})
+	adminCreds := newUser(t, accKp)
+
+	ukp, _ := nkeys.CreateUser()
+	seed, _ := ukp.Seed()
+	upub, _ := ukp.PublicKey()
+	uclaim := newJWTTestUserClaims()
+	uclaim.Subject = upub
+	uclaim.SetScoped(true)
+	uclaim.IssuerAccount = accPub
+	uclaim.Tags.Add("kv:rw", "kvr:ro", "kvr:nd", "obj:orw", "objr:oro")
+	ujwt, err := uclaim.Encode(scopedKp)
+	require_NoError(t, err)
+	userCreds := genCredsFile(t, ujwt, seed)
+
+	cf := createConfFile(t, []byte(fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		server_name: s1
+		jetstream: {max_mem_store: 256MB, max_file_store: 2GB, store_dir: '%s'}
+		operator: %s
+		system_account: %s
+		resolver: {
+			type: full
+			dir: '%s'
+		}
+	`, t.TempDir(), ojwt, syspub, t.TempDir())))
+	s, _ := RunServerWithConfig(cf)
+	defer s.Shutdown()
+	updateJwt(t, s.ClientURL(), sysCreds, sysJwt, 1)
+	updateJwt(t, s.ClientURL(), sysCreds, accJwt, 1)
+
+	// The admin creates the buckets and seeds the read-only ones.
+	anc := natsConnect(t, s.ClientURL(), nats.UserCredentials(adminCreds))
+	defer anc.Close()
+	ajs, err := anc.JetStream()
+	require_NoError(t, err)
+	for _, b := range []string{"rw", "ro", "none"} {
+		_, err = ajs.CreateKeyValue(&nats.KeyValueConfig{Bucket: b, History: 5})
+		require_NoError(t, err)
+	}
+	// A bucket without direct get exercises the STREAM.MSG.GET path.
+	_, err = ajs.AddStream(&nats.StreamConfig{
+		Name: "KV_nd", Subjects: []string{"$KV.nd.>"}, MaxMsgsPerSubject: 1, AllowDirect: false})
+	require_NoError(t, err)
+	for _, b := range []string{"ro", "nd"} {
+		kv, err := ajs.KeyValue(b)
+		require_NoError(t, err)
+		_, err = kv.Put("seed", []byte("v"))
+		require_NoError(t, err)
+	}
+	for _, b := range []string{"orw", "oro", "onone"} {
+		_, err = ajs.CreateObjectStore(&nats.ObjectStoreConfig{Bucket: b})
+		require_NoError(t, err)
+	}
+	seedObs, err := ajs.ObjectStore("oro")
+	require_NoError(t, err)
+	_, err = seedObs.PutBytes("seed", []byte("data"))
+	require_NoError(t, err)
+
+	// The scoped user has only the macro permissions. Denied publishes show
+	// up as async permission violations; count them so the negative cases
+	// below are known to fail for that reason and not for an unrelated timeout.
+	var violations atomic.Int32
+	nc := natsConnect(t, s.ClientURL(), nats.UserCredentials(userCreds),
+		nats.PermissionErrOnSubscribe(true),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+			if errors.Is(err, nats.ErrPermissionViolation) {
+				violations.Add(1)
+			}
+		}))
+	defer nc.Close()
+	js, err := nc.JetStream(nats.MaxWait(time.Second))
+	require_NoError(t, err)
+	njs, err := jetstream.New(nc, jetstream.WithDefaultTimeout(time.Second))
+	require_NoError(t, err)
+	ctx := context.Background()
+
+	t.Run("kv read write legacy api", func(t *testing.T) {
+		kv, err := js.KeyValue("rw")
+		require_NoError(t, err)
+		rev, err := kv.Put("k1", []byte("v1"))
+		require_NoError(t, err)
+		e, err := kv.Get("k1")
+		require_NoError(t, err)
+		require_Equal(t, string(e.Value()), "v1")
+		_, err = kv.Update("k1", []byte("v2"), rev)
+		require_NoError(t, err)
+		_, err = kv.Create("k2", []byte("v"))
+		require_NoError(t, err)
+		h, err := kv.History("k1")
+		require_NoError(t, err)
+		require_Len(t, len(h), 2)
+		keys, err := kv.Keys()
+		require_NoError(t, err)
+		require_Len(t, len(keys), 2)
+		w, err := kv.Watch("k1")
+		require_NoError(t, err)
+		require_True(t, <-w.Updates() != nil)
+		require_NoError(t, w.Stop())
+		require_NoError(t, kv.Delete("k2"))
+		require_NoError(t, kv.Purge("k2"))
+		require_NoError(t, kv.PurgeDeletes(nats.DeleteMarkersOlderThan(-1)))
+		_, err = kv.Status()
+		require_NoError(t, err)
+	})
+
+	t.Run("kv read write new api", func(t *testing.T) {
+		kv, err := njs.KeyValue(ctx, "rw")
+		require_NoError(t, err)
+		_, err = kv.Put(ctx, "n1", []byte("v1"))
+		require_NoError(t, err)
+		e, err := kv.Get(ctx, "n1")
+		require_NoError(t, err)
+		require_Equal(t, string(e.Value()), "v1")
+		h, err := kv.History(ctx, "n1")
+		require_NoError(t, err)
+		require_Len(t, len(h), 1)
+		w, err := kv.Watch(ctx, "n1")
+		require_NoError(t, err)
+		require_True(t, <-w.Updates() != nil)
+		require_NoError(t, w.Stop())
+		lister, err := kv.ListKeys(ctx)
+		require_NoError(t, err)
+		seen := map[string]bool{}
+		for k := range lister.Keys() {
+			seen[k] = true
+		}
+		require_True(t, seen["n1"])
+		require_NoError(t, kv.Delete(ctx, "n1"))
+		require_NoError(t, kv.PurgeDeletes(ctx, jetstream.DeleteMarkersOlderThan(-1)))
+		_, err = kv.Status(ctx)
+		require_NoError(t, err)
+	})
+
+	t.Run("kv read only", func(t *testing.T) {
+		for _, b := range []string{"ro", "nd"} {
+			kv, err := js.KeyValue(b)
+			require_NoError(t, err)
+			e, err := kv.Get("seed")
+			require_NoError(t, err)
+			require_Equal(t, string(e.Value()), "v")
+			keys, err := kv.Keys()
+			require_NoError(t, err)
+			require_Len(t, len(keys), 1)
+			_, err = kv.Put("seed", []byte("x"))
+			require_Error(t, err)
+
+			kv2, err := njs.KeyValue(ctx, b)
+			require_NoError(t, err)
+			e2, err := kv2.Get(ctx, "seed")
+			require_NoError(t, err)
+			require_Equal(t, string(e2.Value()), "v")
+			_, err = kv2.Put(ctx, "seed", []byte("x"))
+			require_Error(t, err)
+		}
+	})
+
+	t.Run("kv not granted", func(t *testing.T) {
+		_, err := js.KeyValue("none")
+		require_Error(t, err)
+		_, err = njs.KeyValue(ctx, "none")
+		require_Error(t, err)
+	})
+
+	t.Run("raw subscribe", func(t *testing.T) {
+		sub, err := nc.SubscribeSync("$KV.rw.>")
+		require_NoError(t, err)
+		require_NoError(t, nc.Flush())
+		kv, err := js.KeyValue("rw")
+		require_NoError(t, err)
+		_, err = kv.Put("raw", []byte("x"))
+		require_NoError(t, err)
+		_, err = sub.NextMsg(time.Second)
+		require_NoError(t, err)
+
+		denied, err := nc.SubscribeSync("$KV.none.>")
+		require_NoError(t, err)
+		_, err = denied.NextMsg(time.Second)
+		require_Error(t, err)
+		require_True(t, errors.Is(err, nats.ErrPermissionViolation))
+	})
+
+	t.Run("object store read write", func(t *testing.T) {
+		obs, err := js.ObjectStore("orw")
+		require_NoError(t, err)
+		_, err = obs.PutBytes("f", []byte("hello"))
+		require_NoError(t, err)
+		b, err := obs.GetBytes("f")
+		require_NoError(t, err)
+		require_Equal(t, string(b), "hello")
+		infos, err := obs.List()
+		require_NoError(t, err)
+		require_Len(t, len(infos), 1)
+		require_NoError(t, obs.Delete("f"))
+
+		obs2, err := njs.ObjectStore(ctx, "orw")
+		require_NoError(t, err)
+		_, err = obs2.PutBytes(ctx, "g", []byte("hello"))
+		require_NoError(t, err)
+		b, err = obs2.GetBytes(ctx, "g")
+		require_NoError(t, err)
+		require_Equal(t, string(b), "hello")
+		infos2, err := obs2.List(ctx)
+		require_NoError(t, err)
+		require_Len(t, len(infos2), 1)
+		require_NoError(t, obs2.Delete(ctx, "g"))
+	})
+
+	t.Run("object store read only", func(t *testing.T) {
+		obs, err := js.ObjectStore("oro")
+		require_NoError(t, err)
+		b, err := obs.GetBytes("seed")
+		require_NoError(t, err)
+		require_Equal(t, string(b), "data")
+		require_Error(t, obs.Delete("seed"))
+
+		obs2, err := njs.ObjectStore(ctx, "oro")
+		require_NoError(t, err)
+		b, err = obs2.GetBytes(ctx, "seed")
+		require_NoError(t, err)
+		require_Equal(t, string(b), "data")
+		wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		_, err = obs2.PutBytes(wctx, "x", []byte("y"))
+		require_Error(t, err)
+
+		_, err = js.ObjectStore("onone")
+		require_Error(t, err)
+	})
+
+	// Every negative case above must have produced a permission violation.
+	// 2 KV put (x2 buckets, x2 APIs) + 2 bucket binds + 1 delete + 1 put + 1 bind.
+	require_True(t, violations.Load() >= 8)
+}
+
+// A tag value that contains a template token fails authentication instead of
+// being expanded a second time by the ordinary template pass.
+func TestJWTXPermissionsRejectsTemplateInjection(t *testing.T) {
+	uc, acc := macroTestUserClaims(t,
+		"kv:{{tag(y)}}", "y:*", "kv:{{name()}}", "kv:{{account-tag(kv)}}", "kv:a$b", "kv:good")
+	uc.Name = "*"
+	acc.tags = []string{"kv:*"}
+	xp := mustXPermissions(t, `{"kv":[{"op":"rw","bucket":"{{tag(kv)}}"}]}`)
+	_, err := processUserPermissionsTemplate(jwt.UserPermissionLimits{}, xp, uc, acc)
+	require_Error(t, err)
+	require_Contains(t, err.Error(), "generated invalid subject")
+}
