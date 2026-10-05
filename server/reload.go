@@ -1321,6 +1321,23 @@ func (l *stampRequestInfoReload) Apply(s *Server) {
 	s.Noticef("Reloaded: inbound requests will %sbe stamped with client info", not)
 }
 
+// authVerificationReload implements the option interface for the
+// `authorization { auth_verification }` setting. The new value is consulted per
+// connection via getOpts(), so swapping the options is enough; this just records
+// the change so reload does not reject it and logs the new state.
+type authVerificationReload struct {
+	noopOption
+	verification bool
+}
+
+func (l *authVerificationReload) Apply(s *Server) {
+	var not string
+	if !l.verification {
+		not = "no longer "
+	}
+	s.Noticef("Reloaded: JWT client/leaf connections will %sbe checked by the auth verification service", not)
+}
+
 // Compares options and disconnects clients that are no longer listed in pinned certs. Lock must not be held.
 func (s *Server) recheckPinnedCerts(curOpts *Options, newOpts *Options) {
 	s.mu.Lock()
@@ -2012,6 +2029,8 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &noFastProdStallReload{noStall: newValue.(bool)})
 		case "stamprequestinfo":
 			diffOpts = append(diffOpts, &stampRequestInfoReload{stamp: newValue.(bool)})
+		case "authverification":
+			diffOpts = append(diffOpts, &authVerificationReload{verification: newValue.(bool)})
 		case "proxies":
 			new := newValue.(*ProxiesConfig)
 			old := oldValue.(*ProxiesConfig)

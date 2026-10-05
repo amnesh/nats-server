@@ -468,6 +468,7 @@ type Options struct {
 	ProxyProtocol              bool          `json:"-"`
 	Authorization              string        `json:"-"`
 	AuthCallout                *AuthCallout  `json:"-"`
+	AuthVerification           bool          `json:"-"`
 	PingInterval               time.Duration `json:"ping_interval"`
 	MaxPingsOut                int           `json:"ping_max"`
 	HTTPHost                   string        `json:"http_host"`
@@ -902,6 +903,8 @@ type authorization struct {
 	defaultPermissions *Permissions
 	// Auth Callouts
 	callout *AuthCallout
+	// Auth Verification enabled
+	verification bool
 }
 
 // TLSConfigOpts holds the parsed tls config information,
@@ -1244,6 +1247,7 @@ func (o *Options) processConfigFileLine(k string, v any, errors *[]error, warnin
 		o.Authorization = auth.token
 		o.AuthTimeout = auth.timeout
 		o.AuthCallout = auth.callout
+		o.AuthVerification = auth.verification
 
 		if (auth.user != _EMPTY_ || auth.pass != _EMPTY_) && auth.token != _EMPTY_ {
 			err := &configErr{tk, "Cannot have a user/pass and token"}
@@ -4662,6 +4666,8 @@ func parseAuthorization(v any, errors, warnings *[]error) (*authorization, error
 				continue
 			}
 			auth.callout = ac
+		case "auth_verification":
+			auth.verification = mv.(bool)
 		case "proxy_required":
 			auth.proxyRequired = mv.(bool)
 		default:
