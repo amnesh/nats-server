@@ -88,7 +88,7 @@ func TestAuthVerifyConfigDefaultDisabled(t *testing.T) {
 // runAuthVerifyOperatorServer starts an operator-mode server with a system
 // account, a TEST account, and auth verification enabled. It returns the server
 // and the system + TEST account keypairs.
-func runAuthVerifyOperatorServer(t *testing.T) (*Server, nkeys.KeyPair, nkeys.KeyPair) {
+func runAuthVerifyOperatorServer(t *testing.T, modify ...func(*jwt.AccountClaims)) (*Server, nkeys.KeyPair, nkeys.KeyPair) {
 	t.Helper()
 	skp, spub := createKey(t)
 	sysClaim := jwt.NewAccountClaims(spub)
@@ -99,6 +99,9 @@ func runAuthVerifyOperatorServer(t *testing.T) (*Server, nkeys.KeyPair, nkeys.Ke
 	tkp, tpub := createKey(t)
 	accClaim := jwt.NewAccountClaims(tpub)
 	accClaim.Name = "TEST"
+	for _, m := range modify {
+		m(accClaim)
+	}
 	accJwt, err := accClaim.Encode(oKp)
 	require_NoError(t, err)
 
@@ -118,8 +121,8 @@ func runAuthVerifyOperatorServer(t *testing.T) (*Server, nkeys.KeyPair, nkeys.Ke
 }
 
 // A verification service in the system account that branches on the connecting
-// user's token: "reject" denies, "narrow" tightens publish to allowed.>, anything
-// else admits unchanged.
+// user's token: "reject" denies, "narrow" tightens publish to allowed.>, "deny"
+// only adds a publish deny on allowed.blocked, anything else admits unchanged.
 func startAuthVerifyResponder(t *testing.T, s *Server, skp nkeys.KeyPair) *nats.Conn {
 	t.Helper()
 	rc, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, skp))
@@ -136,6 +139,8 @@ func startAuthVerifyResponder(t *testing.T, s *Server, skp nkeys.KeyPair) *nats.
 			resp.Reason = "denied by test"
 		case "narrow":
 			resp.Permissions = &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"allowed.>"}}}
+		case "deny":
+			resp.Permissions = &jwt.Permissions{Pub: jwt.Permission{Deny: jwt.StringList{"allowed.blocked"}}}
 		}
 		b, _ := json.Marshal(resp)
 		m.Respond(b)
@@ -195,6 +200,50 @@ func TestAuthVerifyOperatorNarrow(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("expected a permissions violation error after narrowing")
+	}
+}
+
+// A user JWT without permissions gets the account default permissions. A
+// narrowing override must start from those defaults, not from allow-all: a
+// deny-only override must not drop the account's publish restriction.
+func TestAuthVerifyOverrideKeepsAccountDefaultPermissions(t *testing.T) {
+	s, skp, tkp := runAuthVerifyOperatorServer(t, func(ac *jwt.AccountClaims) {
+		ac.DefaultPermissions.Pub.Allow.Add("allowed.>")
+	})
+	defer s.Shutdown()
+	rc := startAuthVerifyResponder(t, s, skp)
+	defer rc.Close()
+
+	errCh := make(chan error, 4)
+	nc, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, tkp), nats.Token("deny"),
+		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, e error) { errCh <- e }))
+	require_NoError(t, err)
+	defer nc.Close()
+
+	expectDenied := func(subj string) {
+		t.Helper()
+		require_NoError(t, nc.Publish(subj, nil))
+		nc.Flush()
+		select {
+		case e := <-errCh:
+			if !strings.Contains(strings.ToLower(e.Error()), "permission") {
+				t.Fatalf("expected a permissions violation on %q, got %v", subj, e)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("expected a permissions violation on %q", subj)
+		}
+	}
+	// Outside the account default: still denied.
+	expectDenied("other.foo")
+	// Denied by the override.
+	expectDenied("allowed.blocked")
+	// Allowed by the account default and not denied by the override.
+	require_NoError(t, nc.Publish("allowed.ok", nil))
+	require_NoError(t, nc.Flush())
+	select {
+	case e := <-errCh:
+		t.Fatalf("unexpected error on allowed.ok: %v", e)
+	case <-time.After(250 * time.Millisecond):
 	}
 }
 

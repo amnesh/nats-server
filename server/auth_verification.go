@@ -245,7 +245,7 @@ func clientTLSInfo(nc net.Conn) *jwt.ClientTLS {
 func (s *Server) applyAuthVerifyOverride(c *client, juc *jwt.UserClaims, acc *Account, resp *authverify.AuthVerifyResponse) error {
 	changed := false
 	if resp.Permissions != nil {
-		narrowed := authverify.NarrowPermissions(&juc.Permissions, resp.Permissions)
+		narrowed := authverify.NarrowPermissions(effectiveJWTPermissions(juc, acc), resp.Permissions)
 		juc.Permissions = *narrowed
 		changed = true
 	}
@@ -267,4 +267,31 @@ func (s *Server) applyAuthVerifyOverride(c *client, juc *jwt.UserClaims, acc *Ac
 	_, validFor := validateTimes(juc)
 	c.setExpiration(juc.Claims(), validFor)
 	return nil
+}
+
+// effectiveJWTPermissions returns the permissions in effect for juc, as
+// buildInternalNkeyUser applies them: the user JWT permissions, or the account
+// default permissions when the user JWT has none. Narrowing must start from
+// these, or an override would drop the account defaults.
+func effectiveJWTPermissions(juc *jwt.UserClaims, acc *Account) *jwt.Permissions {
+	if buildPermissionsFromJwt(&juc.Permissions) != nil {
+		return &juc.Permissions
+	}
+	acc.mu.RLock()
+	dp := acc.defaultPerms.clone()
+	acc.mu.RUnlock()
+	out := &jwt.Permissions{}
+	if dp == nil {
+		return out
+	}
+	if dp.Publish != nil {
+		out.Pub = jwt.Permission{Allow: dp.Publish.Allow, Deny: dp.Publish.Deny}
+	}
+	if dp.Subscribe != nil {
+		out.Sub = jwt.Permission{Allow: dp.Subscribe.Allow, Deny: dp.Subscribe.Deny}
+	}
+	if dp.Response != nil {
+		out.Resp = &jwt.ResponsePermission{MaxMsgs: dp.Response.MaxMsgs, Expires: dp.Response.Expires}
+	}
+	return out
 }

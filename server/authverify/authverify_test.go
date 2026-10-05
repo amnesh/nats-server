@@ -168,18 +168,97 @@ func TestAuthVerifyNarrowAllowBaseNarrowerThanOverride(t *testing.T) {
 	}
 }
 
-// A disjoint override allow must not collapse to an empty (== allow-all) list.
-func TestAuthVerifyNarrowAllowDisjointKeepsBase(t *testing.T) {
+// A disjoint override allow must not collapse to an empty (== allow-all) list,
+// and must not keep base either: the service asked for subjects the user does
+// not have, so nothing is allowed.
+func TestAuthVerifyNarrowAllowDisjointDeniesAll(t *testing.T) {
 	base := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"app.>"}}}
 	override := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"other.>"}}}
 
 	got := NarrowPermissions(base, override)
 
-	if len(got.Pub.Allow) == 0 {
-		t.Fatalf("disjoint override collapsed to empty allow (== allow-all)")
+	if len(got.Pub.Allow) != 0 || !equalSet(got.Pub.Deny, []string{">"}) {
+		t.Fatalf("expected deny-all (allow [], deny [>]), got allow %v deny %v", got.Pub.Allow, got.Pub.Deny)
 	}
-	if !equalSet(got.Pub.Allow, []string{"app.>"}) {
-		t.Fatalf("expected base allow [app.>] retained, got %v", got.Pub.Allow)
+}
+
+// Overlapping wildcards with no subset relation narrow to their exact
+// intersection, not to all of base.
+func TestAuthVerifyNarrowAllowOverlapIntersects(t *testing.T) {
+	base := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"foo.*.bar", "a.>"}}}
+	override := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"foo.baz.*", "a.b.*"}}}
+
+	got := NarrowPermissions(base, override)
+
+	if !equalSet(got.Pub.Allow, []string{"foo.baz.bar", "a.b.*"}) {
+		t.Fatalf("expected pub allow [foo.baz.bar a.b.*], got %v", got.Pub.Allow)
+	}
+}
+
+// A literal token that starts with '*' (e.g. "*bar") is not a wildcard.
+func TestAuthVerifyNarrowStarPrefixedLiteralIsNotWildcard(t *testing.T) {
+	base := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"foo.*bar"}}}
+	override := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"foo.secret"}}}
+
+	got := NarrowPermissions(base, override)
+
+	if len(got.Pub.Allow) != 0 || !equalSet(got.Pub.Deny, []string{">"}) {
+		t.Fatalf("literal *bar escalated: allow %v deny %v", got.Pub.Allow, got.Pub.Deny)
+	}
+
+	// The same literal still intersects with itself and with a real wildcard.
+	override = &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"foo.*"}}}
+	got = NarrowPermissions(base, override)
+	if !equalSet(got.Pub.Allow, []string{"foo.*bar"}) {
+		t.Fatalf("expected pub allow [foo.*bar], got %v", got.Pub.Allow)
+	}
+}
+
+// An invalid base entry grants nothing on the server, so it must not grant
+// anything through the intersection either.
+func TestAuthVerifyNarrowInvalidBaseEntryGrantsNothing(t *testing.T) {
+	base := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"a.>.b", "c..d"}}}
+	override := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"a.x.y", "c.*.d"}}}
+
+	got := NarrowPermissions(base, override)
+
+	if len(got.Pub.Allow) != 0 || !equalSet(got.Pub.Deny, []string{">"}) {
+		t.Fatalf("invalid base entry escalated: allow %v deny %v", got.Pub.Allow, got.Pub.Deny)
+	}
+}
+
+// Queue subscribe permissions ("subject queue") keep the queue restriction.
+func TestAuthVerifyNarrowQueuePermissions(t *testing.T) {
+	base := &jwt.Permissions{Sub: jwt.Permission{Allow: jwt.StringList{"foo.> q1"}}}
+	override := &jwt.Permissions{Sub: jwt.Permission{Allow: jwt.StringList{"foo.bar q2", "foo.baz"}}}
+
+	got := NarrowPermissions(base, override)
+
+	if !equalSet(got.Sub.Allow, []string{"foo.baz q1"}) {
+		t.Fatalf("expected sub allow [foo.baz q1], got %v", got.Sub.Allow)
+	}
+
+	base = &jwt.Permissions{Sub: jwt.Permission{Allow: jwt.StringList{"foo.>"}}}
+	override = &jwt.Permissions{Sub: jwt.Permission{Allow: jwt.StringList{"foo.bar q2"}}}
+	got = NarrowPermissions(base, override)
+	if !equalSet(got.Sub.Allow, []string{"foo.bar q2"}) {
+		t.Fatalf("expected sub allow [foo.bar q2], got %v", got.Sub.Allow)
+	}
+}
+
+// With response permissions and no publish allow list, the server allows only
+// replies. An override must not turn that into an allow list.
+func TestAuthVerifyNarrowResponseOnlyPublishNotWidened(t *testing.T) {
+	base := &jwt.Permissions{Resp: &jwt.ResponsePermission{MaxMsgs: 1, Expires: time.Second}}
+	override := &jwt.Permissions{Pub: jwt.Permission{Allow: jwt.StringList{"app.>"}}}
+
+	got := NarrowPermissions(base, override)
+
+	if len(got.Pub.Allow) != 0 {
+		t.Fatalf("response-only publish widened to %v", got.Pub.Allow)
+	}
+	if got.Resp == nil {
+		t.Fatalf("response permission lost")
 	}
 }
 
@@ -204,8 +283,8 @@ func TestAuthVerifyNarrowEscalationFullyNeutralized(t *testing.T) {
 	if !equalSet(got.Pub.Deny, []string{"app.secret.>"}) {
 		t.Fatalf("pub deny lost: %v", got.Pub.Deny)
 	}
-	if !equalSet(got.Sub.Allow, []string{"app.>"}) {
-		t.Fatalf("sub allow escalated: %v", got.Sub.Allow)
+	if len(got.Sub.Allow) != 0 || !equalSet(got.Sub.Deny, []string{">"}) {
+		t.Fatalf("disjoint sub override not denied: allow %v deny %v", got.Sub.Allow, got.Sub.Deny)
 	}
 	if got.Resp.MaxMsgs != 5 || got.Resp.Expires != time.Second {
 		t.Fatalf("response escalated: %+v", got.Resp)
