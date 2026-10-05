@@ -78,6 +78,9 @@ type Sublist struct {
 	ccSweep   int32
 	notify    *notifyMaps
 	count     uint32
+	// Subscriptions that are not leaf interest, kept only after first use by
+	// nonLeafSubs (see leafnode_isolation.go). Guarded by the sublist lock.
+	nonLeaf map[*subscription]struct{}
 }
 
 // notifyMaps holds maps of arrays of channels for notifications
@@ -447,6 +450,7 @@ func (s *Sublist) Insert(sub *subscription) error {
 		}
 		subs[sub] = struct{}{}
 	}
+	s.trackNonLeafInsert(sub)
 
 	s.count++
 	s.inserts++
@@ -907,6 +911,7 @@ func (s *Sublist) remove(sub *subscription, shouldLock bool, doCacheUpdates bool
 	if !removed {
 		return ErrNotFound
 	}
+	s.trackNonLeafRemove(sub)
 
 	s.count--
 	s.removes++
