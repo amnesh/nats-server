@@ -1,0 +1,22 @@
+{
+  "skill_name": "update-fork",
+  "notes": "Each eval starts by building a fresh fixture with build_fixture.sh, then runs the skill against the fork repo. Fixture lives under /tmp/claude-1000/eval-fixture-<id>/fork. The skill should treat that fork repo as cwd, identify custom commits on release/v1.0.0, build release/v1.1.0 from upstream, cherry-pick, push to the local origin, and tag v1.1.0.",
+  "evals": [
+    {
+      "id": 0,
+      "name": "clean-update",
+      "prompt": "I want to update this fork from release/v1.0.0 to the new upstream release v1.1.0. Please bring my custom commits forward, push the new branch to origin, and create the tag.",
+      "fixture_scenario": "clean",
+      "expected_output": "Skill should: fetch both remotes, list 2 custom commits, create local release/v1.1.0 from upstream/release/v1.1.0, cherry-pick both commits cleanly, push to origin, create and push tag v1.1.0. No --force pushes. Working tree ends clean.",
+      "assertions": []
+    },
+    {
+      "id": 1,
+      "name": "conflict-update",
+      "prompt": "Please update this fork to release/v1.1.0 — cherry-pick my custom commits onto the new release branch.",
+      "fixture_scenario": "conflict",
+      "expected_output": "Skill should fetch, list 2 custom commits, create local release/v1.1.0 from upstream, start cherry-picking, hit a conflict in server.go on the second commit, and surface that conflict to the user with status and explanation rather than auto-resolving or aborting. Should NOT push anything yet.",
+      "assertions": []
+    }
+  ]
+}
