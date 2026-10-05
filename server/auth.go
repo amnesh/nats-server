@@ -691,6 +691,16 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		if regErr != nil {
 			return
 		}
+		// Authentication verification: for an already-authorized JWT client/leaf,
+		// consult the verification service, which may reject the connection or
+		// narrow its claims. Fails closed. Runs before the auth-callout handling
+		// below so a rejection flows through the normal auth-error event path.
+		if authorized && s.authVerificationApplies(c, juc, acc, opts) {
+			if ok, vreason := s.authVerifyConnection(c, juc, acc, ujwt); !ok {
+				c.Debugf("Auth verification rejected connection: %s", vreason)
+				authorized = false
+			}
+		}
 		authErr := c.getAuthError()
 		if authErr == nil {
 			authErr = ErrAuthentication
