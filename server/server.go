@@ -209,6 +209,9 @@ type Server struct {
 	accAddedCh          chan struct{}
 	accAddedReqID       string
 	leafs               map[uint64]*client
+	// Duplicate-check index for leafs, guarded by mu, see leafnode_dupindex.go.
+	leafDupIdx          map[leafDupKey]map[*client]struct{}
+	leafDupDirty        atomic.Int64 // Open leafs whose key changed after capture.
 	users               map[string]*User
 	nkeys               map[string]*NkeyUser
 	totalClients        uint64

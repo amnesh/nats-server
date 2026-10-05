@@ -86,6 +86,7 @@ type Account struct {
 	hasMapped    atomic.Bool
 	lmu          sync.RWMutex
 	lleafs       []*client
+	sharedLeafs  map[*client]struct{} // Non-isolated leafs in lleafs, see leafnode_isolation.go.
 	leafClusters map[string]uint64
 	imports      importMap
 	exports      exportMap
@@ -1076,6 +1077,7 @@ func (a *Account) addClient(c *client) int {
 	if c.kind == LEAF {
 		a.lmu.Lock()
 		a.lleafs = append(a.lleafs, c)
+		a.trackSharedLeaf(c)
 		a.lmu.Unlock()
 	}
 
@@ -1128,6 +1130,7 @@ func (a *Account) removeLeafNode(c *client) {
 	ll := len(a.lleafs)
 	for i, l := range a.lleafs {
 		if l == c {
+			a.untrackSharedLeaf(c)
 			a.lleafs[i] = a.lleafs[ll-1]
 			if ll == 1 {
 				a.lleafs = nil

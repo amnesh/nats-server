@@ -19,8 +19,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
 | 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
+| 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation` | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go` |
 
-Features 1, 2 and 4 are documented in full below. Feature 3 is summarized in between.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between.
 
 ---
 
@@ -499,6 +500,63 @@ The complete design and migration mapping are in
 
 ---
 
+# 5. Leafnode scaling (isolated hubs with 60k+ leaves)
+
+## 5.1 What it is
+
+Performance changes that let one hub serve 60k+ leafnode connections in one
+account when leaf interest is isolated (`leafnodes { isolate: true }`, or a
+remote that sets `request_isolation`). There is no config key. The interest that
+the hub sends to each leaf is the same as upstream.
+
+Upstream cost grows with the number of leaves N for each connect, so a full
+start costs O(N²), under the server lock in part. At about 6k leaves the hub
+used all CPU, handshakes timed out, leaves connected again, and the load grew
+(830k connects in 12 minutes in the reported case).
+
+## 5.2 Changes
+
+| Upstream cost | Change |
+|---|---|
+| `initLeafNodeSmapAndSendSubs` walked **all** account subscriptions for each new leaf, ran `canSubscribe` and built a debug string for each, and only then dropped leaf interest for an isolated leaf. | For an isolated hub-side leaf, the snapshot uses `Sublist.nonLeafSubs`: a set of the non-leaf subscriptions that the sublist fills with one walk on first use and then keeps in `Insert` and `remove`, under the sublist write lock. Leaf interest is "client kind `LEAF` or `sub.leaf`" (routed from a leaf on another server), the same test as upstream. The isolation check runs before `canSubscribe`. |
+| As a side effect of those `canSubscribe` calls, a wildcard leaf subject could load the delivery deny filter (`c.mperms`) of the new leaf. Some of the leaf's own subscriptions (`$GR.`, `_GR_.`) skip the check that would load it. | An isolated hub-side leaf with subscribe denies loads the deny filter in the snapshot. The filter only blocks deliveries that the deny rules already block, so this is the same as upstream or stricter. |
+| `updateLeafNodesEx` walked all leaves for each leaf `LS+`/`LS-` and locked each one, only to skip the isolated ones. | Each account keeps `sharedLeafs`, the leaves in `lleafs` that are not isolated, in the two places that change `lleafs` (`addClient`, `removeLeafNode`). When it is empty, leaf interest returns early. The isolation flag has an atomic copy (`leaf.isolatedHint`); isolation can only be turned on. A leaf that requests isolation in its CONNECT leaves the set. |
+| `addLeafNodeConnection` searched for a previous connection from the same remote by walking all leaves under the server lock. | An index by (remote server, remote cluster, account, remote account) under the server lock, next to `s.leafs`. Each candidate is checked with the original condition. If a remote changes these fields after they were captured (an INFO to the accept side, or a second CONNECT, possibly into another account; both abnormal), the connection is marked before the change, the server logs a notice, and the check uses the full walk while that connection is open. |
+| `client.Debugf` and `client.Tracef` formatted the message before the level check. | They check the level first, as `Server.Debugf`/`Tracef` do. |
+
+## 5.3 Measured
+
+Hub with `isolate: true`, compression off, leaf user with permissions, 16 cores,
+raw leafnode connections with 16 subscriptions each from the same machine:
+
+| Case | Upstream | Fork |
+|---|---|---|
+| 10k leaves at 1000/s | 1,706 connected, 8,294 timed out, 135 CPU-s, 2.5 GB | all connected in 10.9 s, 23 CPU-s, 0.7 GB |
+| 60k leaves at 2000/s | — | all connected in 30.1 s, 55 CPU-s, 4.0 GB, no errors |
+| 60k leaves at 10000/s | — | all connected in 6.1 s, 42 CPU-s, 4.4 GB, no errors |
+| Snapshot for one isolated leaf, 900k leaf subscriptions | 125–133 ms | 7 µs (first use: one walk, about 125 ms) |
+
+## 5.4 Code map & tests
+
+- `server/leafnode_isolation.go` — `isLeafInterest`, `Sublist.nonLeafSubs` and
+  its `Insert`/`remove` hooks, `client.setLeafIsolated`,
+  `client.loadIsolatedLeafDenyFilter`, and the `sharedLeafs` helpers.
+- `server/leafnode_dupindex.go` — duplicate-check index and fallback.
+- Hooks: `server/leafnode.go` (snapshot, `updateLeafNodesEx`,
+  `addLeafNodeConnection`, `removeLeafNodeConnection`, isolation and identity
+  writes), `server/sublist.go` (`Insert`, `remove`), `server/accounts.go`
+  (`addClient`, `removeLeafNode`), `server/client.go` (`Debugf`, `Tracef`,
+  account change in `registerWithAccount`), `server/server.go` (index fields).
+- Tests: `server/leafnode_isolation_test.go` (snapshot with local, routed and
+  leaf interest in a hub cluster; tracking across reload; requested isolation;
+  deny filter; randomized set consistency; benchmark) and
+  `server/leafnode_dupindex_test.go` (randomized index against the upstream walk;
+  fallback on identity and account change, and its end). Upstream tests `TestLeafNodeIsolatedLeafSubjectPropagation*`,
+  `TestLeafNodeLoopDetectedDueToReconnect` and
+  `TestLeafNodeHubRejectDuplicateRemotes` cover the unchanged behavior.
+
+---
+
 # Historical: Permission Template Macros (superseded)
 
 The following section documents the removed whole-entry implementation for
@@ -844,8 +902,10 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 # Maintenance notes
 
 - Features 1–3 are gated **off by default**; feature 4 has no config knob and is
-  active only for account JWTs carrying `template.xpermissions`. An unconfigured
-  server behaves exactly like upstream.
+  active only for account JWTs carrying `template.xpermissions`. Feature 5 is
+  always on but sends the same interest as upstream; its only visible
+  difference is that an isolated leaf with subscribe denies always gets its
+  delivery deny filter. An unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
   `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
@@ -854,7 +914,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Feature 1 (authverify) + Feature 2 (request info stamping) + Feature 4 (xpermissions)
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions' \
+  # Features 1, 2, 4 and 5
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex' \
       ./server ./server/authverify ./test -count=1
   ```

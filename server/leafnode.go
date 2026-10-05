@@ -84,6 +84,15 @@ type leaf struct {
 	remoteAccName string
 	// Whether or not we want to propagate east-west interest from other LNs.
 	isolated bool
+	// Copy of isolated that can be read without the client lock, see
+	// leafnode_isolation.go. Set together with isolated by setLeafIsolated.
+	isolatedHint atomic.Bool
+	// Set when the duplicate-check key of this connection is captured, and when
+	// it changes afterwards, see leafnode_dupindex.go. Changed under the client
+	// lock. dupKey is the indexed key, guarded by the server lock.
+	dupIndexed atomic.Bool
+	dupDirty   atomic.Bool
+	dupKey     *leafDupKey
 	// Used to suppress sub and unsub interest. Same as routes but our audience
 	// here is tied to this leaf node. This will hold all subscriptions except this
 	// leaf nodes. This represents all the interest we want to send to the other side.
@@ -1285,9 +1294,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 
 	// If the leafnode subject interest should be isolated, flag it here.
 	s.optsMu.RLock()
-	if c.leaf.isolated = s.opts.LeafNode.IsolateLeafnodeInterest; !c.leaf.isolated && remote != nil {
-		c.leaf.isolated = remote.LocalIsolation
-	}
+	c.setLeafIsolated(s.opts.LeafNode.IsolateLeafnodeInterest || (remote != nil && remote.LocalIsolation))
 	s.optsMu.RUnlock()
 
 	// For accepted LN connections, ws will be != nil if it was accepted
@@ -1708,6 +1715,7 @@ func (c *client) processLeafnodeInfo(info *Info) {
 		// Pre 2.2.0 servers are not sending their server name.
 		// In that case, use info.ID, which, for those servers, matches
 		// the content of the field `Name` in the leafnode CONNECT protocol.
+		c.leafDupKeyWillChange()
 		if info.Name == _EMPTY_ {
 			c.leaf.remoteServer = info.ID
 		} else {
@@ -1764,6 +1772,7 @@ func (c *client) processLeafnodeInfo(info *Info) {
 		c.nc.SetDeadline(time.Time{})
 		resumeConnect = true
 	} else if !firstINFO && didSolicit {
+		c.leafDupKeyWillChange()
 		c.leaf.remoteAccName = info.RemoteAccount
 	}
 
@@ -1982,28 +1991,16 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 	myClustName := c.leaf.remoteCluster
 	remote := c.leaf.remote
 	solicited := remote != nil
+	if !solicited {
+		c.leaf.dupIndexed.Store(true)
+	}
 	c.mu.Unlock()
 
 	var old *client
 	s.mu.Lock()
 	// We check for empty because in some test we may send empty CONNECT{}
 	if checkForDup && srvName != _EMPTY_ {
-		for _, ol := range s.leafs {
-			ol.mu.Lock()
-			// We care here only about non solicited Leafnode. This function
-			// is more about replacing stale connections than detecting loops.
-			// We have code for the loop detection elsewhere, which also delays
-			// attempt to reconnect.
-			if !ol.isSolicitedLeafNode() && ol.leaf.remoteServer == srvName &&
-				ol.leaf.remoteCluster == clusterName && ol.acc.Name == accName &&
-				remoteAccName != _EMPTY_ && ol.leaf.remoteAccName == remoteAccName {
-				old = ol
-			}
-			ol.mu.Unlock()
-			if old != nil {
-				break
-			}
-		}
+		old = s.findDuplicateLeafLocked(srvName, clusterName, accName, remoteAccName)
 	}
 	// Now that we are under the server lock and before adding it to the map,
 	// for a solicited leaf, we need to make sure that it has not been removed
@@ -2024,6 +2021,7 @@ func (s *Server) addLeafNodeConnection(c *client, srvName, clusterName string, c
 	}
 	// Store new connection in the map
 	s.leafs[cid] = c
+	s.indexLeafLocked(c, leafDupKey{mySrvName, myClustName, accName, remoteAccName}, solicited)
 	s.mu.Unlock()
 	s.removeFromTempClients(cid)
 
@@ -2170,6 +2168,7 @@ func (s *Server) removeLeafNodeConnection(c *client) {
 			// We need to set this to nil for GC to release the connection
 			c.leaf.gwSub = nil
 		}
+		c.leafDupRemovedLocked()
 		if remote := c.leaf.remote; remote != nil {
 			// If "noReconnect" is true, then we won't attempt to reconnect, so
 			// we will clear the "connect-in-progress" flag. However, if we can
@@ -2183,6 +2182,7 @@ func (s *Server) removeLeafNodeConnection(c *client) {
 	proxyKey := c.proxyKey
 	c.mu.Unlock()
 	delete(s.leafs, cid)
+	s.unindexLeafLocked(c)
 	if proxyKey != _EMPTY_ {
 		s.removeProxiedConn(proxyKey, cid)
 	}
@@ -2314,11 +2314,12 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	}
 
 	// Remember the remote server.
+	c.leafDupKeyWillChange()
 	c.leaf.remoteServer = proto.Name
 	// Remember the remote account name
 	c.leaf.remoteAccName = proto.RemoteAccount
 	// Remember if the leafnode requested isolation.
-	c.leaf.isolated = c.leaf.isolated || proto.Isolate
+	c.setLeafIsolated(proto.Isolate)
 
 	// If the other side has declared itself a hub, so we will take on the spoke role.
 	if proto.Hub {
@@ -2360,6 +2361,8 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 		c.closeConnection(MissingAccount)
 		return ErrMissingAccount
 	}
+	// The remote may have requested isolation after the leaf was added.
+	acc.untrackIsolatedLeaf(c)
 
 	// Register the cluster, even if empty, as long as we are acting as a hub.
 	if !proto.Hub {
@@ -2488,6 +2491,10 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// If we are solicited we only send interest for local clients.
 	if c.isSpokeLeafNode() {
 		acc.sl.localSubs(&subs, true)
+	} else if c.isIsolatedLeafNode() {
+		// Leaf interest is never sent to an isolated leaf, do not collect it.
+		acc.sl.nonLeafSubs(&subs)
+		c.loadIsolatedLeafDenyFilter()
 	} else {
 		acc.sl.All(&subs)
 	}
@@ -2557,13 +2564,14 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	rc := c.leaf.remoteCluster
 	c.leaf.smap = make(map[string]int32)
 	for _, sub := range subs {
+		// Don't advertise interest from leafnodes to other isolated leafnodes.
+		// Checked before perms, which would only be wasted on this interest.
+		if (sub.client.kind == LEAF || sub.leaf) && c.isIsolatedLeafNode() {
+			continue
+		}
 		// Check perms regardless of role.
 		if c.perms != nil && !c.canSubscribe(string(sub.subject)) {
 			c.Debugf("Not permitted to subscribe to %q on behalf of %s%s", sub.subject, accName, accNTag)
-			continue
-		}
-		// Don't advertise interest from leafnodes to other isolated leafnodes.
-		if (sub.client.kind == LEAF || sub.leaf) && c.isIsolatedLeafNode() {
 			continue
 		}
 		// We ignore ourselves here.
@@ -2678,6 +2686,12 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 	// We can hold the list lock here to avoid having to copy a large slice.
 	acc.lmu.RLock()
 	defer acc.lmu.RUnlock()
+
+	// Leaf interest is skipped below for every isolated leaf. If no leaf can
+	// receive it, do not walk the list at all (see leafnode_isolation.go).
+	if isLeafInterest(sub) && acc.noLeafReceivesLeafInterest() {
+		return
+	}
 
 	// Do this once.
 	subject := string(sub.subject)

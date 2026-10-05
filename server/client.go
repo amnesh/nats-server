@@ -909,6 +909,10 @@ func (c *client) registerWithAccount(acc *Account) error {
 	}
 	kind := c.kind
 	srv := c.srv
+	if c.acc != nil && c.acc != acc {
+		// The leafnode duplicate check keys on the account name.
+		c.leafDupKeyWillChange()
+	}
 	c.acc = acc
 	// CI cache encodes c.acc.Name; rebuild it on next stamp under the new account.
 	c.ciStampHdr = nil
@@ -6962,6 +6966,10 @@ func (c *client) Errorf(format string, v ...any) {
 }
 
 func (c *client) Debugf(format string, v ...any) {
+	// Same check as Server.Debugf, done here to skip formatting.
+	if atomic.LoadInt32(&c.srv.logging.debug) == 0 {
+		return
+	}
 	c.srv.Debugf(c.format(format), v...)
 }
 
@@ -6970,6 +6978,10 @@ func (c *client) Noticef(format string, v ...any) {
 }
 
 func (c *client) Tracef(format string, v ...any) {
+	// Same check as Server.Tracef, done here to skip formatting.
+	if atomic.LoadInt32(&c.srv.logging.trace) == 0 {
+		return
+	}
 	c.srv.Tracef(c.format(format), v...)
 }
 
