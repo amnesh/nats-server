@@ -17,9 +17,7 @@
 // restrictive than what the server already verified (it can never escalate).
 //
 // It deliberately depends only on github.com/nats-io/jwt/v2 (never on the server
-// package) so it can be imported by the server without an import cycle. The
-// subject subset-match below is a small vendored copy of the unexported helper in
-// server/sublist.go for the same reason.
+// package) so it can be imported by the server without an import cycle.
 package authverify
 
 import (
@@ -32,7 +30,8 @@ import (
 // NarrowPermissions returns a new permission set that restricts base by override
 // such that any subject action allowed by the result is also allowed by base: the
 // override can only narrow, never escalate. A nil override returns an independent
-// clone of base.
+// clone of base. base must be the permissions in effect for the user (for example,
+// the account default permissions when the user JWT has none).
 func NarrowPermissions(base, override *jwt.Permissions) *jwt.Permissions {
 	if base == nil {
 		base = &jwt.Permissions{}
@@ -41,31 +40,39 @@ func NarrowPermissions(base, override *jwt.Permissions) *jwt.Permissions {
 	if override == nil {
 		return out
 	}
-	out.Pub = narrowPermission(base.Pub, override.Pub)
-	out.Sub = narrowPermission(base.Sub, override.Sub)
+	// With a response permission and no publish allow list, the server allows
+	// only replies (see validateResponsePermissions). An empty allow list then
+	// does not mean "allow all".
+	pubAllowsAll := len(base.Pub.Allow) == 0 && base.Resp == nil
+	out.Pub = narrowPermission(base.Pub, override.Pub, pubAllowsAll)
+	out.Sub = narrowPermission(base.Sub, override.Sub, len(base.Sub.Allow) == 0)
 	out.Resp = narrowResponse(base.Resp, override.Resp)
 	return out
 }
 
 // narrowPermission restricts a single pub or sub permission: the allow set is
 // intersected (never broadened) and the deny set is unioned (always narrows).
-func narrowPermission(base, override jwt.Permission) jwt.Permission {
+// allowsAll reports whether an empty base allow list means "allow all".
+func narrowPermission(base, override jwt.Permission, allowsAll bool) jwt.Permission {
 	out := clonePermission(base)
 	// Allow: intersection. An empty override allow means "no allow restriction".
 	if len(override.Allow) > 0 {
-		if len(base.Allow) == 0 {
+		if allowsAll {
 			// base allowed everything -> restrict to the override's set.
 			out.Allow = cloneStrings(override.Allow)
-		} else {
+		} else if len(base.Allow) > 0 {
 			kept := intersectAllow(base.Allow, override.Allow)
-			// An empty intersection would serialize as an empty allow list, which
-			// NATS interprets as "allow all" -- an escalation. When the override
-			// does not intersect base at all, keep base's allow so the result can
-			// never be broader than base.
 			if len(kept) > 0 {
 				out.Allow = kept
+			} else {
+				// No subject is allowed by both. An empty allow list means
+				// "allow all", so deny everything explicitly.
+				out.Allow = nil
+				out.Deny = unionStrings(out.Deny, jwt.StringList{">"})
 			}
 		}
+		// Otherwise base allows nothing on its own allow list, and the
+		// override cannot add to it.
 	}
 	// Deny: union (adding denies always narrows), deduplicated.
 	if len(override.Deny) > 0 {
@@ -74,36 +81,104 @@ func narrowPermission(base, override jwt.Permission) jwt.Permission {
 	return out
 }
 
-// intersectAllow returns the subjects allowed by BOTH base and override allow
-// lists: every override entry within some base entry, plus every base entry
-// within some override entry. The result is always a subset of base.
+// intersectAllow returns the exact intersection of two allow lists: for every
+// pair of entries, the subjects (and queue) allowed by both. Each result entry is
+// within some base entry, so the result is always a subset of base.
 func intersectAllow(base, override jwt.StringList) jwt.StringList {
 	var out jwt.StringList
 	seen := make(map[string]struct{})
-	add := func(s string) {
-		if _, ok := seen[s]; ok {
-			return
-		}
-		seen[s] = struct{}{}
-		out = append(out, s)
-	}
 	for _, o := range override {
 		for _, b := range base {
-			if subjectIsSubsetMatch(o, b) {
-				add(o)
-				break
+			e, ok := intersectEntry(b, o)
+			if !ok {
+				continue
 			}
-		}
-	}
-	for _, b := range base {
-		for _, o := range override {
-			if subjectIsSubsetMatch(b, o) {
-				add(b)
-				break
+			if _, dup := seen[e]; dup {
+				continue
 			}
+			seen[e] = struct{}{}
+			out = append(out, e)
 		}
 	}
 	return out
+}
+
+// intersectEntry intersects two permission entries of the form "subject" or
+// "subject queue". An entry without a queue allows any queue. Entries with
+// different queues do not intersect.
+func intersectEntry(a, b string) (string, bool) {
+	as, aq, ok := splitEntry(a)
+	if !ok {
+		return "", false
+	}
+	bs, bq, ok := splitEntry(b)
+	if !ok {
+		return "", false
+	}
+	q := aq
+	if q == "" {
+		q = bq
+	} else if bq != "" && bq != aq {
+		return "", false
+	}
+	s, ok := intersectSubject(as, bs)
+	if !ok {
+		return "", false
+	}
+	if q != "" {
+		s += " " + q
+	}
+	return s, true
+}
+
+// splitEntry splits a permission entry into subject and optional queue.
+func splitEntry(e string) (string, string, bool) {
+	f := strings.Fields(e)
+	switch len(f) {
+	case 1:
+		return f[0], "", true
+	case 2:
+		return f[0], f[1], true
+	}
+	return "", "", false
+}
+
+// intersectSubject returns a subject that matches exactly the subjects matched
+// by both a and b, or false if no subject matches both. Only a token that is
+// exactly "*" or ">" is a wildcard; a token such as "*bar" is a literal.
+func intersectSubject(a, b string) (string, bool) {
+	ta := strings.Split(a, ".")
+	tb := strings.Split(b, ".")
+	out := make([]string, 0, max(len(ta), len(tb)))
+	for i := 0; ; i++ {
+		if i == len(ta) || i == len(tb) {
+			if len(ta) != len(tb) {
+				return "", false
+			}
+			return strings.Join(out, "."), true
+		}
+		x, y := ta[i], tb[i]
+		// Empty tokens and a ">" before the last token make an invalid
+		// subject, which the server never matches.
+		if x == "" || y == "" || (x == ">" && i != len(ta)-1) || (y == ">" && i != len(tb)-1) {
+			return "", false
+		}
+		switch {
+		case x == ">":
+			// ">" matches one or more tokens: the rest of b (never empty here).
+			return strings.Join(append(out, tb[i:]...), "."), true
+		case y == ">":
+			return strings.Join(append(out, ta[i:]...), "."), true
+		case x == "*":
+			out = append(out, y)
+		case y == "*":
+			out = append(out, x)
+		case x == y:
+			out = append(out, x)
+		default:
+			return "", false
+		}
+	}
 }
 
 // unionStrings returns the deduplicated union of a and b.
@@ -218,75 +293,4 @@ func cloneStrings(s jwt.StringList) jwt.StringList {
 	out := make(jwt.StringList, len(s))
 	copy(out, s)
 	return out
-}
-
-// --- vendored subject subset-match (copy of the unexported helpers in
-// server/sublist.go; duplicated here to keep this package free of a server
-// import). subjectIsSubsetMatch reports whether subject is a subset of test,
-// e.g. "foo.*" is a subset of "foo.>" but not of "foo.bar".
-
-const (
-	pwc  = '*'
-	fwc  = '>'
-	tsep = '.'
-)
-
-func tokenizeSubjectIntoSlice(tts []string, subject string) []string {
-	start := 0
-	for i := 0; i < len(subject); i++ {
-		if subject[i] == tsep {
-			tts = append(tts, subject[start:i])
-			start = i + 1
-		}
-	}
-	tts = append(tts, subject[start:])
-	return tts
-}
-
-func subjectIsSubsetMatch(subject, test string) bool {
-	tsa := [32]string{}
-	tts := tokenizeSubjectIntoSlice(tsa[:0], subject)
-	return isSubsetMatch(tts, test)
-}
-
-func isSubsetMatch(tokens []string, test string) bool {
-	tsa := [32]string{}
-	tts := tokenizeSubjectIntoSlice(tsa[:0], test)
-	return isSubsetMatchTokenized(tokens, tts)
-}
-
-func isSubsetMatchTokenized(tokens, test []string) bool {
-	for i, t2 := range test {
-		if i >= len(tokens) {
-			return false
-		}
-		l := len(t2)
-		if l == 0 {
-			return false
-		}
-		if t2[0] == fwc && l == 1 {
-			return true
-		}
-		t1 := tokens[i]
-
-		l = len(t1)
-		if l == 0 || t1[0] == fwc && l == 1 {
-			return false
-		}
-
-		if t1[0] == pwc && len(t1) == 1 {
-			m := t2[0] == pwc && len(t2) == 1
-			if !m {
-				return false
-			}
-			if i >= len(test) {
-				return true
-			}
-			continue
-		}
-		if t2[0] != pwc && strings.Compare(t1, t2) != 0 {
-			return false
-		}
-	}
-	return len(tokens) == len(test)
 }
