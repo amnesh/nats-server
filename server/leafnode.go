@@ -1890,7 +1890,7 @@ func (c *client) processLeafnodeInfo(info *Info) {
 	// Check to see if we need to kick any internal source or mirror consumers.
 	// This will be a no-op if JetStream not enabled for this server or if the bound account
 	// does not have jetstream.
-	s.checkInternalSyncConsumers(c.acc)
+	s.scheduleInternalSyncConsumersCheck(c.acc)
 }
 
 func (s *Server) negotiateLeafCompression(c *client, didSolicit bool, infoCompression string, co *CompressionOpts) (bool, error) {
@@ -2482,7 +2482,7 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	// Check to see if we need to kick any internal source or mirror consumers.
 	// This will be a no-op if JetStream not enabled for this server or if the bound account
 	// does not have jetstream.
-	s.checkInternalSyncConsumers(acc)
+	s.scheduleInternalSyncConsumersCheck(acc)
 
 	return nil
 }
