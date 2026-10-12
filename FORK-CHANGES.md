@@ -20,8 +20,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
 | 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
 | 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation`. Optional: `leafnodes { sync_consumers_check_interval: "250ms" }` (off by default, hot-reloadable) | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go`, `server/leafnode_synccheck.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go`, `server/opts.go`, `server/reload.go` |
+| 6 | Leafnode `SignatureCB` kept across reload | programmatic (`RemoteLeafOpts.SignatureCB`) | — | `server/reload.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Feature 6 is documented after feature 5.
 
 ---
 
@@ -604,6 +605,47 @@ raw leafnode connections with 16 subscriptions each from the same machine:
 
 ---
 
+# 6. Leafnode `SignatureCB` kept across reload
+
+## 6.1 What it is
+
+An embedder can set `RemoteLeafOpts.SignatureCB` to sign the hub's nonce for a
+leafnode remote. Upstream compares each existing remote at a reload with
+`reflect.DeepEqual`, and a non-nil func value is never equal to anything, not
+even to itself. So with a `SignatureCB`, every `ReloadOptions` and every config
+file reload (the new remote has no callback) failed with
+`field "SignatureCB": old=..., new=...`. The fork ignores the field in that
+comparison, like `TLSConfig`.
+
+## 6.2 Which callback is used after a reload
+
+**The callback from before the reload.** A running remote keeps its original
+`*RemoteLeafOpts` (`leafNodeCfg.RemoteLeafOpts`), and a reload copies only
+`TLSConfig`, `TLSHandshakeFirst`, `Compression` and `Disabled` into it. The
+connect path reads `c.leaf.remote.SignatureCB`, so the old callback signs all
+later reconnects. The new value is only stored in the new options, so
+`s.getOpts().LeafNode.Remotes[i].SignatureCB` can differ from the callback in
+use. A new callback takes effect only for a remote that the reload adds (for
+example a remote with other URLs), or after a restart.
+
+Note: `Options.Clone` does not copy `LeafNode.Remotes`; the clone shares the
+`*RemoteLeafOpts` of the running server. Setting `SignatureCB` on such a shared
+remote changes the running remote directly, without a reload and without a
+lock. Build a new `RemoteLeafOpts` for `ReloadOptions` instead.
+
+## 6.3 Code map & tests
+
+- `server/reload.go`: `"SignatureCB"` in the per-remote ignore list of
+  `getLeafNodeOptionsChanges`.
+- `server/leafnode_sigcb_reload_test.go`: `TestLeafNodeSignatureCBReload`
+  reloads with a different func, the same func and no func. Each reload
+  succeeds, the leaf stays connected on the same connection, and after the hub
+  closes the connection, the old callback signs the reconnect. A last case
+  keeps the running `*RemoteLeafOpts` and adds a second remote with its own
+  callback in the same reload; both connect.
+
+---
+
 # Historical: Permission Template Macros (superseded)
 
 The following section documents the removed whole-entry implementation for
@@ -953,8 +995,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   always on but sends the same interest as upstream; its only visible
   difference is that an isolated leaf with subscribe denies always gets its
   delivery deny filter. Its coalesced source/mirror check is off unless
-  `sync_consumers_check_interval` is set. An unconfigured server behaves like
-  upstream.
+  `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
+  with a `SignatureCB`. An unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
   `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
@@ -963,7 +1005,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4 and 5
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck' \
+  # Features 1, 2, 4, 5 and 6
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload' \
       ./server ./server/authverify ./test -count=1
   ```

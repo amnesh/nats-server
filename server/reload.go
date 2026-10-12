@@ -1001,6 +1001,7 @@ forLoop:
 			err := checkConfigsEqual(lrc.RemoteLeafOpts, rlo, []string{
 				"Compression",
 				"Disabled",
+				"SignatureCB", // Fork: func values never compare equal; the running remote keeps its callback.
 				"TLS",
 				"TLSHandshakeFirst",
 				"TLSConfig",
