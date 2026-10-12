@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Fork feature tests:
 
 ```sh
-go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload' ./server ./server/authverify ./test -count=1
+go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits' ./server ./server/authverify ./test -count=1
 ```
 
 ## Build, lint, and test
