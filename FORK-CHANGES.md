@@ -21,8 +21,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
 | 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation`. Optional: `leafnodes { sync_consumers_check_interval: "250ms" }` (off by default, hot-reloadable) | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go`, `server/leafnode_synccheck.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go`, `server/opts.go`, `server/reload.go` |
 | 6 | Leafnode `SignatureCB` kept across reload | programmatic (`RemoteLeafOpts.SignatureCB`) | — | `server/reload.go` |
+| 7 | `Account.SetJetStreamLimits` (JetStream limits for accounts built in code) | programmatic | `server/account_jslimits.go` | — |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Feature 6 is documented after feature 5.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5.
 
 ---
 
@@ -646,6 +647,45 @@ lock. Build a new `RemoteLeafOpts` for `ReloadOptions` instead.
 
 ---
 
+# 7. `Account.SetJetStreamLimits`
+
+## 7.1 What it is
+
+`Account.jsLimits` is what `jetstream` in an account block of a config file
+sets. It is unexported, so an embedder that builds `Options.Accounts` in code
+could not set it. `EnableJetStream` and `UpdateJetStreamLimits` need a
+registered account and running JetStream, and they do not survive a reload: at
+`ReloadOptions` the server copies `jsLimits` from the new account objects
+(`shallowCopy`), and `configJetStream` calls `DisableJetStream` for an account
+without limits. Memory streams lose their messages.
+
+```go
+// SetJetStreamLimits records JetStream limits on an account that is given to
+// the server in Options.Accounts.
+func (a *Account) SetJetStreamLimits(limits map[string]JetStreamAccountLimits)
+```
+
+- Call it on the `*Account` before the server starts, or before the options go
+  to `ReloadOptions`. It does not enable JetStream on a running account.
+- The limits apply only when server-wide JetStream is enabled.
+- Accounts built new for each `ReloadOptions` must get the limits again.
+  `Options.Clone` copies them.
+- `nil` means no JetStream for the account. An empty map means the default
+  (dynamic) limits, as `EnableJetStream` and `jetstream: enabled` do. The map is
+  copied.
+
+## 7.2 Code map & tests
+
+- `server/account_jslimits.go`: `Account.SetJetStreamLimits`, a wrapper of
+  `assignJetStreamLimits`.
+- `server/jetstream_account_jslimits_test.go`:
+  `TestJetStreamAccountSetJetStreamLimitsReload` (new account objects with the
+  limits, and a clone, keep JetStream across `ReloadOptions` and a memory stream
+  keeps its messages; without limits JetStream is disabled) and
+  `TestJetStreamAccountSetJetStreamLimitsValues` (nil, empty map, copy).
+
+---
+
 # Historical: Permission Template Macros (superseded)
 
 The following section documents the removed whole-entry implementation for
@@ -996,7 +1036,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   difference is that an isolated leaf with subscribe denies always gets its
   delivery deny filter. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
-  with a `SignatureCB`. An unconfigured server behaves like upstream.
+  with a `SignatureCB`. Feature 7 is an API that does nothing until it is
+  called. An unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
   `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
@@ -1005,7 +1046,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4, 5 and 6
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload' \
+  # Features 1, 2, 4, 5, 6 and 7
+  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits' \
       ./server ./server/authverify ./test -count=1
   ```
