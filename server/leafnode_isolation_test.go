@@ -398,31 +398,6 @@ func TestLeafNodeNonLeafSubsTracking(t *testing.T) {
 	}
 }
 
-// An isolated hub-side leaf with subscribe denies gets its delivery deny
-// filter in the snapshot, also when the account has no other interest. Upstream
-// could load it only as a side effect of permission checks on leaf interest.
-func TestLeafNodeIsolatedSnapshotLoadsDenyFilter(t *testing.T) {
-	s, _ := RunServerWithConfig(createConfFile(t, []byte(`
-		listen: 127.0.0.1:-1
-		leafnodes { listen: 127.0.0.1:-1, isolate_leafnode_interest: true }
-	`)))
-	defer s.Shutdown()
-	acc := s.globalAccount()
-
-	for _, deny := range []bool{true, false} {
-		c := &client{srv: s, kind: LEAF, acc: acc, leaf: &leaf{}}
-		c.setLeafIsolated(true)
-		if deny {
-			c.darray = []*subscription{{subject: []byte("$GR.>")}}
-		}
-		s.initLeafNodeSmapAndSendSubs(c)
-		c.mu.Lock()
-		loaded := c.mperms != nil
-		c.mu.Unlock()
-		require_Equal(t, loaded, deny)
-	}
-}
-
 // A leaf that requests isolation in its CONNECT, on a hub that does not
 // isolate by itself, leaves the shared-leaf set once it is isolated.
 func TestLeafNodeRequestedIsolationLeavesSharedSet(t *testing.T) {

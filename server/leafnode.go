@@ -2589,7 +2589,6 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	} else if c.isIsolatedLeafNode() {
 		// Leaf interest is never sent to an isolated leaf, do not collect it.
 		acc.sl.nonLeafSubs(&subs)
-		c.loadIsolatedLeafDenyFilter()
 	} else {
 		acc.sl.All(&subs)
 	}

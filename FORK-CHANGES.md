@@ -524,14 +524,17 @@ in 56 s with `/varz` blocked for most of that time, and only 5,031 of 60k. The
 fork keeps its snapshot path; `Sublist.Filter` stays in the tree but the fork
 does not use it. v2.15.1 also removed the post-loop isolation check, so an
 isolated spoke connection sends the interest of its downstream leaves in its
-snapshot. The fork keeps that check, before `canSubscribe`.
+snapshot. The fork keeps that check, before `canSubscribe`. Upstream PR #8749
+fixes this in the spoke branch; when it is released, the fork can take it.
+As in upstream, the snapshot of an isolated leaf does not load the leaf's
+delivery deny filter (`c.mperms`): the leaf's own subscriptions load it in
+`processLeafSub` when they arrive, which is after the snapshot.
 
 ## 5.2 Changes
 
 | Upstream cost | Change |
 |---|---|
 | `initLeafNodeSmapAndSendSubs` walked **all** account subscriptions for each new leaf, ran `canSubscribe` and built a debug string for each, and only then dropped leaf interest for an isolated leaf. | For an isolated hub-side leaf, the snapshot uses `Sublist.nonLeafSubs`: a set of the non-leaf subscriptions that the sublist fills with one walk on first use and then keeps in `Insert` and `remove`, under the sublist write lock. Leaf interest is "client kind `LEAF` or `sub.leaf`" (routed from a leaf on another server), the same test as upstream. The isolation check runs before `canSubscribe`. |
-| As a side effect of those `canSubscribe` calls, a wildcard leaf subject could load the delivery deny filter (`c.mperms`) of the new leaf. Some of the leaf's own subscriptions (`$GR.`, `_GR_.`) skip the check that would load it. | An isolated hub-side leaf with subscribe denies loads the deny filter in the snapshot. The filter only blocks deliveries that the deny rules already block, so this is the same as upstream or stricter. |
 | `updateLeafNodesEx` walked all leaves for each leaf `LS+`/`LS-` and locked each one, only to skip the isolated ones. | Each account keeps `sharedLeafs`, the leaves in `lleafs` that are not isolated, in the two places that change `lleafs` (`addClient`, `removeLeafNode`). When it is empty, leaf interest returns early. The isolation flag has an atomic copy (`leaf.isolatedHint`); isolation can only be turned on. A leaf that requests isolation in its CONNECT leaves the set. |
 | `addLeafNodeConnection` searched for a previous connection from the same remote by walking all leaves under the server lock. | An index by (remote server, remote cluster, account, remote account) under the server lock, next to `s.leafs`. Each candidate is checked with the original condition. If a remote changes these fields after they were captured (an INFO to the accept side, or a second CONNECT, possibly into another account; both abnormal), the connection is marked before the change, the server logs a notice, and the check uses the full walk while that connection is open. |
 | `client.Debugf` and `client.Tracef` formatted the message before the level check. | They check the level first, as `Server.Debugf`/`Tracef` do. |
@@ -582,7 +585,7 @@ raw leafnode connections with 16 subscriptions each from the same machine:
 
 - `server/leafnode_isolation.go` — `isLeafInterest`, `Sublist.nonLeafSubs` and
   its `Insert`/`remove` hooks, `client.setLeafIsolated`,
-  `client.loadIsolatedLeafDenyFilter`, and the `sharedLeafs` helpers.
+  and the `sharedLeafs` helpers.
 - `server/leafnode_dupindex.go` — duplicate-check index and fallback.
 - `server/leafnode_synccheck.go` — `syncCheckCoalescer` and
   `scheduleInternalSyncConsumersCheck`; config key in `server/opts.go`
@@ -595,7 +598,7 @@ raw leafnode connections with 16 subscriptions each from the same machine:
   account change in `registerWithAccount`), `server/server.go` (index fields).
 - Tests: `server/leafnode_isolation_test.go` (snapshot with local, routed and
   leaf interest in a hub cluster; tracking across reload; requested isolation;
-  deny filter; randomized set consistency; isolated spoke snapshot; benchmark) and
+  randomized set consistency; isolated spoke snapshot; benchmark) and
   `server/leafnode_dupindex_test.go` (randomized index against the upstream walk;
   fallback on identity and account change, and its end),
   `server/leafnode_synccheck_test.go` (config, reload, coalescer bounds and
@@ -1032,9 +1035,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
 - Features 1–3 are gated **off by default**; feature 4 has no config knob and is
   active only for account JWTs carrying `template.xpermissions`. Feature 5 is
-  always on but sends the same interest as upstream; its only visible
-  difference is that an isolated leaf with subscribe denies always gets its
-  delivery deny filter. Its coalesced source/mirror check is off unless
+  always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
   with a `SignatureCB`. Feature 7 is an API that does nothing until it is
   called. An unconfigured server behaves like upstream.

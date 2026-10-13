@@ -145,19 +145,6 @@ func (a *Account) untrackIsolatedLeaf(c *client) {
 	a.lmu.Unlock()
 }
 
-// loadIsolatedLeafDenyFilter loads the delivery deny filter of an isolated
-// hub-side leaf that has subscribe denies. Upstream runs canSubscribe on all
-// leaf interest in the snapshot and drops it afterwards; as a side effect, a
-// wildcard subject there can load this filter. Some subscriptions of the leaf
-// itself ($GR., _GR_.) skip the permission check that would load it. Since the
-// snapshot no longer collects leaf interest, load the filter here. The filter
-// only blocks deliveries that the deny rules already block. Lock must be held.
-func (c *client) loadIsolatedLeafDenyFilter() {
-	if c.mperms == nil && len(c.darray) > 0 {
-		c.loadMsgDenyFilter()
-	}
-}
-
 // noLeafReceivesLeafInterest reports whether no leaf in lleafs can receive
 // interest that comes from a leafnode. Account lmu must be held.
 func (a *Account) noLeafReceivesLeafInterest() bool {
