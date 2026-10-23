@@ -1068,7 +1068,8 @@ JWT selects the mode, and linked Go code implements `authverify.GrantHook` throu
 An absent block or `"mode": "static"` retains normal JWT authorization. Unknown
 fields, types, and modes reject the claims. Grant mode cannot coexist with an
 account auth callout. A mode change closes every account connection with
-`AuthModeChanged`.
+`AuthModeChanged`. Admission rechecks the mode after account registration so a
+connection cannot miss a concurrent mode-change disconnect.
 
 A user signed by the account identity key can opt into static authorization:
 
@@ -1099,6 +1100,8 @@ grant nothing. The hook replaces JWT, scoped-template, xpermissions, and account
 default permissions. Identity validation, source and time restrictions, transport
 restrictions, bearer policy, proxy requirements, and account limits still apply.
 The earlier of JWT expiry and a nonzero grant expiry ends the connection.
+Grant expiry uses its own timer, so updating a grant cannot strand CONNECT waiting
+for a canceled authentication timeout.
 Response permission defaults match normal JWT response permissions.
 
 A prefix token such as `device-*` matches `device-123`, but not `device-`.

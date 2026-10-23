@@ -196,6 +196,8 @@ the logic in a new file (for example `server/auth_grant.go`).
   through `jwt.Permissions` (`buildPermissionsFromJwt`, `accounts.go:4141-4171`, turns empty into
   "no restriction").
 - **G6 Expiry.** Effective expiry = the sooner of the JWT expiry and `Expires` (when non-zero).
+  Grant state owns its expiration timer separately from the initial authentication timer.
+  Replacement invalidates obsolete callbacks, and connection teardown cancels the grant timer.
 - **G7 Done.** The installation under the client lock is the admission point. Call `Done(true)` exactly when the grant was installed and
   `processClientOrLeafAuthentication` returns authorized. On every other path after an admit verdict
   (install error, later rejection in the same authentication, client closed during authentication)
@@ -289,6 +291,8 @@ Run with `-race`. Add `AuthGrant` to the fork feature-test regex in `CLAUDE.md` 
 
 - Account block: valid `static`/`grant`; unknown field, wrong type, unknown value rejected; grant +
   auth callout rejected; mode change closes the account's connections with `AuthModeChanged`.
+  Admission rechecks the mode after account registration to catch changes that occurred before
+  the connection became visible to the account's disconnect snapshot.
 - User block: honored for an identity-signed user (gets its JWT permissions, no hook call); a scoped
   user with the block is rejected; an unknown value is rejected.
 - G9: an identity-signed user without the block in a grant account is rejected; a plain

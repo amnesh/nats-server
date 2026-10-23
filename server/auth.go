@@ -702,6 +702,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 
 	var proxyRequired bool
 	var grantMode bool
+	var accountMode authMode
 	// Check if we have auth callouts enabled at the server level or in the bound account.
 	defer func() {
 		// Not an auth failure, skip the auth error event and auth callout.
@@ -1073,7 +1074,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
-		if grantMode, err = s.authGrantApplies(c, juc, acc, ujwt); err != nil {
+		if grantMode, accountMode, err = s.authGrantApplies(c, juc, acc, ujwt); err != nil {
 			c.Debugf("Auth grant mode rejected connection: %v", err)
 			return false
 		}
@@ -1190,7 +1191,16 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			return false
 		}
 
+		acc.mu.RLock()
+		modeChanged := acc.authMode != accountMode
+		acc.mu.RUnlock()
+		if modeChanged {
+			c.closeConnection(AuthModeChanged)
+			return false
+		}
+
 		// Warn about JetStream restrictions
+		c.mu.Lock()
 		if c.perms != nil {
 			deniedPub := []string{}
 			deniedSub := []string{}
@@ -1212,7 +1222,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 
 		// Hold onto the user's public key.
-		c.mu.Lock()
 		c.pubKey = juc.Subject
 		// If this is a MQTT client, we purposefully didn't populate the JWT as it could contain
 		// a password or token. Now we know it's a valid JWT, we can populate it.

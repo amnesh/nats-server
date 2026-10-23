@@ -40,17 +40,18 @@ type authGrantState struct {
 	generation                          uint64
 	expires, jwtExpires                 int64
 	deadline                            time.Time
+	expirationTimer                     *time.Timer
 	timerVersion                        uint64
 	done, closeComplete, closedNotified bool
 }
 
-func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, raw string) (bool, error) {
+func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, raw string) (bool, authMode, error) {
 	_, static, err := decodeAuthModeJWT(raw, true)
 	if err != nil {
-		return false, err
+		return false, authModeStatic, err
 	}
 	if static && juc.Issuer != acc.Name {
-		return false, errors.New("user authverify block requires the account identity signer")
+		return false, authModeStatic, errors.New("user authverify block requires the account identity signer")
 	}
 	acc.mu.RLock()
 	mode := acc.authMode
@@ -61,15 +62,15 @@ func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, 
 	changed := st != nil && (!applies || st.account != acc.Name || st.user != juc.Subject)
 	c.mu.Unlock()
 	if changed {
-		return false, errors.New("cannot change a grant connection identity")
+		return false, authModeStatic, errors.New("cannot change a grant connection identity")
 	}
 	if applies {
 		scope, _, ok := acc.issuerScopeAndXPermissions(juc.Issuer)
 		if _, scoped := scope.(*jwt.UserScope); !ok || !scoped {
-			return false, errors.New("grant mode requires a scoped signing key")
+			return false, authModeStatic, errors.New("grant mode requires a scoped signing key")
 		}
 	}
-	return applies, nil
+	return applies, mode, nil
 }
 
 func invokeGrantHook(h authverify.GrantHook, req *authverify.GrantRequest) (v *authverify.GrantVerdict) {
@@ -238,7 +239,10 @@ func (c *client) installAuthGrant(p *Permissions, pub, sub grantPrefixRules) {
 }
 
 func (c *client) setGrantExpiration(st *authGrantState) {
-	c.clearAuthTimer()
+	if st.expirationTimer != nil {
+		st.expirationTimer.Stop()
+		st.expirationTimer = nil
+	}
 	st.timerVersion++
 	version := st.timerVersion
 	expires := authverify.NarrowExpiry(st.jwtExpires, st.expires)
@@ -253,17 +257,31 @@ func (c *client) setGrantExpiration(st *authGrantState) {
 	if deadline.IsZero() {
 		return
 	}
-	c.atmr = time.AfterFunc(time.Until(deadline), func() {
-		c.mu.Lock()
-		if c.isClosed() || c.authGrant != st || st.timerVersion != version {
-			c.mu.Unlock()
-			return
-		}
-		c.enqueueProto([]byte(fmt.Sprintf(errProto, "User Authentication Expired")))
-		c.markConnAsClosed(AuthenticationExpired)
-		c.mu.Unlock()
-		c.closeConnection(AuthenticationExpired)
+	st.expirationTimer = time.AfterFunc(time.Until(deadline), func() {
+		c.expireAuthGrant(st, version)
 	})
+}
+
+func (c *client) expireAuthGrant(st *authGrantState, version uint64) {
+	c.mu.Lock()
+	if c.isClosed() || c.authGrant != st || st.timerVersion != version {
+		c.mu.Unlock()
+		return
+	}
+	c.enqueueProto([]byte(fmt.Sprintf(errProto, "User Authentication Expired")))
+	c.markConnAsClosed(AuthenticationExpired)
+	c.mu.Unlock()
+	c.closeConnection(AuthenticationExpired)
+}
+
+func (c *client) clearGrantExpiration() {
+	if st := c.authGrant; st != nil {
+		if st.expirationTimer != nil {
+			st.expirationTimer.Stop()
+			st.expirationTimer = nil
+		}
+		st.timerVersion++
+	}
 }
 
 func (c *client) finishGrantClose() {

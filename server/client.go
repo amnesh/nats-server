@@ -6339,6 +6339,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	c.flags.set(closeConnection)
 	defer c.finishGrantClose()
 	c.clearAuthTimer()
+	c.clearGrantExpiration()
 	c.clearPingTimer()
 	c.clearTlsToTimer()
 	c.markConnAsClosed(reason)
