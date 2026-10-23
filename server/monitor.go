@@ -2712,6 +2712,14 @@ func (reason ClosedState) String() string {
 		return "Proxy Not Trusted"
 	case ProxyRequired:
 		return "Proxy Required"
+	case AuthorizationChanged:
+		return "Authorization Changed"
+	case GrantRejected:
+		return "Grant Rejected"
+	case AuthModeChanged:
+		return "Authorization Mode Changed"
+	case ResourceLimit:
+		return "Resource Limit"
 	}
 
 	return "Unknown State"

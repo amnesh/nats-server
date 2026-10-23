@@ -99,6 +99,7 @@ type Account struct {
 	incomplete   bool
 	signingKeys  map[string]jwt.Scope
 	xpermissions accountXPermissions
+	authMode     authMode
 	extAuth      *jwt.ExternalAuthorization
 	srv          *Server // server this account is registered with (possibly nil)
 	lds          string  // loop detection subject for leaf nodes
@@ -3416,7 +3417,7 @@ func (a *Account) isClaimAccount() bool {
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
-	s.updateAccountClaimsWithRefresh(a, ac, nil, true)
+	s.updateAccountClaimsWithRefresh(a, ac, accountClaimExtensions{}, true)
 }
 
 func (a *Account) traceLabel() string {
@@ -3492,7 +3493,7 @@ func (a *Account) isAllowedAcount(acc string) bool {
 // If refreshImportingAccounts is true it will also update incomplete dependent accounts
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
-func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, xp accountXPermissions, refreshImportingAccounts bool) {
+func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, extensions accountClaimExtensions, refreshImportingAccounts bool) {
 	if a == nil {
 		return
 	}
@@ -3510,6 +3511,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		limits:       a.limits,
 		signingKeys:  a.signingKeys,
 		xpermissions: a.xpermissions,
+		authMode:     a.authMode,
 		defaultPerms: a.defaultPerms.clone(),
 	}
 
@@ -3574,7 +3576,8 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 	for k, scope := range ac.SigningKeys {
 		a.signingKeys[k] = scope
 	}
-	a.xpermissions = xp
+	a.xpermissions = extensions.xpermissions
+	a.authMode = extensions.authMode
 	if !strict {
 		a.signingKeys[a.Name] = nil
 	}
@@ -3990,6 +3993,13 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 		}
 	}
 
+	if old.authMode != extensions.authMode {
+		for _, c := range clients {
+			c.closeConnection(AuthModeChanged)
+		}
+		clients = nil
+	}
+
 	// client list is in chronological order (older cids at the beginning of the list).
 	count := 0
 	for _, c := range clients {
@@ -4116,7 +4126,7 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 // Helper to build an internal account structure from a jwt.AccountClaims.
 // Lock MUST NOT be held upon entry.
-func (s *Server) buildInternalAccount(ac *jwt.AccountClaims, xp accountXPermissions) *Account {
+func (s *Server) buildInternalAccount(ac *jwt.AccountClaims, extensions accountClaimExtensions) *Account {
 	acc := NewAccount(ac.Subject)
 	acc.Issuer = ac.Issuer
 	// Set this here since we are placing in s.tmpAccounts below and may be
@@ -4131,7 +4141,7 @@ func (s *Server) buildInternalAccount(ac *jwt.AccountClaims, xp accountXPermissi
 	}
 
 	// Update based on claims.
-	s.updateAccountClaimsWithRefresh(acc, ac, xp, true)
+	s.updateAccountClaimsWithRefresh(acc, ac, extensions, true)
 
 	return acc
 }

@@ -224,6 +224,10 @@ const (
 	Kicked
 	ProxyNotTrusted
 	ProxyRequired
+	AuthorizationChanged
+	GrantRejected
+	AuthModeChanged
+	ResourceLimit
 )
 
 // Some flags passed to processMsgResults
@@ -342,6 +346,7 @@ type client struct {
 	// once at admission so a reload re-auth can re-apply any narrowing locally
 	// instead of contacting the verification service again.
 	authVerify *authVerifyState
+	authGrant  *authGrantState
 }
 
 type rrTracking struct {
@@ -436,8 +441,9 @@ func nbPoolPut(b []byte) {
 }
 
 type perm struct {
-	allow *Sublist
-	deny  *Sublist
+	allow  *Sublist
+	deny   *Sublist
+	prefix grantPrefixRules
 }
 
 type permissions struct {
@@ -2609,7 +2615,11 @@ func (c *client) authViolation() {
 		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false)
 	} else {
 		// Send this to client, regardless of the authErr override.
-		c.sendErr("Authorization Violation")
+		if reason == ResourceLimit {
+			c.sendErr("maximum connections exceeded")
+		} else {
+			c.sendErr("Authorization Violation")
+		}
 	}
 	c.closeConnection(reason)
 }
@@ -3445,23 +3455,29 @@ func (c *client) canSubscribeInternal(subject string, optQueue ...string) bool {
 	// the "$MQTT.sub." or "$MQTT.deliver.pubrel." prefix. For other types of connections, we
 	// will implicitly allow anything that starts with the full "$MQTT." prefix. However,
 	// we don't just return here, we skip the check for "allow" but will check "deny".
-	if (c.isMqtt() && (strings.HasPrefix(subject, mqttSubPrefix) || strings.HasPrefix(subject, mqttPubRelDeliverySubjectPrefix))) ||
-		(c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix)) {
+	if c.authGrant == nil && ((c.isMqtt() && (strings.HasPrefix(subject, mqttSubPrefix) || strings.HasPrefix(subject, mqttPubRelDeliverySubjectPrefix))) ||
+		(c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix))) {
 		checkAllow = false
 	}
 	// Check allow list. If no allow list that means all are allowed. Deny can overrule.
-	if checkAllow && c.perms.sub.allow != nil {
-		r := c.perms.sub.allow.Match(subject)
-		allowed = len(r.psubs) > 0
-		if queue != _EMPTY_ && len(r.qsubs) > 0 {
-			// If the queue appears in the allow list, then DO allow.
-			allowed = queueMatches(queue, r.qsubs)
+	if checkAllow && (c.perms.sub.allow != nil || len(c.perms.sub.prefix) > 0) {
+		allowed = false
+		if c.perms.sub.allow != nil {
+			r := c.perms.sub.allow.Match(subject)
+			allowed = len(r.psubs) > 0
+			if queue != _EMPTY_ && len(r.qsubs) > 0 {
+				// If the queue appears in the allow list, then DO allow.
+				allowed = queueMatches(queue, r.qsubs)
+			}
+			// Leafnodes operate slightly differently in that they allow broader scoped subjects.
+			// They will prune based on publish perms before sending to a leafnode client.
+			if !allowed && c.kind == LEAF && subjectHasWildcard(subject) {
+				r := c.perms.sub.allow.ReverseMatch(subject)
+				allowed = len(r.psubs) != 0
+			}
 		}
-		// Leafnodes operate slightly differently in that they allow broader scoped subjects.
-		// They will prune based on publish perms before sending to a leafnode client.
-		if !allowed && c.kind == LEAF && subjectHasWildcard(subject) {
-			r := c.perms.sub.allow.ReverseMatch(subject)
-			allowed = len(r.psubs) != 0
+		if !allowed {
+			allowed = c.perms.sub.prefix.allows(subject)
 		}
 	}
 	// If we have a deny list and we think we are allowed, check that as well.
@@ -4103,7 +4119,7 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 	// If we are tracking dynamic publish permissions that track reply subjects,
 	// do that accounting here. We only look at client.replies which will be non-nil.
 	// Only reply subject permissions if the client is not already allowed to publish to the reply subject.
-	if client.replies != nil && len(reply) > 0 && !client.pubAllowedFullCheck(string(reply), true, true) {
+	if client.replies != nil && len(reply) > 0 && !client.canPublishGrantReply(string(reply)) {
 		client.replies[string(reply)] = &resp{time.Now(), 0}
 		client.repliesSincePrune++
 		if client.repliesSincePrune > replyPermLimit || time.Since(client.lastReplyPrune) > replyPruneTime {
@@ -4292,7 +4308,7 @@ func (c *client) pubAllowed(subject string) bool {
 // pubAllowedFullCheck checks on all publish permissioning depending
 // on the flag for dynamic reply permissions.
 func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bool {
-	if c.perms == nil || (c.perms.pub.allow == nil && c.perms.pub.deny == nil) {
+	if c.perms == nil || (c.perms.pub.allow == nil && c.perms.pub.deny == nil && len(c.perms.pub.prefix) == 0) {
 		return true
 	}
 	// Check if published subject is allowed if we have permissions in place.
@@ -4304,13 +4320,19 @@ func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bo
 	// For any connections, other than CLIENT, we will implicitly allow anything that
 	// starts with the "$MQTT." prefix. However, we don't just return here,
 	// we skip the check for "allow" but will check "deny".
-	if c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix) {
+	if c.authGrant == nil && c.kind != CLIENT && strings.HasPrefix(subject, mqttPrefix) {
 		checkAllow = false
 	}
 	// Cache miss, check allow then deny as needed.
-	if checkAllow && c.perms.pub.allow != nil {
-		np, _ := c.perms.pub.allow.NumInterest(subject)
-		allowed = np != 0
+	if checkAllow && (c.perms.pub.allow != nil || len(c.perms.pub.prefix) > 0) {
+		allowed = false
+		if c.perms.pub.allow != nil {
+			np, _ := c.perms.pub.allow.NumInterest(subject)
+			allowed = np != 0
+		}
+		if !allowed {
+			allowed = c.perms.pub.prefix.allows(subject)
+		}
 	}
 	// If we have a deny list and are currently allowed, check that as well.
 	if allowed && c.perms.pub.deny != nil {
@@ -6315,6 +6337,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	// so don't set this to 1, instead bump the count.
 	c.rref++
 	c.flags.set(closeConnection)
+	defer c.finishGrantClose()
 	c.clearAuthTimer()
 	c.clearPingTimer()
 	c.clearTlsToTimer()

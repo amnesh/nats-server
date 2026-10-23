@@ -120,7 +120,7 @@ func TestJWTXPermissionsWildcardOnlyAsLiteral(t *testing.T) {
 			f := newXPermissionsRawFixture(t, raw)
 			_, extensions, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 			if err == nil {
-				_, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, extensions[f.signer], uc, acc)
+				_, err = processUserPermissionsTemplate(jwt.UserPermissionLimits{}, extensions.xpermissions[f.signer], uc, acc)
 			}
 			require_Error(t, err)
 		})

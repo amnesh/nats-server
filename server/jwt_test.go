@@ -5187,7 +5187,7 @@ func TestJWTXPermissionsAccountLifecycle(t *testing.T) {
 	require_Equal(t, installed.Stream[0].Stream, "orders")
 	// Replacing the account generation must not mutate a pointer retained by
 	// an authentication attempt from the prior generation.
-	require_Len(t, len(firstGeneration[f.signer].KV), 1)
+	require_Len(t, len(firstGeneration.xpermissions[f.signer].KV), 1)
 
 	invalidToken := encodeAccountClaimWithXPermissions(t, f.claim, map[string]string{f.signer: `{"kv":[]}`})
 	_, _, _, err = s.verifyAccountClaimsWithXPermissions(invalidToken)

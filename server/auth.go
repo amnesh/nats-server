@@ -701,6 +701,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 	}
 
 	var proxyRequired bool
+	var grantMode bool
 	// Check if we have auth callouts enabled at the server level or in the bound account.
 	defer func() {
 		// Not an auth failure, skip the auth error event and auth callout.
@@ -711,6 +712,13 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		// consult the verification service, which may reject the connection or
 		// narrow its claims. Fails closed. Runs before the auth-callout handling
 		// below so a rejection flows through the normal auth-error event path.
+		if authorized && grantMode {
+			authorized = s.authGrantConnection(c, juc, acc, ujwt, opts.AuthGrant)
+			if !authorized {
+				s.sendAccountAuthErrorEvent(c, c.acc, getAuthErrClosedState(c.getAuthError()).String())
+			}
+			return
+		}
 		if authorized && s.authVerificationApplies(c, juc, acc, opts) {
 			if ok, vreason := s.authVerifyConnection(c, juc, acc, ujwt); !ok {
 				c.Debugf("Auth verification rejected connection: %s", vreason)
@@ -1065,6 +1073,10 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
+		if grantMode, err = s.authGrantApplies(c, juc, acc, ujwt); err != nil {
+			c.Debugf("Auth grant mode rejected connection: %v", err)
+			return false
+		}
 		if scope, xp, ok := acc.issuerScopeAndXPermissions(juc.Issuer); !ok {
 			c.Debugf("User JWT issuer is not known")
 			return false
@@ -1075,6 +1087,9 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			} else if uSc, ok := scope.(*jwt.UserScope); !ok {
 				c.Debugf("User JWT is not valid")
 				return false
+			} else if grantMode {
+				juc.UserPermissionLimits = uSc.Template
+				juc.Permissions = jwt.Permissions{}
 			} else if juc.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, xp, juc, acc); err != nil {
 				c.Debugf("User JWT issuer %q generated invalid permissions: %v", juc.Issuer, err)
 				return false
@@ -1166,7 +1181,12 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 
 		nkey = buildInternalNkeyUser(juc, allowedConnTypes, acc)
-		if err := c.RegisterNkeyUser(nkey); err != nil {
+		if grantMode {
+			err = c.registerGrantUser(nkey)
+		} else {
+			err = c.RegisterNkeyUser(nkey)
+		}
+		if err != nil {
 			return false
 		}
 
@@ -1204,7 +1224,9 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		c.mu.Unlock()
 
 		// Check if we need to set an auth timer if the user jwt expires.
-		c.setExpiration(juc.Claims(), validFor)
+		if !grantMode {
+			c.setExpiration(juc.Claims(), validFor)
+		}
 
 		acc.mu.RLock()
 		c.Debugf("Authenticated JWT: %s %q (claim-name: %q, claim-tags: %q) "+
@@ -1870,6 +1892,8 @@ func (s *Server) processProxiesTrustedKeys() {
 // Returns the connection's `ClosedState` for the given authenication error.
 func getAuthErrClosedState(authErr error) ClosedState {
 	switch authErr {
+	case errAuthGrantResourceLimit:
+		return ResourceLimit
 	case ErrAuthProxyNotTrusted:
 		return ProxyNotTrusted
 	case ErrAuthProxyRequired:

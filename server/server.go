@@ -2231,16 +2231,16 @@ func (s *Server) fetchRawAccountClaims(name string) (string, error) {
 
 // fetchAccountClaims will attempt to fetch new claims if a resolver is present.
 // Lock is NOT held upon entry.
-func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, accountXPermissions, string, error) {
+func (s *Server) fetchAccountClaims(name string) (*jwt.AccountClaims, accountClaimExtensions, string, error) {
 	claimJWT, err := s.fetchRawAccountClaims(name)
 	if err != nil {
-		return nil, nil, _EMPTY_, err
+		return nil, accountClaimExtensions{}, _EMPTY_, err
 	}
 	var claim *jwt.AccountClaims
-	var xp accountXPermissions
+	var xp accountClaimExtensions
 	claim, xp, claimJWT, err = s.verifyAccountClaimsWithXPermissions(claimJWT)
 	if claim != nil && claim.Subject != name {
-		return nil, nil, _EMPTY_, ErrAccountValidation
+		return nil, accountClaimExtensions{}, _EMPTY_, ErrAccountValidation
 	}
 	return claim, xp, claimJWT, err
 }
@@ -2262,19 +2262,26 @@ func (s *Server) verifyAccountClaims(claimJWT string) (*jwt.AccountClaims, strin
 	return accClaims, claimJWT, nil
 }
 
-func (s *Server) verifyAccountClaimsWithXPermissions(claimJWT string) (*jwt.AccountClaims, accountXPermissions, string, error) {
+func (s *Server) verifyAccountClaimsWithXPermissions(claimJWT string) (*jwt.AccountClaims, accountClaimExtensions, string, error) {
 	accClaims, verifiedJWT, err := s.verifyAccountClaims(claimJWT)
 	if err != nil {
-		return nil, nil, _EMPTY_, err
+		return nil, accountClaimExtensions{}, _EMPTY_, err
 	}
 	if err := validateNoLegacyPermissionMacros(accClaims); err != nil {
-		return nil, nil, _EMPTY_, err
+		return nil, accountClaimExtensions{}, _EMPTY_, err
 	}
 	xp, err := decodeAccountXPermissions(verifiedJWT, accClaims)
 	if err != nil {
-		return nil, nil, _EMPTY_, err
+		return nil, accountClaimExtensions{}, _EMPTY_, err
 	}
-	return accClaims, xp, verifiedJWT, nil
+	mode, _, err := decodeAuthModeJWT(verifiedJWT, false)
+	if err != nil {
+		return nil, accountClaimExtensions{}, _EMPTY_, err
+	}
+	if mode == authModeGrant && accClaims.HasExternalAuthorization() {
+		return nil, accountClaimExtensions{}, _EMPTY_, ErrAccountValidation
+	}
+	return accClaims, accountClaimExtensions{xpermissions: xp, authMode: mode}, verifiedJWT, nil
 }
 
 // This will fetch an account from a resolver if defined.

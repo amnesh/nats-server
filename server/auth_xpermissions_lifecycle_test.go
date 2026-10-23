@@ -242,7 +242,7 @@ func TestJWTXPermissionsConcurrentAccountGeneration(t *testing.T) {
 	scopeTwo.Key = f.signer
 	scopeTwo.Role = "two"
 	claimTwo.SigningKeys.AddScopedSigner(scopeTwo)
-	xpTwo := accountXPermissions{f.signer: {Stream: []xStreamPermission{{Op: "ro", Stream: "two"}}}}
+	xpTwo := accountClaimExtensions{xpermissions: accountXPermissions{f.signer: {Stream: []xStreamPermission{{Op: "ro", Stream: "two"}}}}}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
