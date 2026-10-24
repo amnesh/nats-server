@@ -931,7 +931,7 @@ func checkMsgHeadersPreClusteredProposal(
 
 		// Check for any rollups.
 		if rollup := getRollup(hdr); rollup != _EMPTY_ {
-			if (!allowRollup || denyPurge) && !sourced {
+			if !sourced && (!allowRollup || denyPurge || (rollup == JSMsgRollupAll && mset.js.subjectRollupOnly)) {
 				err := errors.New("rollup not permitted")
 				return hdr, msg, 0, NewJSStreamRollupFailedError(err), err
 			}

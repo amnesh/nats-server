@@ -20,13 +20,18 @@ import (
 )
 
 const (
-	FeatureFlagJsAckFormatV2      = "js_ack_fc_v2"
-	FeatureFlagJsAPIReplyFormatV2 = "js_api_reply_v2"
-	FeatureFlagJsRaftDeleteRange  = "js_raft_delete_range"
-	FeatureFlagJsSnapshotSources  = "js_snapshot_sources"
+	FeatureFlagJsAckFormatV2       = "js_ack_fc_v2"
+	FeatureFlagJsAPIReplyFormatV2  = "js_api_reply_v2"
+	FeatureFlagJsRaftDeleteRange   = "js_raft_delete_range"
+	FeatureFlagJsSnapshotSources   = "js_snapshot_sources"
+	FeatureFlagJsSubjectRollupOnly = "js_subject_rollup_only"
 )
 
 var featureFlags = map[string]bool{
+	// Keep client rollup limited to the publication subject. Stream purge
+	// through the API retains its existing permissions. Changes require restart.
+	FeatureFlagJsSubjectRollupOnly: false,
+
 	// Use v2 format for `$JS.ACK.>` and `$JS.FC.>`.
 	// - Introduced: 2.14.0, both v1 and v2 supported, only using v1.
 	// - Enabled: TBD, both supported, v2 becomes the default.

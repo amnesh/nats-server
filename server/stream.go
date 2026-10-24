@@ -7054,7 +7054,7 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		}
 		// Check for any rollups.
 		if rollup := getRollup(hdr); rollup != _EMPTY_ {
-			if canConsistencyCheck && !allowRollupPurge && !sourced {
+			if canConsistencyCheck && !sourced && (!allowRollupPurge || (rollup == JSMsgRollupAll && js.subjectRollupOnly)) {
 				err := errors.New("rollup not permitted")
 				if canRespond {
 					resp.PubAck = &PubAck{Stream: name}
