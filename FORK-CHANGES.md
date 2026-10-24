@@ -1127,11 +1127,11 @@ rules, with denies applied, even when response permissions are enabled. Response
 routing may advertise an export superset with the configured denies retained.
 The hub forwards exact reply interest only after delivering a request that permits
 that response. Hub interest advertisement uses intersection matching, so a broad
-hub subscription still receives allowed leaf publications. Grant connections keep
-the upstream built-in MQTT, service reply, JetStream acknowledgement, and
-gateway-routed reply exceptions. Leaf wildcard interest retains upstream admission
-rules, while every actual delivery still passes the grant checks. A grant replaces
-permission lists only.
+hub subscription still receives allowed leaf publications. Grant connections have
+no built-in exception for MQTT, service replies, JetStream acknowledgements, or
+gateway-routed replies; each needs a grant. Non-grant connections keep the
+upstream exceptions. Leaf wildcard interest retains upstream admission
+rules, while every actual delivery still passes the grant checks.
 
 ## 8.2 Live replacement and planned close
 

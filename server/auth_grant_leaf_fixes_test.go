@@ -74,85 +74,158 @@ func authGrantLeafUntilPong(t *testing.T, r *bufio.Reader) []string {
 	}
 }
 
-func TestAuthGrantLeafBuiltInServiceReply(t *testing.T) {
-	hook := &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
-		return &authverify.GrantVerdict{Generation: 1, Grant: authverify.Grant{}, Done: func(bool) {}}
-	}}
-	f := newGrantFixture(t, hook)
-	hub := grantTransportCloneHub(t, f, hook, true)
-	nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(grantTransportCredentials(t, f, true)), nats.NoReconnect())
-	require_NoError(t, err)
-	defer nc.Close()
-	sub, err := nc.SubscribeSync("_R_.grant.service")
-	require_NoError(t, err)
-	require_NoError(t, nc.Flush())
-	conn, r := authGrantRawLeaf(t, hub, f.creds(t, f.signer, true, "", 0))
-	authGrantLeafUntilPong(t, r)
-	_, err = fmt.Fprint(conn, "LMSG _R_.grant.service 5\r\nreply\r\nPING\r\n")
-	require_NoError(t, err)
-	m, err := sub.NextMsg(time.Second)
-	require_NoError(t, err)
-	require_Equal(t, string(m.Data), "reply")
-	authGrantLeafUntilPong(t, r)
-}
-
-func TestAuthGrantLeafBuiltInJetStreamAck(t *testing.T) {
-	hook := &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
-		return &authverify.GrantVerdict{Generation: 1, Grant: authverify.Grant{
-			Sub: authverify.SubjectGrant{Allow: []string{"delivery"}},
-		}, Done: func(bool) {}}
-	}}
-	f := newGrantFixture(t, hook, func(ac *jwt.AccountClaims, _ *jwt.UserScope) {
-		ac.Limits.JetStreamLimits = jwt.JetStreamLimits{MemoryStorage: jwt.NoLimit, DiskStorage: jwt.NoLimit, Streams: jwt.NoLimit, Consumer: jwt.NoLimit}
-	})
-	hub := grantTransportCloneHub(t, f, hook, true)
-	_, systemKey := createKey(t)
-	systemJWT, err := jwt.NewAccountClaims(systemKey).Encode(oKp)
-	require_NoError(t, err)
-	require_NoError(t, hub.AccountResolver().Store(systemKey, systemJWT))
-	require_NoError(t, hub.SetSystemAccount(systemKey))
-	require_NoError(t, hub.EnableJetStream(&JetStreamConfig{StoreDir: t.TempDir(), MaxMemory: 64 << 20, MaxStore: 64 << 20}))
-	nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(grantTransportCredentials(t, f, true)), nats.NoReconnect())
-	require_NoError(t, err)
-	defer nc.Close()
-	js, err := nc.JetStream()
-	require_NoError(t, err)
-	_, err = js.AddStream(&nats.StreamConfig{Name: "GRANT_ACK", Subjects: []string{"events"}, Storage: nats.MemoryStorage})
-	require_NoError(t, err)
-	_, err = js.AddConsumer("GRANT_ACK", &nats.ConsumerConfig{Durable: "worker", DeliverSubject: "delivery", AckPolicy: nats.AckExplicitPolicy})
-	require_NoError(t, err)
-	conn, r := authGrantRawLeaf(t, hub, f.creds(t, f.signer, true, "", 0))
-	authGrantLeafUntilPong(t, r)
-	_, err = fmt.Fprint(conn, "LS+ delivery\r\nPING\r\n")
-	require_NoError(t, err)
-	authGrantLeafUntilPong(t, r)
-	_, err = js.Publish("events", []byte("event"))
-	require_NoError(t, err)
-	var ack string
-	for ack == "" {
+func authGrantLeafUntilErr(t *testing.T, r *bufio.Reader) string {
+	t.Helper()
+	for {
 		line, err := r.ReadString('\n')
 		require_NoError(t, err)
-		if strings.HasPrefix(line, "LMSG delivery ") {
-			fields := strings.Fields(line)
-			ack = fields[2]
-			_, err = r.ReadString('\n')
-			require_NoError(t, err)
+		if line = strings.TrimSpace(line); strings.HasPrefix(line, "-ERR") {
+			return line
 		}
 	}
-	require_True(t, strings.HasPrefix(ack, "$JS.ACK."))
-	_, err = fmt.Fprintf(conn, "LMSG %s 4\r\n+ACK\r\nPING\r\n", ack)
-	require_NoError(t, err)
-	authGrantLeafUntilPong(t, r)
-	checkFor(t, time.Second, 10*time.Millisecond, func() error {
-		ci, err := js.ConsumerInfo("GRANT_ACK", "worker")
-		if err != nil {
-			return err
+}
+
+// A grant leaf has no built-in exception for service-import replies: it needs
+// a grant for the reply subject.
+func TestAuthGrantLeafServiceReplyNeedsGrant(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		pub       []string
+		delivered bool
+	}{
+		{"no grant", nil, false},
+		{"exact grant", []string{"_R_.grant.service"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hook := &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+				return &authverify.GrantVerdict{Generation: 1, Grant: authverify.Grant{
+					Pub: authverify.SubjectGrant{Allow: test.pub},
+				}, Done: func(bool) {}}
+			}}
+			f := newGrantFixture(t, hook)
+			hub := grantTransportCloneHub(t, f, hook, true)
+			nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(grantTransportCredentials(t, f, true)), nats.NoReconnect())
+			require_NoError(t, err)
+			defer nc.Close()
+			sub, err := nc.SubscribeSync("_R_.grant.service")
+			require_NoError(t, err)
+			require_NoError(t, nc.Flush())
+			conn, r := authGrantRawLeaf(t, hub, f.creds(t, f.signer, true, "", 0))
+			authGrantLeafUntilPong(t, r)
+			_, err = fmt.Fprint(conn, "LMSG _R_.grant.service 5\r\nreply\r\nPING\r\n")
+			require_NoError(t, err)
+			if test.delivered {
+				m, err := sub.NextMsg(time.Second)
+				require_NoError(t, err)
+				require_Equal(t, string(m.Data), "reply")
+				authGrantLeafUntilPong(t, r)
+				return
+			}
+			require_Contains(t, authGrantLeafUntilErr(t, r), "Permissions Violation for Publish")
+			_, err = sub.NextMsg(250 * time.Millisecond)
+			require_Error(t, err, nats.ErrTimeout)
+		})
+	}
+}
+
+// A grant leaf has no built-in exception for JetStream acknowledgements. The
+// exact ack row that the NCDL JS-API table emits for a granted stream is enough.
+func TestAuthGrantLeafJetStreamAckNeedsGrant(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		pub   []string
+		acked bool
+	}{
+		{"no ack grant", nil, false},
+		{"exact ack row", []string{"$JS.ACK.GRANT_ACK.*.*.*.*.*.*"}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hook := &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+				return &authverify.GrantVerdict{Generation: 1, Grant: authverify.Grant{
+					Pub: authverify.SubjectGrant{Allow: test.pub},
+					Sub: authverify.SubjectGrant{Allow: []string{"delivery"}},
+				}, Done: func(bool) {}}
+			}}
+			f := newGrantFixture(t, hook, func(ac *jwt.AccountClaims, _ *jwt.UserScope) {
+				ac.Limits.JetStreamLimits = jwt.JetStreamLimits{MemoryStorage: jwt.NoLimit, DiskStorage: jwt.NoLimit, Streams: jwt.NoLimit, Consumer: jwt.NoLimit}
+			})
+			hub := grantTransportCloneHub(t, f, hook, true)
+			_, systemKey := createKey(t)
+			systemJWT, err := jwt.NewAccountClaims(systemKey).Encode(oKp)
+			require_NoError(t, err)
+			require_NoError(t, hub.AccountResolver().Store(systemKey, systemJWT))
+			require_NoError(t, hub.SetSystemAccount(systemKey))
+			require_NoError(t, hub.EnableJetStream(&JetStreamConfig{StoreDir: t.TempDir(), MaxMemory: 64 << 20, MaxStore: 64 << 20}))
+			nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(grantTransportCredentials(t, f, true)), nats.NoReconnect())
+			require_NoError(t, err)
+			defer nc.Close()
+			js, err := nc.JetStream()
+			require_NoError(t, err)
+			_, err = js.AddStream(&nats.StreamConfig{Name: "GRANT_ACK", Subjects: []string{"events"}, Storage: nats.MemoryStorage})
+			require_NoError(t, err)
+			_, err = js.AddConsumer("GRANT_ACK", &nats.ConsumerConfig{Durable: "worker", DeliverSubject: "delivery", AckPolicy: nats.AckExplicitPolicy, AckWait: time.Minute})
+			require_NoError(t, err)
+			conn, r := authGrantRawLeaf(t, hub, f.creds(t, f.signer, true, "", 0))
+			authGrantLeafUntilPong(t, r)
+			_, err = fmt.Fprint(conn, "LS+ delivery\r\nPING\r\n")
+			require_NoError(t, err)
+			authGrantLeafUntilPong(t, r)
+			_, err = js.Publish("events", []byte("event"))
+			require_NoError(t, err)
+			var ack string
+			for ack == "" {
+				line, err := r.ReadString('\n')
+				require_NoError(t, err)
+				if strings.HasPrefix(line, "LMSG delivery ") {
+					ack = strings.Fields(line)[2]
+					_, err = r.ReadString('\n')
+					require_NoError(t, err)
+				}
+			}
+			require_True(t, strings.HasPrefix(ack, "$JS.ACK.GRANT_ACK."))
+			_, err = fmt.Fprintf(conn, "LMSG %s 4\r\n+ACK\r\nPING\r\n", ack)
+			require_NoError(t, err)
+			if !test.acked {
+				require_Contains(t, authGrantLeafUntilErr(t, r), "Permissions Violation for Publish")
+				time.Sleep(100 * time.Millisecond)
+				ci, err := js.ConsumerInfo("GRANT_ACK", "worker")
+				require_NoError(t, err)
+				require_Equal(t, ci.NumAckPending, 1)
+				return
+			}
+			authGrantLeafUntilPong(t, r)
+			checkFor(t, time.Second, 10*time.Millisecond, func() error {
+				ci, err := js.ConsumerInfo("GRANT_ACK", "worker")
+				if err != nil {
+					return err
+				}
+				if ci.NumAckPending != 0 || ci.AckFloor.Stream != 1 {
+					return fmt.Errorf("ack did not advance consumer: pending=%d floor=%d", ci.NumAckPending, ci.AckFloor.Stream)
+				}
+				return nil
+			})
+		})
+	}
+}
+
+// A grant connection has no built-in exception for service-import replies,
+// JetStream acknowledgements, or gateway-routed replies. A non-grant leaf keeps
+// the upstream exceptions.
+func TestAuthGrantLeafMessageExceptionsStrict(t *testing.T) {
+	for _, subject := range []string{"_R_.abc.def", "$JS.ACK.S.C.1.1.1.1.0", "_GR_.abcdef.ghijkl.reply.subject"} {
+		for _, grant := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/grant=%t", subject, grant), func(t *testing.T) {
+				c := &client{kind: LEAF, leaf: &leaf{isSpoke: true}, user: &NkeyUser{}}
+				p, pub, sub, err := compileAuthGrant(authverify.Grant{})
+				require_NoError(t, err)
+				c.installAuthGrant(p, pub, sub)
+				c.opts.Export = p.Publish
+				c.authGrantMode.Store(grant)
+				c.pa.subject = []byte(subject)
+				require_Equal(t, c.leafMsgAllowed(), !grant)
+			})
 		}
-		if ci.NumAckPending != 0 || ci.AckFloor.Stream != 1 {
-			return fmt.Errorf("ack did not advance consumer: pending=%d floor=%d", ci.NumAckPending, ci.AckFloor.Stream)
-		}
-		return nil
-	})
+	}
 }
 
 func TestAuthGrantLeafResponseInterestPrivacy(t *testing.T) {
@@ -196,16 +269,23 @@ func TestAuthGrantLeafResponseInterestPrivacy(t *testing.T) {
 	authGrantLeafUntilPong(t, r)
 }
 
-func TestAuthGrantLeafMQTTExceptions(t *testing.T) {
-	c := &client{kind: LEAF, leaf: &leaf{}, authGrant: &authGrantState{}, user: &NkeyUser{}}
-	p, pub, sub, err := compileAuthGrant(authverify.Grant{})
-	require_NoError(t, err)
-	c.installAuthGrant(p, pub, sub)
-	c.opts.Export = p.Publish
-	for _, subject := range []string{"$MQTT.sub.test", "$MQTT.deliver.pubrel.test"} {
-		require_True(t, c.canSubscribeInternal(subject))
-		require_True(t, c.pubAllowedFullCheck(subject, false, true))
-		require_True(t, c.leafSendAllowed([]byte(subject)))
+// A grant connection has no built-in exception for MQTT subjects. A non-grant
+// leaf keeps the upstream exception.
+func TestAuthGrantLeafMQTTExceptionsStrict(t *testing.T) {
+	for _, grant := range []bool{false, true} {
+		t.Run(fmt.Sprintf("grant=%t", grant), func(t *testing.T) {
+			c := &client{kind: LEAF, leaf: &leaf{}, authGrant: &authGrantState{}, user: &NkeyUser{}}
+			p, pub, sub, err := compileAuthGrant(authverify.Grant{})
+			require_NoError(t, err)
+			c.installAuthGrant(p, pub, sub)
+			c.opts.Export = p.Publish
+			c.authGrantMode.Store(grant)
+			for _, subject := range []string{"$MQTT.sub.test", "$MQTT.deliver.pubrel.test", "$MQTT.JSA.test"} {
+				require_Equal(t, c.canSubscribeInternal(subject), !grant)
+				require_Equal(t, c.pubAllowedFullCheck(subject, false, true), !grant)
+				require_Equal(t, c.leafSendAllowed([]byte(subject)), !grant)
+			}
+		})
 	}
 }
 

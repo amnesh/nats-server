@@ -187,8 +187,10 @@ the logic in a new file (for example `server/auth_grant.go`).
 - **G2 Mandatory.** `Options.AuthGrant == nil`: reject. Hook panic: recover and reject. Nil verdict:
   reject. `Reject: true`: reject with `Code`. `Generation == 0` or an admit with `Done == nil`: reject.
 - **G3 Grant only.** Effective permission lists are exactly the verdict's `Grant`.
-  Grant connections keep all upstream built-in exceptions, including MQTT, service replies,
-  JetStream acknowledgements, and gateway-routed replies. Ignore the user JWT
+  Grant connections have no built-in exception for MQTT subjects, service-import replies,
+  JetStream acknowledgements, or gateway-routed replies: each needs a grant. Reason: these
+  exceptions let a leaf publish, for example, `$JS.ACK` for another consumer in its account
+  and acknowledge or terminate messages that it never received. Ignore the user JWT
   permissions, the scoped template permissions, `xpermissions`, and the account default
   permissions. Limits, allowed connection types, bearer, proxy, and expiry still apply. Build the
   internal `NkeyUser` with the grant permissions and register it, as `applyAuthVerifyOverride` does
@@ -381,8 +383,8 @@ standard wildcard supersets, and the accepted hub enforces exact rules on actual
 messages. Interest advertisements use prefix intersection so broad hub interests
 receive allowed leaf traffic. Prefix subscription permission checks retain subset semantics. Standard leaf
 wildcard interest retains upstream overlap behavior and filters each delivery. Grant connections
-retain the upstream built-in exceptions for MQTT, service replies, JetStream acknowledgements,
-and gateway-routed replies. Leaf wildcard interest retains upstream admission rules,
+have no built-in exception for MQTT, service replies, JetStream acknowledgements, or
+gateway-routed replies; non-grant connections keep the upstream exceptions. Leaf wildcard interest retains upstream admission rules,
 while every actual delivery still passes the grant checks. Prefix checks run only for grant connections. The non-grant leaf
 message path keeps the upstream lock-free fast path.
 

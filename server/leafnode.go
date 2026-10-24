@@ -3524,8 +3524,8 @@ func (c *client) leafMsgAllowed() bool {
 
 	// Service-import replies (_R_), JS ack subjects ($JS.ACK.)
 	// are internal routing subjects forwarded via LS+ without
-	// permission checks.
-	if isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck) {
+	// permission checks. A grant connection has no such exception.
+	if (isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck)) && !c.authGrantMode.Load() {
 		return true
 	}
 
@@ -3533,7 +3533,7 @@ func (c *client) leafMsgAllowed() bool {
 	if c.isSpokeLeafNode() {
 		// Gateway routed replies are forwarded without
 		// permission checks.
-		if isGW || c.leafReceiveAllowed(subjectToCheck) {
+		if (isGW && !c.authGrantMode.Load()) || c.leafReceiveAllowed(subjectToCheck) {
 			c.mu.RUnlock()
 			return true
 		}
@@ -3583,7 +3583,7 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 	}
 
 	allowed := true
-	if perms.Allow != nil && !strings.HasPrefix(subject, mqttPrefix) {
+	if perms.Allow != nil && (!strings.HasPrefix(subject, mqttPrefix) || c.authGrantMode.Load()) {
 		allowed = false
 		for _, allowSubj := range perms.Allow {
 			if matchLiteral(subject, allowSubj) {
