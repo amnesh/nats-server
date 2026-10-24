@@ -23,6 +23,7 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 6 | Leafnode `SignatureCB` kept across reload | programmatic (`RemoteLeafOpts.SignatureCB`) | — | `server/reload.go` |
 | 7 | `Account.SetJetStreamLimits` (JetStream limits for accounts built in code) | programmatic | `server/account_jslimits.go` | — |
 | 8 | Grant mode | operator-signed account JWT `nats.authverify.mode: "grant"` and programmatic `Options.AuthGrant` | `server/authverify/grant.go`, `server/auth_grant*.go` | `server/accounts.go`, `server/auth.go`, `server/client.go`, `server/leafnode.go`, `server/monitor.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
+| 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
 
 Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8.
 
@@ -1049,7 +1050,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
   ```sh
   # Features 1, 2, 4, 5, 6 and 7
-  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits' \
+  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 
@@ -1187,3 +1188,39 @@ records the complete API and admission contract.
 Scoped user JWTs must still pass upstream scoped-signer validation. Explicit
 user permission or limit fields are invalid for that JWT form and reject before
 `Verify`. Grant replacement applies after this identity-validation prerequisite.
+
+# 9. Subject-only rollup
+
+`Nats-Rollup: all` can remove foreign subjects when a publisher can write only
+one subject. The optional `js_subject_rollup_only` flag rejects this header on
+client publications. `Nats-Rollup: sub` and normal publication keep their existing
+behavior. Stream purge through the API keeps its existing permissions.
+
+```text
+feature_flags {
+  js_subject_rollup_only: true
+}
+```
+
+The default is `false`. The policy covers every stream, including streams
+created after startup and streams with subject transforms. It applies to both
+static and grant-mode connections. A change to feature flags requires restart.
+Enable the flag on every cluster peer and every origin that accepts key-scoped
+writers.
+
+The policy uses one value set at JetStream startup. Both existing rollup
+validation paths read that value. It adds no identity lookup, authorization
+callback, or lock to publication. Ordinary, atomic-batch, and fast-batch
+publications use these checks. Committed Raft application remains unchanged.
+
+Trusted source and mirror replay retain the existing rollup exemption. A source
+can replay a historical `all` header. Protection therefore belongs at each
+publishing origin. The flag does not reject source history or replace source
+trust checks.
+
+The [subject-rollup design](docs/superpowers/specs/2026-10-24-subject-rollup-only-design.md)
+records the policy and tests.
+
+```sh
+go test -race ./server -run 'TestJetStreamSubjectRollupOnly' -count=1
+```

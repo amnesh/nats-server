@@ -129,6 +129,8 @@ type jetStream struct {
 	infoSubs       *gsl.SimpleSublist // Subjects for info-specific queue.
 	started        time.Time
 
+	subjectRollupOnly bool
+
 	// System level request to purge a stream move
 	accountPurge *subscription
 
@@ -429,6 +431,7 @@ func (s *Server) initJetStreamEncryption() (err error) {
 // enableJetStream will start up the JetStream subsystem.
 func (s *Server) enableJetStream(cfg JetStreamConfig) error {
 	js := &jetStream{srv: s, config: cfg, accounts: make(map[string]*jsAccount), apiSubs: NewSublistNoCache(), infoSubs: gsl.NewSimpleSublist()}
+	js.subjectRollupOnly = s.getOpts().getFeatureFlag(FeatureFlagJsSubjectRollupOnly)
 	s.gcbMu.Lock()
 	if s.gcbOutMax = s.getOpts().JetStreamMaxCatchup; s.gcbOutMax == 0 {
 		s.gcbOutMax = defaultMaxTotalCatchupOutBytes
