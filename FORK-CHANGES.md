@@ -1097,8 +1097,10 @@ without server or client locks held by the calling goroutine. The server recover
 and logs panics in `Done` and `Closed`. A panic in `Done(true)` closes the connection
 with `GrantRejected`. A Closed notification starts a short tracked goroutine at
 close time, so an open grant connection costs no goroutine. During shutdown the
-server calls the host directly, so shutdown cannot discard the notification. Host
-callbacks must not block.
+server calls the host directly, so shutdown cannot discard the notification. That
+call can run on the goroutine that called `Server.Shutdown`, so a host must not
+hold a lock that its `Closed` takes while it calls `Shutdown`. Host callbacks must
+not block.
 
 `Grant` contains `Pub`, `Sub`, and optional `Resp`. Each direction has standard
 `Allow` and `Deny` subject lists and token-prefix `AllowPrefix` rules. Empty allows

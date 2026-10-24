@@ -295,7 +295,9 @@ Decide under the client lock that a notification is due, after both `Done(true)`
 finish, then deliver it with no lock held. Delivery starts a short tracked goroutine at close
 time, so an open grant connection costs no goroutine of its own. During shutdown the server
 starts no tracked goroutines, so the host is called directly and still receives the notification
-before `Shutdown` returns. Host callbacks must not block, including waiting for server shutdown.
+before `Shutdown` returns. That direct call can run on the goroutine that called
+`Server.Shutdown`. So a host must not hold a lock that its `Closed` takes while it calls
+`Shutdown`. Host callbacks must not block, including waiting for server shutdown.
 
 ## 9. New close reasons
 
