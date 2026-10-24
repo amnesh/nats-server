@@ -120,15 +120,19 @@ func TestAuthGrantPrefixPermissions(t *testing.T) {
 	for _, kind := range []int{CLIENT, LEAF} {
 		for _, standardAllow := range []bool{false, true} {
 			c := &client{kind: kind}
+			c.authGrantMode.Store(true)
 			perms := &Permissions{
-				Publish:   &SubjectPermission{Deny: []string{"pub-denied"}},
-				Subscribe: &SubjectPermission{Deny: []string{"sub-denied", "sub-queue workers"}},
+				Publish:   &SubjectPermission{Allow: []string{}, Deny: []string{"pub-denied"}},
+				Subscribe: &SubjectPermission{Allow: []string{}, Deny: []string{"sub-denied", "sub-queue workers"}},
 			}
 			if standardAllow {
 				perms.Publish.Allow = []string{"standard.pub"}
 				perms.Subscribe.Allow = []string{"standard.sub"}
 			}
 			c.setPermissions(perms)
+			if c.perms.sub.allow == nil {
+				c.perms.sub.allow = NewSublistNoCache()
+			}
 			var err error
 			c.perms.pub.prefix, err = compileGrantPrefixRules([]string{"pub-*"})
 			require_NoError(t, err)
@@ -171,6 +175,7 @@ func TestAuthGrantPrefixLeafSwap(t *testing.T) {
 	defer s.Shutdown()
 	c := &client{kind: LEAF, srv: s, leaf: &leaf{}, acc: s.globalAccount(), opts: defaultOpts}
 	c.initClient()
+	c.authGrantMode.Store(true)
 	defer c.closeConnection(ClientClosed)
 	c.setPermissions(&Permissions{
 		Publish:   &SubjectPermission{Allow: []string{"standard.pub"}},

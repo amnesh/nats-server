@@ -2274,14 +2274,7 @@ func (s *Server) verifyAccountClaimsWithXPermissions(claimJWT string) (*jwt.Acco
 	if err != nil {
 		return nil, accountClaimExtensions{}, _EMPTY_, err
 	}
-	mode, _, err := decodeAuthModeJWT(verifiedJWT, false)
-	if err != nil {
-		return nil, accountClaimExtensions{}, _EMPTY_, err
-	}
-	if mode == authModeGrant && accClaims.HasExternalAuthorization() {
-		return nil, accountClaimExtensions{}, _EMPTY_, ErrAccountValidation
-	}
-	return accClaims, accountClaimExtensions{xpermissions: xp, authMode: mode}, verifiedJWT, nil
+	return accountClaimsWithGrantMode(accClaims, xp, verifiedJWT)
 }
 
 // This will fetch an account from a resolver if defined.

@@ -356,7 +356,10 @@ func TestAuthGrantLeafPrefixMessages(t *testing.T) {
 		{"hub deny wins", hubClient, leafClient, "in.device-denied.value", "in.device-denied.>", false},
 		{"leaf cannot use hub permission", leafClient, hubClient, "in.device-123.value", "in.device-123.>", false},
 		{"hub cannot use leaf permission", hubClient, leafClient, "out.device-123.value", "out.device-123.>", false},
-		{"hub wildcard at prefix", hubClient, leafClient, "in.device-123.value", "in.*.>", false},
+		{"hub wildcard at prefix", hubClient, leafClient, "in.device-123.value", "in.*.>", true},
+		{"hub wildcard filters wrong prefix", hubClient, leafClient, "in.other.value", "in.*.>", false},
+		{"hub wildcard filters empty suffix", hubClient, leafClient, "in.device-.value", "in.*.>", false},
+		{"hub wildcard filters denies", hubClient, leafClient, "in.device-denied.value", "in.*.>", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			sub, err := test.receiver.SubscribeSync(test.subscribe)

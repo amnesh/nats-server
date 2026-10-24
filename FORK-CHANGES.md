@@ -1067,9 +1067,9 @@ JWT selects the mode, and linked Go code implements `authverify.GrantHook` throu
 
 An absent block or `"mode": "static"` retains normal JWT authorization. Unknown
 fields, types, and modes reject the claims. Grant mode cannot coexist with an
-account auth callout. A mode change closes every account connection with
-`AuthModeChanged`. Admission rechecks the mode after account registration so a
-connection cannot miss a concurrent mode-change disconnect.
+account auth callout. A mode change closes non-internal account connections with
+`AuthModeChanged`. JetStream, account, and system internal clients remain active.
+Admission rechecks the mode after account registration so a connection cannot miss a concurrent mode-change disconnect.
 
 A user signed by the account identity key can opt into static authorization:
 
@@ -1077,9 +1077,10 @@ A user signed by the account identity key can opt into static authorization:
 "nats": { "authverify": { "mode": "static" } }
 ```
 
-The user block is invalid for any other signer. All other grant-mode users must
-use a scoped signing key. The hook receives its role, verified identity, server,
-client, CONNECT, and TLS information. CLIENT connections, including in-process
+In a grant-mode account, the user block is invalid for any other signer. In a static
+account, the server ignores the user block without parsing it. All other grant-mode
+users must use a scoped signing key with a non-empty role. The hook receives its role,
+verified identity, server, client, CONNECT, and TLS information. CLIENT connections, including in-process
 connections, and LEAF connections participate. The system account is excluded.
 Static users retain the existing `auth_verification` behavior and scope rules.
 
@@ -1092,7 +1093,12 @@ invalid grant, or missing admit `Done` callback rejects admission. An admit's
 admission point under the client lock. A concurrent close after that point is an
 admitted close. `Closed(serverID, clientID)` runs asynchronously after `Done(true)`
 returns and teardown removes the connection from server maps. Host callbacks run
-without server or client locks held by the calling goroutine.
+without server or client locks held by the calling goroutine. The server recovers
+and logs panics in `Done` and `Closed`. A panic in `Done(true)` closes the connection
+with `GrantRejected`. A Closed notification starts a short tracked goroutine at
+close time, so an open grant connection costs no goroutine. During shutdown the
+server calls the host directly, so shutdown cannot discard the notification. Host
+callbacks must not block.
 
 `Grant` contains `Pub`, `Sub`, and optional `Resp`. Each direction has standard
 `Allow` and `Deny` subject lists and token-prefix `AllowPrefix` rules. Empty allows
@@ -1114,11 +1120,16 @@ entries. Invalid entries reject the complete grant.
 Accepted leaves reverse publish and subscribe rules with their standard lists.
 Leaf INFO advertises standard wildcard supersets of prefix rules because the
 upstream wire format cannot express token prefixes. The hub enforces the exact
-grant on actual messages. Response-enabled leaves advertise unrestricted exports
-and forward reply interest so replies can reach the hub for dynamic authorization. Hub interest advertisement uses intersection matching,
-so a broad hub subscription still receives allowed leaf publications. Internal
-MQTT, service reply, and JetStream acknowledgement subjects require explicit
-permission on a grant connection.
+grant on actual messages. Leaf interest follows the standard lists and prefix
+rules, with denies applied, even when response permissions are enabled. Response
+routing may advertise an export superset with the configured denies retained.
+The hub forwards exact reply interest only after delivering a request that permits
+that response. Hub interest advertisement uses intersection matching, so a broad
+hub subscription still receives allowed leaf publications. Grant connections keep
+the upstream built-in MQTT, service reply, JetStream acknowledgement, and
+gateway-routed reply exceptions. Leaf wildcard interest retains upstream admission
+rules, while every actual delivery still passes the grant checks. A grant replaces
+permission lists only.
 
 ## 8.2 Live replacement and planned close
 
@@ -1134,7 +1145,13 @@ A LEAF update closes the connection with `AuthorizationChanged`; reconnect runs
 `ErrGrantRejected`. Other errors are `ErrUnknownClient`, `ErrNotGrantMode`, and
 `ErrStaleGeneration`. Account or user mismatch returns `ErrUnknownClient`.
 
-`Server.DisconnectClient(id, code)` accepts either reject code:
+`Server.UpdateAccountClaims` preserves the current account auth mode and
+`xpermissions`, because typed claims cannot express these raw JWT extensions.
+Raw signed JWT updates can replace them.
+
+`Server.DisconnectClient(id, code)` acts only on grant connections. It returns
+`ErrNotGrantMode` for a non-grant connection and `ErrUnknownClient` for an unknown
+ID. It accepts either reject code:
 
 | Code | Wire error | Planned-close reason |
 |---|---|---|
@@ -1151,6 +1168,7 @@ Both APIs can run from any goroutine. A caller must not hold a lock that its own
 - `server/authverify/grant.go` defines the host API.
 - `server/auth_grant.go` owns admission, stored grants, timers, updates, and callbacks.
 - `server/auth_grant_mode.go` parses signed account and user mode blocks.
+- `server/auth_grant_leaf.go` projects leaf permissions and advertises request reply interest.
 - `server/auth_grant_prefix.go` compiles and matches token-prefix rules.
 - `server/auth_grant*_test.go` covers modes, lifecycle, matching, and transport behavior.
 

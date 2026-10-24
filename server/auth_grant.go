@@ -45,7 +45,13 @@ type authGrantState struct {
 	done, closeComplete, closedNotified bool
 }
 
-func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, raw string) (bool, authMode, error) {
+func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, raw string, scope jwt.Scope) (bool, authMode, error) {
+	acc.mu.RLock()
+	mode := acc.authMode
+	acc.mu.RUnlock()
+	if mode != authModeGrant {
+		return false, mode, nil
+	}
 	_, static, err := decodeAuthModeJWT(raw, true)
 	if err != nil {
 		return false, authModeStatic, err
@@ -53,9 +59,6 @@ func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, 
 	if static && juc.Issuer != acc.Name {
 		return false, authModeStatic, errors.New("user authverify block requires the account identity signer")
 	}
-	acc.mu.RLock()
-	mode := acc.authMode
-	acc.mu.RUnlock()
 	applies := mode == authModeGrant && !static && (c.kind == CLIENT || c.kind == LEAF) && acc != s.SystemAccount()
 	c.mu.Lock()
 	st := c.authGrant
@@ -65,9 +68,8 @@ func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, 
 		return false, authModeStatic, errors.New("cannot change a grant connection identity")
 	}
 	if applies {
-		scope, _, ok := acc.issuerScopeAndXPermissions(juc.Issuer)
-		if _, scoped := scope.(*jwt.UserScope); !ok || !scoped {
-			return false, authModeStatic, errors.New("grant mode requires a scoped signing key")
+		if us, scoped := scope.(*jwt.UserScope); !scoped || us.Role == "" {
+			return false, authModeStatic, errors.New("grant mode requires a scoped signing key with a non-empty role")
 		}
 	}
 	return applies, mode, nil
@@ -82,7 +84,40 @@ func invokeGrantHook(h authverify.GrantHook, req *authverify.GrantRequest) (v *a
 	return h.Verify(req)
 }
 
-func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Account, raw string, hook authverify.GrantHook) bool {
+func (s *Server) invokeGrantDone(done func(bool), applied bool) (ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Errorf("Auth grant Done(%t) callback panicked: %v", applied, r)
+		}
+	}()
+	done(applied)
+	return true
+}
+
+func (s *Server) callGrantClosed(st *authGrantState, id uint64) {
+	defer func() {
+		if r := recover(); r != nil {
+			s.Errorf("Auth grant Closed callback panicked: %v", r)
+		}
+	}()
+	st.hook.Closed(st.serverID, id)
+}
+
+// deliverGrantClosed reports a close to the host. The caller holds no lock. A
+// short tracked goroutine delivers it. During shutdown the server starts no
+// tracked goroutines, so the host is called directly and still receives the
+// notification before Shutdown returns.
+func (s *Server) deliverGrantClosed(st *authGrantState, id uint64) {
+	if s.startGoRoutine(func() {
+		defer s.grWG.Done()
+		s.callGrantClosed(st, id)
+	}) {
+		return
+	}
+	s.callGrantClosed(st, id)
+}
+
+func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Account, raw string, hook authverify.GrantHook, scope *jwt.UserScope) bool {
 	c.mu.Lock()
 	if st := c.authGrant; st != nil {
 		if c.isClosed() {
@@ -110,17 +145,12 @@ func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Accoun
 		return true
 	}
 	c.mu.Unlock()
-	if hook == nil {
-		return false
-	}
-	scope, _, _ := acc.issuerScopeAndXPermissions(juc.Issuer)
-	us, ok := scope.(*jwt.UserScope)
-	if !ok {
+	if hook == nil || scope == nil {
 		return false
 	}
 	base := s.buildAuthVerifyRequest(c, juc, acc, "", raw)
 	req := &authverify.GrantRequest{Server: base.Server, UserNkey: base.UserNkey, Account: base.Account,
-		Client: base.Client, Connect: base.Connect, TLS: base.TLS, Issuer: juc.Issuer, ScopeRole: us.Role}
+		Client: base.Client, Connect: base.Connect, TLS: base.TLS, Issuer: juc.Issuer, ScopeRole: scope.Role}
 	v := invokeGrantHook(hook, req)
 	if v == nil {
 		return false
@@ -137,7 +167,7 @@ func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Accoun
 	applied := false
 	defer func() {
 		if !applied && v.Done != nil {
-			v.Done(false)
+			s.invokeGrantDone(v.Done, false)
 		}
 	}()
 	if v.Generation == 0 || v.Done == nil {
@@ -168,11 +198,19 @@ func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Accoun
 	c.setGrantExpiration(st)
 	applied = true
 	c.mu.Unlock()
-	v.Done(true)
+	doneOK := s.invokeGrantDone(v.Done, true)
 	c.mu.Lock()
 	st.done = true
-	c.notifyGrantClosed(st)
+	due := st.closeDueLocked()
 	c.mu.Unlock()
+	if due {
+		s.deliverGrantClosed(st, c.cid)
+	}
+	if !doneOK {
+		c.sendErr("Authorization Violation")
+		c.closeConnection(GrantRejected)
+		return false
+	}
 	return true
 }
 
@@ -286,29 +324,33 @@ func (c *client) clearGrantExpiration() {
 
 func (c *client) finishGrantClose() {
 	c.mu.Lock()
-	if st := c.authGrant; st != nil {
+	st, srv := c.authGrant, c.srv
+	due := false
+	if st != nil {
 		st.closeComplete = true
-		c.notifyGrantClosed(st)
+		due = st.closeDueLocked()
 	}
 	c.mu.Unlock()
+	if due && srv != nil {
+		srv.deliverGrantClosed(st, c.cid)
+	}
 }
 
-func (c *client) notifyGrantClosed(st *authGrantState) {
+// closeDueLocked reports, once, that both Done(true) and the close finished.
+// The client lock must be held.
+func (st *authGrantState) closeDueLocked() bool {
 	if !st.done || !st.closeComplete || st.closedNotified {
-		return
+		return false
 	}
 	st.closedNotified = true
-	go st.hook.Closed(st.serverID, c.cid)
+	return true
 }
 
 func (s *Server) grantClient(id uint64) *client {
-	s.mu.RLock()
-	c := s.clients[id]
-	if c == nil {
-		c = s.leafs[id]
+	if c := s.getClient(id); c != nil {
+		return c
 	}
-	s.mu.RUnlock()
-	return c
+	return s.GetLeafNode(id)
 }
 
 // UpdateClientGrant replaces all permissions of an admitted grant connection.
@@ -358,15 +400,25 @@ func (s *Server) UpdateClientGrant(u authverify.GrantUpdate) error {
 	return nil
 }
 
-// DisconnectClient closes a client or leaf with the protocol error for code.
+// DisconnectClient closes a grant-mode client or leaf with the protocol error for code.
 func (s *Server) DisconnectClient(clientID uint64, code authverify.RejectCode) error {
 	c := s.grantClient(clientID)
 	if c == nil {
 		return ErrUnknownClient
 	}
+	c.mu.Lock()
+	if c.isClosed() {
+		c.mu.Unlock()
+		return ErrUnknownClient
+	}
+	if !c.authGrantMode.Load() {
+		c.mu.Unlock()
+		return ErrNotGrantMode
+	}
+	c.mu.Unlock()
 	reason, message := GrantRejected, "Authorization Violation"
 	if code == authverify.CodeResourceLimit {
-		reason, message = ResourceLimit, "maximum connections exceeded"
+		reason, message = ResourceLimit, ErrTooManyConnections.Error()
 	}
 	c.sendErr(message)
 	c.closeConnection(reason)
@@ -394,6 +446,11 @@ func grantLeafWirePermission(p *SubjectPermission, rules grantPrefixRules) *Subj
 }
 
 func (c *client) registerGrantUser(user *NkeyUser) error {
+	c.mu.Lock()
+	if c.authGrant == nil {
+		c.authGrantMode.Store(true)
+	}
+	c.mu.Unlock()
 	if err := c.registerWithAccount(user.Account); err != nil {
 		c.reportErrRegisterAccount(user.Account, err)
 		return err
@@ -415,15 +472,32 @@ func (c *client) registerGrantUser(user *NkeyUser) error {
 	return nil
 }
 
+func (c *client) registerJWTUser(user *NkeyUser, grant bool, mode authMode) error {
+	var err error
+	if grant {
+		err = c.registerGrantUser(user)
+	} else {
+		err = c.RegisterNkeyUser(user)
+	}
+	if err != nil {
+		return err
+	}
+	user.Account.mu.RLock()
+	changed := user.Account.authMode != mode
+	user.Account.mu.RUnlock()
+	if changed {
+		c.closeConnection(AuthModeChanged)
+		return ErrAuthentication
+	}
+	return nil
+}
+
 func (c *client) canAdvertiseLeafInterestInternal(subject string) bool {
 	if c.canSubscribeInternal(subject) {
 		return true
 	}
 	if c.authGrant == nil || c.isSolicitedLeafNode() || c.perms == nil {
 		return false
-	}
-	if c.perms.resp != nil {
-		return true
 	}
 	if !c.perms.sub.prefix.intersects(subject) {
 		return false
@@ -442,26 +516,9 @@ func (c *client) canAdvertiseLeafInterest(subject string) bool {
 	return true
 }
 
-func (c *client) canPublishGrantReply(subject string) bool {
+func (c *client) canPublishReply(subject string) bool {
 	if c.kind == LEAF && c.authGrant != nil {
 		return c.leafSendAllowed([]byte(subject))
 	}
 	return c.pubAllowedFullCheck(subject, true, true)
-}
-
-func (c *client) leafSubscriptionAllowed(subject string) bool {
-	literal := subjectIsLiteral(subject)
-	if !literal && c.authGrant == nil {
-		return true
-	}
-	if c.pubAllowedFullCheck(subject, true, true) {
-		return true
-	}
-	if literal || c.perms == nil || c.perms.pub.allow == nil {
-		return false
-	}
-	if c.perms.pub.deny != nil && c.perms.pub.deny.HasInterest(subject) {
-		return false
-	}
-	return len(c.perms.pub.allow.ReverseMatch(subject).psubs) > 0
 }

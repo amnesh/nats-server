@@ -293,8 +293,9 @@ a connection cannot combine generations.
 Initial resolver load, system-account load, resolver/event update, reload, and
 incomplete-account refresh must all carry the verified raw extension through
 the same install path. Typed-only `UpdateAccountClaims` calls carry no signed
-raw extension and must clear any previously stored groups rather than retain
-stale authority. The typed scope map and extension map are swapped together
+raw extension and preserve the current groups and auth mode. Raw signed JWT
+updates replace or remove extensions, as specified by the grant-mode follow-up.
+The typed scope map and extension map are swapped together
 under `Account.mu`; any error leaves the old generation intact.
 
 Extension-only changes count as scoped-signer changes. The existing altered
@@ -410,7 +411,7 @@ partially updates an account.
   subjects. Remote-domain info works only through explicit ordinary
   `pub.allow` entries.
 - Cover first load, system-account load, extension-only update, resolver/event
-  refresh, incomplete-account refresh, typed-only update clearing stale groups,
+  refresh, incomplete-account refresh, typed-only update preserving groups,
   atomic rollback on error, and disconnection of clients for altered scopes.
 
 ## 9. Risks and non-goals

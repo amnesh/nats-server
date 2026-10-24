@@ -14,10 +14,13 @@
 package server
 
 import (
+	"bufio"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -572,15 +575,23 @@ func TestAuthGrantEmptyLeafInternalSubjects(t *testing.T) {
 	require_NoError(t, err)
 	c.installAuthGrant(p, pub, sub)
 	c.opts.Export = p.Publish
-	for _, subject := range []string{"ordinary", "$MQTT.test", "_R_.test", "$JS.ACK.stream.consumer.1.2.3.4.5"} {
-		c.pa.subject = []byte(subject)
-		require_False(t, c.leafMsgAllowed())
-		require_False(t, c.pubAllowedFullCheck(subject, false, true))
-		require_False(t, c.canSubscribe(subject))
+	for _, test := range []struct {
+		subject         string
+		leaf, pubAndSub bool
+	}{
+		{"ordinary", false, false},
+		{"$MQTT.test", true, true},
+		{"_R_.test", true, false},
+		{"$JS.ACK.stream.consumer.1.2.3.4.5", true, false},
+	} {
+		c.pa.subject = []byte(test.subject)
+		require_Equal(t, c.leafMsgAllowed(), test.leaf)
+		require_Equal(t, c.pubAllowedFullCheck(test.subject, false, true), test.pubAndSub)
+		require_Equal(t, c.canSubscribe(test.subject), test.pubAndSub)
 	}
 	c.leaf.isSpoke = true
 	c.pa.subject = []byte("_GR_.cluster.server.forbidden")
-	require_False(t, c.leafMsgAllowed())
+	require_True(t, c.leafMsgAllowed())
 }
 
 func TestAuthGrantReinstallKeepsDeliveryDeny(t *testing.T) {
@@ -607,12 +618,12 @@ func TestAuthGrantReauthenticationRefreshesExpiry(t *testing.T) {
 	uc, err := jwt.DecodeUserClaims(req.Connect.JWT)
 	require_NoError(t, err)
 	uc.Expires = time.Now().Unix() + 20
-	require_True(t, f.s.authGrantConnection(c, uc, f.acc, req.Connect.JWT, nil))
+	require_True(t, f.s.authGrantConnection(c, uc, f.acc, req.Connect.JWT, nil, nil))
 	c.mu.Lock()
 	require_Equal(t, c.expires.Unix(), uc.Expires)
 	c.mu.Unlock()
 	uc.Times = []jwt.TimeRange{{Start: "00:00:00", End: "00:00:00"}}
-	require_False(t, f.s.authGrantConnection(c, uc, f.acc, req.Connect.JWT, nil))
+	require_False(t, f.s.authGrantConnection(c, uc, f.acc, req.Connect.JWT, nil, nil))
 }
 
 func TestAuthGrantScopedUserValidation(t *testing.T) {
@@ -692,4 +703,224 @@ func TestAuthGrantJWTExpiryCloses(t *testing.T) {
 	req := grantRecv(t, reqs)
 	require_Equal(t, grantRecv(t, closed), req.Client.ID)
 	grantTransportClosedReason(t, f.s, req.Client.ID, AuthenticationExpired)
+}
+
+func TestAuthGrantStaticAccountIgnoresUserMode(t *testing.T) {
+	plain, plainPub := createKey(t)
+	f := newGrantFixture(t, nil, func(ac *jwt.AccountClaims, _ *jwt.UserScope) { ac.SigningKeys.Add(plainPub) })
+	raw, err := f.claims.Encode(oKp)
+	require_NoError(t, err)
+	require_NoError(t, f.s.updateAccountWithClaimJWT(f.acc, raw))
+	for _, tc := range []struct {
+		name   string
+		signer nkeys.KeyPair
+		scoped bool
+		block  string
+	}{
+		{"duplicate members", f.account, false, `{"mode":"static","mode":"static"}`},
+		{"nonidentity signer", plain, false, `{"mode":"static"}`},
+		{"scoped signer", f.signer, true, `{"mode":"static"}`},
+		{"malformed extension", f.account, false, `false`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nc, err := nats.Connect(f.s.ClientURL(), f.creds(t, tc.signer, tc.scoped, tc.block, 0), nats.NoReconnect())
+			require_NoError(t, err)
+			defer nc.Close()
+			require_NoError(t, nc.FlushTimeout(time.Second))
+		})
+	}
+	applies, mode, err := f.s.authGrantApplies(&client{kind: CLIENT}, &jwt.UserClaims{}, f.acc, "not a JWT", nil)
+	require_NoError(t, err)
+	require_False(t, applies)
+	require_Equal(t, mode, authModeStatic)
+}
+
+func TestAuthGrantRejectsEmptyScopeRole(t *testing.T) {
+	var calls atomic.Int32
+	f := newGrantFixture(t, &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+		calls.Add(1)
+		return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+	}}, func(_ *jwt.AccountClaims, scope *jwt.UserScope) { scope.Role = "" })
+	nc, err := nats.Connect(f.s.ClientURL(), f.creds(t, f.signer, true, "", 0), nats.NoReconnect())
+	if nc != nil {
+		nc.Close()
+	}
+	require_Error(t, err)
+	require_Equal(t, calls.Load(), int32(0))
+}
+
+func TestAuthGrantDisconnectRejectsStaticClient(t *testing.T) {
+	f := newGrantFixture(t, nil)
+	nc := natsConnect(t, f.s.ClientURL(), f.creds(t, f.account, false, `{"mode":"static"}`, 0), nats.NoReconnect())
+	defer nc.Close()
+	id, err := nc.GetClientID()
+	require_NoError(t, err)
+	require_Equal(t, f.s.DisconnectClient(id, authverify.CodeDenied), ErrNotGrantMode)
+	require_NoError(t, nc.FlushTimeout(time.Second))
+	require_Equal(t, f.s.DisconnectClient(^uint64(0), authverify.CodeDenied), ErrUnknownClient)
+}
+
+func TestAuthGrantDonePanic(t *testing.T) {
+	for _, applied := range []bool{false, true} {
+		t.Run(fmt.Sprint(applied), func(t *testing.T) {
+			calls := make(chan bool, 2)
+			closed := make(chan uint64, 1)
+			reqs := make(chan *authverify.GrantRequest, 1)
+			f := newGrantFixture(t, &testGrantHook{verify: func(r *authverify.GrantRequest) *authverify.GrantVerdict {
+				reqs <- r
+				generation := uint64(1)
+				if !applied {
+					generation = 0
+				}
+				return &authverify.GrantVerdict{Generation: generation, Grant: grantAll(), Done: func(ok bool) {
+					calls <- ok
+					panic("host Done panic")
+				}}
+			}, closed: func(_ string, id uint64) { closed <- id }})
+			_, reader := grantTransportRawConnect(t, f.s, f.creds(t, f.signer, true, "", 0))
+			req := grantRecv(t, reqs)
+			require_Equal(t, grantRecv(t, calls), applied)
+			line, err := reader.ReadString('\n')
+			require_NoError(t, err)
+			require_Equal(t, line, "-ERR 'Authorization Violation'\r\n")
+			reason := AuthenticationViolation
+			if applied {
+				reason = GrantRejected
+				require_Equal(t, grantRecv(t, closed), req.Client.ID)
+			}
+			grantTransportClosedReason(t, f.s, req.Client.ID, reason)
+			select {
+			case <-calls:
+				t.Fatal("Done called twice")
+			default:
+			}
+		})
+	}
+}
+
+func TestAuthGrantClosedPanic(t *testing.T) {
+	reqs := make(chan *authverify.GrantRequest, 1)
+	f := newGrantFixture(t, &testGrantHook{verify: func(r *authverify.GrantRequest) *authverify.GrantVerdict {
+		reqs <- r
+		return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+	}, closed: func(string, uint64) { panic("host Closed panic") }})
+	log := &captureErrorLogger{errCh: make(chan string, 4)}
+	f.s.SetLogger(log, false, false)
+	nc := natsConnect(t, f.s.ClientURL(), f.creds(t, f.signer, true, "", 0), nats.NoReconnect())
+	req := grantRecv(t, reqs)
+	nc.Close()
+	require_Contains(t, grantRecv(t, log.errCh), "host Closed panic")
+	grantTransportClosedReason(t, f.s, req.Client.ID, ClientClosed)
+	require_True(t, f.s.Running())
+}
+
+func TestAuthGrantClosedDuringShutdown(t *testing.T) {
+	closed := make(chan uint64, 2)
+	reqs := make(chan *authverify.GrantRequest, 1)
+	var s *Server
+	f := newGrantFixture(t, &testGrantHook{verify: func(r *authverify.GrantRequest) *authverify.GrantVerdict {
+		reqs <- r
+		return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+	}, closed: func(_ string, id uint64) {
+		if c := s.grantClient(id); c != nil {
+			closed <- 0
+			return
+		}
+		closed <- id
+	}})
+	s = f.s
+	nc := natsConnect(t, s.ClientURL(), f.creds(t, f.signer, true, "", 0), nats.NoReconnect())
+	defer nc.Close()
+	req := grantRecv(t, reqs)
+	finished := make(chan struct{})
+	go func() { s.Shutdown(); close(finished) }()
+	require_Equal(t, grantRecv(t, closed), req.Client.ID)
+	grantRecv(t, finished)
+	select {
+	case <-closed:
+		t.Fatal("duplicate shutdown Closed callback")
+	default:
+	}
+}
+
+func TestAuthGrantModeChangeBeforeAccountRegistration(t *testing.T) {
+	for _, initial := range []authMode{authModeStatic, authModeGrant} {
+		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+			f := newGrantFixture(t, nil)
+			rawAccount, err := f.claims.Encode(oKp)
+			require_NoError(t, err)
+			if initial == authModeStatic {
+				require_NoError(t, f.s.updateAccountWithClaimJWT(f.acc, rawAccount))
+			}
+			conn, err := net.DialTimeout("tcp", f.s.Addr().String(), time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+			require_NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
+			line, err := bufio.NewReader(conn).ReadString('\n')
+			require_NoError(t, err)
+			var info Info
+			require_NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(line, "INFO ")), &info))
+			c := f.s.grantClient(info.CID)
+			require_NotNil(t, c)
+			options := nats.GetDefaultOptions()
+			require_NoError(t, f.creds(t, f.signer, true, "", 0)(&options))
+			rawUser, err := options.UserJWT()
+			require_NoError(t, err)
+			uc, err := jwt.DecodeUserClaims(rawUser)
+			require_NoError(t, err)
+			scope, _, _ := f.acc.issuerScopeAndXPermissions(uc.Issuer)
+			grant, mode, err := f.s.authGrantApplies(c, uc, f.acc, rawUser, scope)
+			require_NoError(t, err)
+			require_Equal(t, mode, initial)
+			for _, existing := range f.acc.getClients() {
+				if existing == c {
+					t.Fatal("client registered before interleaving")
+				}
+			}
+			next := rawAccount
+			if initial == authModeStatic {
+				next = injectJWTAuthMode(t, rawAccount, oKp, `{"mode":"grant"}`)
+			}
+			require_NoError(t, f.s.updateAccountWithClaimJWT(f.acc, next))
+			require_Error(t, c.registerJWTUser(buildInternalNkeyUser(uc, nil, f.acc), grant, mode))
+			grantTransportClosedReason(t, f.s, c.cid, AuthModeChanged)
+		})
+	}
+}
+
+// A grant connection costs no goroutine of its own while it is open. The Closed
+// notification starts its goroutine only when the connection closes.
+func TestAuthGrantNoGoroutinePerConnection(t *testing.T) {
+	f := newGrantFixture(t, &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+		return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+	}})
+	const n = 50
+	settle := func() int {
+		time.Sleep(200 * time.Millisecond)
+		return runtime.NumGoroutine()
+	}
+	grow := func(opt nats.Option) int {
+		t.Helper()
+		base := settle()
+		conns := make([]*nats.Conn, 0, n)
+		for range n {
+			conns = append(conns, natsConnect(t, f.s.ClientURL(), opt, nats.NoReconnect()))
+		}
+		delta := settle() - base
+		for _, nc := range conns {
+			nc.Close()
+		}
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			if nc := f.s.NumClients(); nc != 0 {
+				return fmt.Errorf("%d clients still connected", nc)
+			}
+			return nil
+		})
+		return delta
+	}
+	static := grow(nats.UserCredentials(grantTransportCredentials(t, f, true)))
+	grant := grow(f.creds(t, f.signer, true, "", 0))
+	if grant > static+10 {
+		t.Fatalf("%d grant connections added %d goroutines; %d static connections added %d", n, grant, n, static)
+	}
 }

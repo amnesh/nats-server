@@ -16,6 +16,8 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+
+	"github.com/nats-io/jwt/v2"
 )
 
 type authMode uint8
@@ -70,4 +72,15 @@ func decodeAuthModeJWT(raw string, user bool) (authMode, bool, error) {
 		}
 	}
 	return authModeStatic, true, fmt.Errorf("unsupported authverify mode %q", mode)
+}
+
+func accountClaimsWithGrantMode(claims *jwt.AccountClaims, xp accountXPermissions, raw string) (*jwt.AccountClaims, accountClaimExtensions, string, error) {
+	mode, _, err := decodeAuthModeJWT(raw, false)
+	if err != nil {
+		return nil, accountClaimExtensions{}, _EMPTY_, err
+	}
+	if mode == authModeGrant && claims.HasExternalAuthorization() {
+		return nil, accountClaimExtensions{}, _EMPTY_, ErrAccountValidation
+	}
+	return claims, accountClaimExtensions{xpermissions: xp, authMode: mode}, raw, nil
 }

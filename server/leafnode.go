@@ -2427,7 +2427,6 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 
 	// When a leaf solicits a connection to a hub, the perms that it will use on the soliciting leafnode's
 	// behalf are correct for them, but inside the hub need to be reversed since data is flowing in the opposite direction.
-	// Each perm includes both the standard lists and the token-prefix rules.
 	if !c.isSolicitedLeafNode() && c.perms != nil {
 		sp, pp := c.perms.sub, c.perms.pub
 		c.perms.sub, c.perms.pub = pp, sp
@@ -2549,13 +2548,7 @@ func (s *Server) sendPermsAndAccountInfo(c *client) {
 	info.CID = c.cid
 	info.Import = c.opts.Import
 	info.Export = c.opts.Export
-	if c.authGrant != nil && c.perms != nil {
-		info.Import = grantLeafWirePermission(info.Import, c.perms.pub.prefix)
-		info.Export = grantLeafWirePermission(info.Export, c.perms.sub.prefix)
-		if c.perms.resp != nil {
-			info.Export = &SubjectPermission{Allow: []string{">"}}
-		}
-	}
+	c.setGrantLeafInfoPermissions(info)
 	info.RemoteAccount = c.acc.Name
 	// s.SystemAccount() uses an atomic operation and does not get the server lock, so this is safe.
 	info.IsSystemAccount = c.acc == s.SystemAccount()
@@ -3128,7 +3121,7 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	// If we are a hub check that we can publish to this subject.
 	if checkPerms {
 		subj := string(sub.subject)
-		if !c.leafSubscriptionAllowed(subj) {
+		if subjectIsLiteral(subj) && !c.pubAllowedFullCheck(subj, true, true) {
 			c.mu.Unlock()
 			c.leafSubPermViolation(sub.subject)
 			c.Debugf(fmt.Sprintf("Permissions Violation for Subscription to %q", sub.subject))
@@ -3532,15 +3525,15 @@ func (c *client) leafMsgAllowed() bool {
 	// Service-import replies (_R_), JS ack subjects ($JS.ACK.)
 	// are internal routing subjects forwarded via LS+ without
 	// permission checks.
-	c.mu.RLock()
-	if c.authGrant == nil && (isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck)) {
-		c.mu.RUnlock()
+	if isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck) {
 		return true
 	}
+
+	c.mu.RLock()
 	if c.isSpokeLeafNode() {
 		// Gateway routed replies are forwarded without
 		// permission checks.
-		if (isGW && c.authGrant == nil) || c.leafReceiveAllowed(subjectToCheck) {
+		if isGW || c.leafReceiveAllowed(subjectToCheck) {
 			c.mu.RUnlock()
 			return true
 		}
@@ -3590,7 +3583,7 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 	}
 
 	allowed := true
-	if perms.Allow != nil && (c.authGrant != nil || !strings.HasPrefix(subject, mqttPrefix)) {
+	if perms.Allow != nil && !strings.HasPrefix(subject, mqttPrefix) {
 		allowed = false
 		for _, allowSubj := range perms.Allow {
 			if matchLiteral(subject, allowSubj) {
@@ -3600,7 +3593,7 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 		}
 	}
 
-	if !allowed && c.authGrant != nil && c.perms != nil {
+	if !allowed && c.authGrantMode.Load() {
 		allowed = c.perms.sub.prefix.allows(subject)
 	}
 

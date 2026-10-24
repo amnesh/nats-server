@@ -703,6 +703,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 	var proxyRequired bool
 	var grantMode bool
 	var accountMode authMode
+	var grantScope *jwt.UserScope
 	// Check if we have auth callouts enabled at the server level or in the bound account.
 	defer func() {
 		// Not an auth failure, skip the auth error event and auth callout.
@@ -714,7 +715,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		// narrow its claims. Fails closed. Runs before the auth-callout handling
 		// below so a rejection flows through the normal auth-error event path.
 		if authorized && grantMode {
-			authorized = s.authGrantConnection(c, juc, acc, ujwt, opts.AuthGrant)
+			authorized = s.authGrantConnection(c, juc, acc, ujwt, opts.AuthGrant, grantScope)
 			if !authorized {
 				s.sendAccountAuthErrorEvent(c, c.acc, getAuthErrClosedState(c.getAuthError()).String())
 			}
@@ -1074,14 +1075,16 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 			c.Debugf("Account JWT not signed by trusted operator")
 			return false
 		}
-		if grantMode, accountMode, err = s.authGrantApplies(c, juc, acc, ujwt); err != nil {
+		scope, xp, ok := acc.issuerScopeAndXPermissions(juc.Issuer)
+		if !ok {
+			c.Debugf("User JWT issuer is not known")
+			return false
+		}
+		if grantMode, accountMode, err = s.authGrantApplies(c, juc, acc, ujwt, scope); err != nil {
 			c.Debugf("Auth grant mode rejected connection: %v", err)
 			return false
 		}
-		if scope, xp, ok := acc.issuerScopeAndXPermissions(juc.Issuer); !ok {
-			c.Debugf("User JWT issuer is not known")
-			return false
-		} else if scope != nil {
+		if scope != nil {
 			if err := scope.ValidateScopedSigner(juc); err != nil {
 				c.Debugf("User JWT is not valid: %v", err)
 				return false
@@ -1089,6 +1092,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 				c.Debugf("User JWT is not valid")
 				return false
 			} else if grantMode {
+				grantScope = uSc
 				juc.UserPermissionLimits = uSc.Template
 				juc.Permissions = jwt.Permissions{}
 			} else if juc.UserPermissionLimits, err = processUserPermissionsTemplate(uSc.Template, xp, juc, acc); err != nil {
@@ -1182,20 +1186,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 
 		nkey = buildInternalNkeyUser(juc, allowedConnTypes, acc)
-		if grantMode {
-			err = c.registerGrantUser(nkey)
-		} else {
-			err = c.RegisterNkeyUser(nkey)
-		}
-		if err != nil {
-			return false
-		}
-
-		acc.mu.RLock()
-		modeChanged := acc.authMode != accountMode
-		acc.mu.RUnlock()
-		if modeChanged {
-			c.closeConnection(AuthModeChanged)
+		if err = c.registerJWTUser(nkey, grantMode, accountMode); err != nil {
 			return false
 		}
 

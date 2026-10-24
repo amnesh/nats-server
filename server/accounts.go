@@ -3417,7 +3417,7 @@ func (a *Account) isClaimAccount() bool {
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
-	s.updateAccountClaimsWithRefresh(a, ac, accountClaimExtensions{}, true)
+	s.updateAccountClaims(a, ac, nil, true)
 }
 
 func (a *Account) traceLabel() string {
@@ -3494,12 +3494,23 @@ func (a *Account) isAllowedAcount(acc string) bool {
 // This will replace any exports or imports previously defined.
 // Lock MUST NOT be held upon entry.
 func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaims, extensions accountClaimExtensions, refreshImportingAccounts bool) {
+	s.updateAccountClaims(a, ac, &extensions, refreshImportingAccounts)
+}
+
+func (s *Server) updateAccountClaims(a *Account, ac *jwt.AccountClaims, extensions *accountClaimExtensions, refreshImportingAccounts bool) {
 	if a == nil {
 		return
 	}
 	// Rebuilding the exports below empties them, so must not overlap with the
 	// checks at the end that mark imports of other accounts invalid.
 	a.cmu.Lock()
+	if extensions == nil {
+		// Typed claims cannot carry the raw extensions. Retain their current
+		// values while serialized with other account claim updates.
+		a.mu.RLock()
+		extensions = &accountClaimExtensions{xpermissions: a.xpermissions, authMode: a.authMode}
+		a.mu.RUnlock()
+	}
 	s.Debugf("Updating account claims: %s/%s", a.Name, ac.Name)
 	a.checkExpiration(ac.Claims())
 
@@ -3995,7 +4006,9 @@ func (s *Server) updateAccountClaimsWithRefresh(a *Account, ac *jwt.AccountClaim
 
 	if old.authMode != extensions.authMode {
 		for _, c := range clients {
-			c.closeConnection(AuthModeChanged)
+			if !isInternalClient(c.kind) {
+				c.closeConnection(AuthModeChanged)
+			}
 		}
 		clients = nil
 	}
