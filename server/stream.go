@@ -3954,6 +3954,7 @@ func (mset *stream) setupMirrorConsumer() error {
 		return subject
 	}
 	subject := generateSubject()
+	want := req.Config.DeliverSubject
 
 	// Reset
 	mirror.msgs = nil
@@ -4093,22 +4094,27 @@ func (mset *stream) setupMirrorConsumer() error {
 			// Create a new queue each time
 			mirror.msgs = newIPQueue[*inMsg](mset.srv, qname)
 			msgs := mirror.msgs
+			var sub *subscription
+			var err error
 			if durableDeliverSubject != _EMPTY_ {
 				deliverSubject = durableDeliverSubject
 			} else {
 				deliverSubject = ccr.ConsumerInfo.Config.DeliverSubject
+				err = mset.srv.checkSourceDeliverSubject(want, deliverSubject)
 			}
-			sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
-				hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
-				if len(hdr) > 0 {
-					// Remove any Nats-Expected- headers as we don't want to validate them.
-					hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
-					// Remove any Nats-Batch- headers, batching is not supported when mirroring.
-					hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Batch-")
-				}
-				mset.queueInbound(msgs, subject, reply, hdr, msg, nil, nil)
-				mirror.last.Store(time.Now().UnixNano())
-			})
+			if err == nil {
+				sub, err = mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+					hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
+					if len(hdr) > 0 {
+						// Remove any Nats-Expected- headers as we don't want to validate them.
+						hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Expected-")
+						// Remove any Nats-Batch- headers, batching is not supported when mirroring.
+						hdr = removeHeaderIfPrefixPresent(hdr, "Nats-Batch-")
+					}
+					mset.queueInbound(msgs, subject, reply, hdr, msg, nil, nil)
+					mirror.last.Store(time.Now().UnixNano())
+				})
+			}
 			if err != nil {
 				mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
 				retry = true
@@ -4465,6 +4471,7 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 		return subject
 	}
 	subject := generateSubject()
+	want := req.Config.DeliverSubject
 
 	// Reset
 	si.msgs = nil
@@ -4626,6 +4633,20 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 					return
 				}
 
+				if durableDeliverSubject != _EMPTY_ {
+					deliverSubject = durableDeliverSubject
+				} else {
+					deliverSubject = ccr.ConsumerInfo.Config.DeliverSubject
+					// Reject before the response can change source progress or start its worker.
+					if err := mset.srv.checkSourceDeliverSubject(want, deliverSubject); err != nil {
+						mset.unsubscribe(crSub)
+						si.err = NewJSSourceConsumerSetupFailedError(err, Unless(err))
+						retry = true
+						mset.mu.Unlock()
+						return
+					}
+				}
+
 				// We can now unsubscribe.
 				mset.unsubscribe(crSub)
 
@@ -4666,11 +4687,6 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 				si.last.Store(time.Now().UnixNano())
 
 				msgs := mset.smsgs
-				if durableDeliverSubject != _EMPTY_ {
-					deliverSubject = durableDeliverSubject
-				} else {
-					deliverSubject = ccr.ConsumerInfo.Config.DeliverSubject
-				}
 				sub, err := mset.subscribeInternal(deliverSubject, func(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
 					hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
 					mset.queueInbound(msgs, subject, reply, hdr, msg, si, nil)
@@ -9481,6 +9497,10 @@ const snapsDir = "__snapshots__"
 
 // RestoreStream will restore a stream from a snapshot.
 func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error) {
+	return a.restoreStream(ncfg, r, nil)
+}
+
+func (a *Account) restoreStream(ncfg *StreamConfig, r io.Reader, g *restoreInboxGate) (*stream, error) {
 	if ncfg == nil {
 		return nil, errors.New("nil config on stream restore")
 	}
@@ -9497,6 +9517,11 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	cfg, apiErr := s.checkStreamCfg(ncfg, a, false)
 	if apiErr != nil {
 		return nil, apiErr
+	}
+	if g != nil {
+		if err := js.checkRestoredInboxCapture(*g, &cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	sd := filepath.Join(jsa.storeDir, snapsDir)
@@ -9592,6 +9617,15 @@ func (a *Account) RestoreStream(ncfg *StreamConfig, r io.Reader) (*stream, error
 	// Check to make sure names match.
 	if fcfg.Name != cfg.Name {
 		return nil, errors.New("stream names do not match")
+	}
+	if g != nil && js.rejectInboxCapture && !g.exempt {
+		final, apiErr := s.checkStreamCfg(&fcfg.StreamConfig, a, false)
+		if apiErr != nil {
+			return nil, apiErr
+		}
+		if err := js.checkRestoredInboxCapture(*g, &final); err != nil {
+			return nil, err
+		}
 	}
 
 	// See if this stream already exists.

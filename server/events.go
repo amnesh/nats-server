@@ -330,6 +330,9 @@ type ClientInfo struct {
 	MQTTClient string        `json:"client_id,omitempty"` // This is the MQTT client ID
 	Nonce      string        `json:"nonce,omitempty"`
 	Reply      string        `json:"reply,omitempty"` // Original reply subject after a service import (only when needed).
+
+	// Verified first system-import origin, never caller authority.
+	InProcessUnrestricted bool `json:"iproc_unrestricted,omitempty"`
 }
 
 // forAssignmentSnap returns the minimum amount of ClientInfo we need for assignment snapshots.
@@ -349,6 +352,7 @@ func (ci *ClientInfo) forProposal() *ClientInfo {
 	cci := *ci
 	cci.Jwt = _EMPTY_
 	cci.IssuerKey = _EMPTY_
+	cci.InProcessUnrestricted = false
 	return &cci
 }
 
@@ -360,6 +364,7 @@ func (ci *ClientInfo) forAdvisory() *ClientInfo {
 	cci := *ci
 	cci.Jwt = _EMPTY_
 	cci.Alternates = nil
+	cci.InProcessUnrestricted = false
 	return &cci
 }
 

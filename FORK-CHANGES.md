@@ -24,6 +24,7 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 7 | `Account.SetJetStreamLimits` (JetStream limits for accounts built in code) | programmatic | `server/account_jslimits.go` | — |
 | 8 | Grant mode | operator-signed account JWT `nats.authverify.mode: "grant"` and programmatic `Options.AuthGrant` | `server/authverify/grant.go`, `server/auth_grant*.go` | `server/accounts.go`, `server/auth.go`, `server/client.go`, `server/leafnode.go`, `server/monitor.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
+| 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
 
 Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8.
 
@@ -1224,3 +1225,41 @@ records the policy and tests.
 ```sh
 go test -race ./server -run 'TestJetStreamSubjectRollupOnly' -count=1
 ```
+
+
+# 10. Native inbox capture policy
+
+`FeatureFlagJsRejectInboxCapture` names `js_reject_inbox_capture`. Its default is false.
+When enabled, ordinary stream create, update, and restore requests receive API error 10052 if the normalized config captures `_INBOX.>`.
+The policy checks stream subjects, source and mirror external delivery prefixes, and declared source and mirror consumer delivery subjects.
+
+```text
+feature_flags {
+  js_reject_inbox_capture: true
+}
+```
+
+The exemption requires both authenticated IN_PROCESS origin and unrestricted current authority.
+The first system-account import stamps the proof. CLIENT and LEAF ingress clear caller-supplied proof.
+Route and gateway transit preserve verified metadata. Chained imports, proposals, advisories, and assignment snapshots do not carry the proof.
+Enable enforcement only after every peer supports this sanitation.
+Enable the flag on every peer and every origin that accepts ordinary stream-manager credentials.
+
+Restore freezes the exemption and normalized admitted config before cluster proposal.
+The assignment retains a separate restore-only bit. Legacy and V2 transfer completion checks run before the stream accepts messages.
+A source or mirror consumer response must retain the server's requested delivery subject before it creates internal subscription interest. Source setup validates the response before it starts the shared worker or changes source identity and sequence state. A rejected high-sequence response cannot suppress genuine messages after a valid retry.
+A mismatch uses the existing ConsumerSetupFailed error and retry path.
+
+JetStream captures the policy flag at startup. A flag change requires restart.
+Request-free recovery and apply remain unchanged, including streams admitted before enforcement.
+Plain outgoing consumers, KV and object creation, and trusted declared delivery configs keep their existing behavior.
+
+The [native inbox capture design](docs/superpowers/specs/2026-10-31-inbox-capture-policy-design.md) records provenance, field coverage, restore state, exclusions, and proof requirements.
+The dedicated `server/jetstream_inbox_capture*_test.go` tests cover standalone and clustered admission, memory and file storage, spoof protection, final restore checks, response equality, and restart and leader controls.
+
+```sh
+rtk proxy env GOWORK=off GOFLAGS='-p=2 -buildvcs=false' GOMAXPROCS=4 GOCACHE=/work/.gotmp/ncdl-fork-buildcache-20261026 go test ./server -run 'Test.*InboxCapture' -count=1
+```
+
+The owner publishes the tested clean commit as `v2.15.3-amnesh.1` on upstream base `v2.15.2`.
+The existing `v2.15.2` tag stays at its current commit.

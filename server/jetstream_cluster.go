@@ -478,15 +478,16 @@ func (rg *raftGroup) withRetentionChange(osa *streamAssignment, newRetention Ret
 
 // streamAssignment is what the meta controller uses to assign streams to peers.
 type streamAssignment struct {
-	Client     *ClientInfo     `json:"client,omitempty"`
-	Created    time.Time       `json:"created"`
-	ConfigJSON json.RawMessage `json:"stream"`
-	Config     *StreamConfig   `json:"-"`
-	Group      *raftGroup      `json:"group"`
-	Sync       string          `json:"sync"`
-	Subject    string          `json:"subject,omitempty"`
-	Reply      string          `json:"reply,omitempty"`
-	Restore    *StreamState    `json:"restore_state,omitempty"`
+	Client             *ClientInfo     `json:"client,omitempty"`
+	Created            time.Time       `json:"created"`
+	ConfigJSON         json.RawMessage `json:"stream"`
+	Config             *StreamConfig   `json:"-"`
+	Group              *raftGroup      `json:"group"`
+	Sync               string          `json:"sync"`
+	Subject            string          `json:"subject,omitempty"`
+	Reply              string          `json:"reply,omitempty"`
+	Restore            *StreamState    `json:"restore_state,omitempty"`
+	RestoreInboxExempt bool            `json:"restore_inbox_exempt,omitempty"`
 	// Internal
 	consumers   map[string]*consumerAssignment
 	responded   atomic.Bool // copied via clone() to satisfy go vet's noCopy check
@@ -517,22 +518,23 @@ func (sa *streamAssignment) clearResponded() {
 // responded via markResponded/clearResponded without holding js.mu.
 func (sa *streamAssignment) clone() *streamAssignment {
 	csa := &streamAssignment{
-		Client:      sa.Client,
-		Created:     sa.Created,
-		ConfigJSON:  sa.ConfigJSON,
-		Config:      sa.Config,
-		Group:       sa.Group,
-		Sync:        sa.Sync,
-		Subject:     sa.Subject,
-		Reply:       sa.Reply,
-		Restore:     sa.Restore,
-		consumers:   sa.consumers,
-		recovering:  sa.recovering,
-		catchup:     sa.catchup,
-		reassigning: sa.reassigning,
-		resetting:   sa.resetting,
-		err:         sa.err,
-		unsupported: sa.unsupported,
+		Client:             sa.Client,
+		Created:            sa.Created,
+		ConfigJSON:         sa.ConfigJSON,
+		Config:             sa.Config,
+		Group:              sa.Group,
+		Sync:               sa.Sync,
+		Subject:            sa.Subject,
+		Reply:              sa.Reply,
+		Restore:            sa.Restore,
+		RestoreInboxExempt: sa.RestoreInboxExempt,
+		consumers:          sa.consumers,
+		recovering:         sa.recovering,
+		catchup:            sa.catchup,
+		reassigning:        sa.reassigning,
+		resetting:          sa.resetting,
+		err:                sa.err,
+		unsupported:        sa.unsupported,
 	}
 	csa.responded.Store(sa.responded.Load())
 	return csa
@@ -3024,6 +3026,7 @@ func (js *jetStream) setStreamAssignmentRecovering(sa *streamAssignment) {
 	sa.markResponded()
 	sa.recovering = true
 	sa.Restore = nil
+	sa.RestoreInboxExempt = false
 	if sa.Group != nil {
 		sa.Group.Preferred = _EMPTY_
 		// Must be preserved while a migration is inflight, so peers that create
@@ -4320,6 +4323,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 	isLeader := cc.isStreamLeader(sa.Client.serviceAccount(), sa.Config.Name)
 	var leaderTerm uint64
 	isRestore := sa.Restore != nil
+	var restoreGate restoreInboxGate
+	if isRestore {
+		restoreGate = restoreInboxGateFromAssignment(sa)
+	}
 	js.mu.RUnlock()
 
 	acc, err := s.LookupAccount(sa.Client.serviceAccount())
@@ -4746,7 +4753,7 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				}
 				if isRestore {
 					acc, _ := s.LookupAccount(sa.Client.serviceAccount())
-					restoreDoneCh = s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_)
+					restoreDoneCh = s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_, restoreGate)
 					continue
 				} else if n != nil && n.NeedSnapshot() {
 					doSnapshot(false)
@@ -4889,7 +4896,10 @@ func (js *jetStream) monitorStream(mset *stream, sa *streamAssignment, sendSnaps
 				s.Debugf("Stream restore failed: %v", err)
 			}
 			isRestore = false
+			js.mu.Lock()
 			sa.Restore = nil
+			sa.RestoreInboxExempt = false
+			js.mu.Unlock()
 			// If we were successful lookup up our stream now.
 			if err == nil {
 				if mset, err = acc.lookupStream(sa.Config.Name); mset != nil {
@@ -6915,6 +6925,10 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 	newCfg := sa.Config.atDesiredOrigin(rg)
 	storage := sa.Config.Storage
 	restore := sa.Restore
+	var restoreGate restoreInboxGate
+	if restore != nil {
+		restoreGate = restoreInboxGateFromAssignment(sa)
+	}
 	raftRecovering := sa.recovering || sa.catchup
 	hadErr := sa.err != nil
 	js.mu.RUnlock()
@@ -6935,6 +6949,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 		} else {
 			js.mu.Lock()
 			sa.Restore = nil
+			sa.RestoreInboxExempt = false
 			js.mu.Unlock()
 		}
 	}
@@ -7107,7 +7122,7 @@ func (js *jetStream) processClusterCreateStream(acc *Account, sa *streamAssignme
 		// If we are restoring, process that first.
 		if sa.Restore != nil {
 			// We are restoring a stream here.
-			restoreDoneCh := s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_)
+			restoreDoneCh := s.processStreamRestore(sa.Client, acc, sa.Config, _EMPTY_, sa.Reply, _EMPTY_, restoreGate)
 			s.startGoRoutine(func() {
 				defer s.grWG.Done()
 				select {
@@ -11579,7 +11594,7 @@ func (s *Server) jsClusteredStreamRestoreRequest(
 	ci *ClientInfo,
 	acc *Account,
 	req *JSApiStreamRestoreRequest,
-	subject, reply string, rmsg []byte) {
+	subject, reply string, rmsg []byte, g restoreInboxGate) {
 
 	js, cc := s.getJetStreamCluster()
 	if js == nil || cc == nil {
@@ -11588,13 +11603,7 @@ func (s *Server) jsClusteredStreamRestoreRequest(
 
 	resp := JSApiStreamRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRestoreResponseType}}
 
-	// check stream config at the start of the restore process, not at the end
-	cfg, apiErr := s.checkStreamCfg(&req.Config, acc, false)
-	if apiErr != nil {
-		resp.Error = apiErr
-		s.sendAPIErrResponse(ci, acc, subject, reply, string(rmsg), s.jsonResponse(&resp))
-		return
-	}
+	cfg := req.Config
 
 	js.mu.Lock()
 	defer js.mu.Unlock()
@@ -11627,6 +11636,7 @@ func (s *Server) jsClusteredStreamRestoreRequest(
 	sa := &streamAssignment{Group: rg, Sync: syncSubjForStream(), Config: &cfg, Subject: subject, Reply: reply, Client: ci, Created: time.Now().UTC()}
 	// Now add in our restore state and pre-select a peer to handle the actual receipt of the snapshot.
 	sa.Restore = &req.State
+	sa.RestoreInboxExempt = g.exempt
 	// Set ScaleUp to prevent other members from winning the initial election.
 	// The preferred node clears its ScaleUp state through CampaignImmediately
 	// in createRaftGroup.

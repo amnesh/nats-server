@@ -258,7 +258,11 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 }
 
 // RestoreStreamSnapshotV2 will restore a stream from a snapshot.
-func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (retMset *stream, retErr error) {
+func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (*stream, error) {
+	return a.restoreStreamV2(ncfg, r, nil)
+}
+
+func (a *Account) restoreStreamV2(ncfg *StreamConfig, r io.Reader, g *restoreInboxGate) (retMset *stream, retErr error) {
 	dec := s2.NewReader(r)
 	tr := archive.NewReader(dec)
 
@@ -308,6 +312,12 @@ func (a *Account) RestoreStreamV2(ncfg *StreamConfig, r io.Reader) (retMset *str
 	cfg, apiErr := s.checkStreamCfg(ncfg, a, false)
 	if apiErr != nil {
 		return nil, apiErr
+	}
+
+	if g != nil {
+		if err := js.checkRestoredInboxCapture(*g, &cfg); err != nil {
+			return nil, err
+		}
 	}
 
 	_, isClustered := jsa.jetStreamAndClustered()

@@ -3426,6 +3426,7 @@ func (c *client) processLeafMsgArgs(arg []byte) error {
 
 // processInboundLeafMsg is called to process an inbound msg from a leaf node.
 func (c *client) processInboundLeafMsg(msg []byte) {
+	msg = c.clearForwardedOriginMarker(msg)
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
 	c.in.msgs++

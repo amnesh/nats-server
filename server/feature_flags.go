@@ -20,14 +20,19 @@ import (
 )
 
 const (
-	FeatureFlagJsAckFormatV2       = "js_ack_fc_v2"
-	FeatureFlagJsAPIReplyFormatV2  = "js_api_reply_v2"
-	FeatureFlagJsRaftDeleteRange   = "js_raft_delete_range"
-	FeatureFlagJsSnapshotSources   = "js_snapshot_sources"
-	FeatureFlagJsSubjectRollupOnly = "js_subject_rollup_only"
+	FeatureFlagJsAckFormatV2        = "js_ack_fc_v2"
+	FeatureFlagJsAPIReplyFormatV2   = "js_api_reply_v2"
+	FeatureFlagJsRaftDeleteRange    = "js_raft_delete_range"
+	FeatureFlagJsSnapshotSources    = "js_snapshot_sources"
+	FeatureFlagJsSubjectRollupOnly  = "js_subject_rollup_only"
+	FeatureFlagJsRejectInboxCapture = "js_reject_inbox_capture"
 )
 
 var featureFlags = map[string]bool{
+	// Reject inbox-capturing stream configuration from ordinary origins.
+	// Enable only after every peer clears forwarded origin markers. Changes require restart.
+	FeatureFlagJsRejectInboxCapture: false,
+
 	// Keep client rollup limited to the publication subject. Stream purge
 	// through the API retains its existing permissions. Changes require restart.
 	FeatureFlagJsSubjectRollupOnly: false,

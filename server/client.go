@@ -4474,6 +4474,7 @@ var clientNRGPrefix = []byte("$NRG.")
 // Return if the message was delivered, and if the message was not delivered
 // due to a permission issue.
 func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
+	msg = c.clearForwardedOriginMarker(msg)
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.
 	c.in.msgs++
@@ -5117,6 +5118,7 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			}
 		} else if hadPrevSi && cis != nil {
 			ci = cis
+			ci.InProcessUnrestricted = false
 			ci.Service = acc.Name
 			// Check if we are moving into a share details account from a non-shared
 			// and add in server and cluster details.
@@ -5125,6 +5127,9 @@ func (c *client) processServiceImport(si *serviceImport, acc *Account, msg []byt
 			}
 		} else if c.kind != LEAF || c.pa.hdr < 0 || len(sliceHeader(ClientInfoHdr, msg[:c.pa.hdr])) == 0 {
 			ci = c.getClientInfo(share)
+			if ci != nil && isSysImport && !hadPrevSi {
+				ci.InProcessUnrestricted = c.inProcessUnrestricted()
+			}
 			// Fast batch requires knowledge of the original reply subject.
 			if bytes.HasSuffix(c.pa.reply, []byte(FastBatchSuffix)) {
 				ci.Reply = bytesToString(c.pa.reply)

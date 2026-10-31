@@ -1615,6 +1615,17 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 		return
 	}
 
+	// Check effective subjects before limits, proposals, or storage.
+	normalized, apiErr := s.checkStreamCfg(&cfg.StreamConfig, acc, cfg.Pedantic)
+	if apiErr == nil {
+		apiErr = s.checkStreamInboxCapture(ci, &normalized)
+	}
+	if apiErr != nil {
+		resp.Error = apiErr
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
 	// Hand off to cluster for processing.
 	if s.JetStreamIsClustered() {
 		s.jsClusteredStreamRequest(ci, acc, subject, reply, rmsg, &cfg)
@@ -1711,6 +1722,12 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, _ *Account,
 	streamName := streamNameFromSubject(subject)
 	if streamName != cfg.Name {
 		resp.Error = NewJSStreamMismatchError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	if apiErr := s.checkStreamInboxCapture(ci, &cfg); apiErr != nil {
+		resp.Error = apiErr
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
@@ -4403,16 +4420,24 @@ func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, _ *Account
 		return
 	}
 
-	if s.JetStreamIsClustered() {
-		s.jsClusteredStreamRestoreRequest(ci, acc, &req, subject, reply, rmsg)
-		return
-	}
-
 	// check stream config at the start of the restore process, not at the end
 	cfg, apiErr := s.checkStreamCfg(&req.Config, acc, false)
 	if apiErr != nil {
 		resp.Error = apiErr
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	g, apiErr := s.newRestoreInboxGate(ci, &cfg)
+	if apiErr != nil {
+		resp.Error = apiErr
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	if s.JetStreamIsClustered() {
+		req.Config = cfg
+		s.jsClusteredStreamRestoreRequest(ci, acc, &req, subject, reply, rmsg, g)
 		return
 	}
 
@@ -4436,10 +4461,10 @@ func (s *Server) jsStreamRestoreRequest(sub *subscription, c *client, _ *Account
 		return
 	}
 
-	s.processStreamRestore(ci, acc, &cfg, subject, reply, string(msg))
+	s.processStreamRestore(ci, acc, &cfg, subject, reply, string(msg), g)
 }
 
-func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamConfig, subject, reply, msg string) <-chan error {
+func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamConfig, subject, reply, msg string, g restoreInboxGate) <-chan error {
 	var resp = JSApiStreamRestoreResponse{ApiResponse: ApiResponse{Type: JSApiStreamRestoreResponseType}}
 
 	streamName := cfg.Name
@@ -4509,9 +4534,9 @@ func (s *Server) processStreamRestore(ci *ClientInfo, acc *Account, cfg *StreamC
 		} else if err == nil {
 			replay := io.MultiReader(&consumed, pr)
 			if bytes.Equal(preamble[:], []byte(archive.MagicBytes)) {
-				mset, err = acc.RestoreStreamV2(cfg, replay)
+				mset, err = acc.restoreStreamV2(cfg, replay, &g)
 			} else {
-				mset, err = acc.RestoreStream(cfg, replay)
+				mset, err = acc.restoreStream(cfg, replay, &g)
 			}
 		}
 		restoreFinished.Store(true)
