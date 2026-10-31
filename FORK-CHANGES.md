@@ -182,9 +182,14 @@ non-escalating:
 |---|---|
 | Expiration | effective = **sooner** of (JWT exp, override exp); `0` = "no change" |
 | Pub/Sub **deny** | **union** (override denies are added) — always narrows |
-| Pub/Sub **allow** | **intersection** — only subjects within *both* the JWT-allow and the override-allow survive. A disjoint override keeps the base allow (an empty allow list would mean "allow all", which would be an escalation). |
+| Pub/Sub **allow** | exact **intersection** — only subjects (and queues) allowed by *both* the base allow and the override allow survive; e.g. `foo.*.bar` ∩ `foo.baz.*` = `foo.baz.bar`. Only a token that is exactly `*` or `>` is a wildcard (`*bar` is a literal). If nothing is in both, the result is **deny all** (`deny: [">"]`), because an empty allow list would mean "allow all". |
 | Response `max` / numeric limits | effective = **smaller** (`-1` = unlimited) |
 | Response `ttl` | effective = **shorter** |
+
+The base is the permissions **in effect** for the user: the user JWT permissions,
+or the account default permissions when the user JWT has none. With a response
+permission and no publish allow list, the user can publish only replies, and an
+override allow cannot add publish subjects.
 
 A compromised verification service therefore cannot widen any user — worst case it
 over-restricts or rejects. Identity fields in the response are ignored entirely.
@@ -260,21 +265,22 @@ Operational notes:
 ## 1.11 Code map & tests
 
 - `server/authverify/authverify.go` — the narrowing engine (`NarrowPermissions`,
-  `NarrowExpiry`, `NarrowCount`) on `jwt` types; never imports `server` (carries a
-  vendored copy of the subject subset-match).
+  `NarrowExpiry`, `NarrowCount`) on `jwt` types, with its own exact subject
+  intersection; never imports `server`.
 - `server/authverify/req.go` — wire types (`AuthVerifyRequest`,
   `AuthVerifyResponse`), constants, `ParseAuthVerifyResponse`.
 - `server/auth_verification.go` — config gating (`AuthVerifyInScope`,
   `authVerificationApplies`), the SYS transport (`processAuthVerification`),
   request building (`buildAuthVerifyRequest`, `clientTLSInfo`), and override
-  application (`applyAuthVerifyOverride`).
+  application (`applyAuthVerifyOverride`, `effectiveJWTPermissions`).
 - `server/opts.go` — `Options.AuthVerification bool` + the `auth_verification`
   config key.
 - `server/auth.go` — one hook in the `processClientOrLeafAuthentication` deferred
   block.
 - Tests: `server/authverify/*_test.go` (narrowing engine, escalation regression,
   capstone) and `server/auth_verification_test.go` (scope, config, response parse,
-  and operator-mode integration: admit / reject / narrow / fail-closed-on-timeout).
+  and operator-mode integration: admit / reject / narrow / account default
+  permissions kept / fail-closed-on-timeout).
 
 ---
 
