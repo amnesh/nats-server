@@ -1571,6 +1571,7 @@ func (s *Server) reloadOptions(curOpts, newOpts *Options) error {
 	// Apply to the new options some of the options that may have been set
 	// that can't be configured in the config file (this can happen in
 	// applications starting NATS Server programmatically).
+	newOpts.AuthGrant = curOpts.AuthGrant
 	newOpts.CustomClientAuthentication = curOpts.CustomClientAuthentication
 	newOpts.CustomRouterAuthentication = curOpts.CustomRouterAuthentication
 	// Programmatic-only hooks (cannot be expressed in the config file). Carry
@@ -1677,6 +1678,9 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// options have operators, we don't do the trusted keys comparison, so
 			// we can fail with the "not supported for TrustedOperators" config reload
 			// error instead of TrustedKeys (that the user would not have set).
+			continue
+		}
+		if optName == "authgrant" {
 			continue
 		}
 		var (

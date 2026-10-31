@@ -22,8 +22,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation`. Optional: `leafnodes { sync_consumers_check_interval: "250ms" }` (off by default, hot-reloadable) | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go`, `server/leafnode_synccheck.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go`, `server/opts.go`, `server/reload.go` |
 | 6 | Leafnode `SignatureCB` kept across reload | programmatic (`RemoteLeafOpts.SignatureCB`) | — | `server/reload.go` |
 | 7 | `Account.SetJetStreamLimits` (JetStream limits for accounts built in code) | programmatic | `server/account_jslimits.go` | — |
+| 8 | Grant mode | operator-signed account JWT `nats.authverify.mode: "grant"` and programmatic `Options.AuthGrant` | `server/authverify/grant.go`, `server/auth_grant*.go` | `server/accounts.go`, `server/auth.go`, `server/client.go`, `server/leafnode.go`, `server/monitor.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8.
 
 ---
 
@@ -1048,6 +1049,141 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
   ```sh
   # Features 1, 2, 4, 5, 6 and 7
-  go test -run 'AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits' \
+  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits' \
       ./server ./server/authverify ./test -count=1
   ```
+
+
+# 8. Grant mode (in-process authorization hook)
+
+Grant mode lets an embedding host supply a connection's complete permissions after
+NATS verifies its JWT identity. It is off by default. The operator-signed account
+JWT selects the mode, and linked Go code implements `authverify.GrantHook` through
+`Options.AuthGrant`. There is no config-file key or network grant service.
+
+```json
+"nats": { "authverify": { "mode": "grant" } }
+```
+
+An absent block or `"mode": "static"` retains normal JWT authorization. Unknown
+fields, types, and modes reject the claims. Grant mode cannot coexist with an
+account auth callout. A mode change closes non-internal account connections with
+`AuthModeChanged`. JetStream, account, and system internal clients remain active.
+Admission rechecks the mode after account registration so a connection cannot miss a concurrent mode-change disconnect.
+
+A user signed by the account identity key can opt into static authorization:
+
+```json
+"nats": { "authverify": { "mode": "static" } }
+```
+
+In a grant-mode account, the user block is invalid for any other signer. In a static
+account, the server ignores the user block without parsing it. All other grant-mode
+users must use a scoped signing key with a non-empty role. The hook receives its role,
+verified identity, server, client, CONNECT, and TLS information. CLIENT connections, including in-process
+connections, and LEAF connections participate. The system account is excluded.
+Static users retain the existing `auth_verification` behavior and scope rules.
+
+## 8.1 Hook and permission rules
+
+`Verify(*authverify.GrantRequest) *authverify.GrantVerdict` runs synchronously and
+must not block or perform I/O. A missing hook, panic, nil verdict, zero generation,
+invalid grant, or missing admit `Done` callback rejects admission. An admit's
+`Done(bool)` runs exactly once. `true` means the grant reached the authentication
+admission point under the client lock. A concurrent close after that point is an
+admitted close. `Closed(serverID, clientID)` runs asynchronously after `Done(true)`
+returns and teardown removes the connection from server maps. Host callbacks run
+without server or client locks held by the calling goroutine. The server recovers
+and logs panics in `Done` and `Closed`. A panic in `Done(true)` closes the connection
+with `GrantRejected`. A Closed notification starts a short tracked goroutine at
+close time, so an open grant connection costs no goroutine. During shutdown the
+server calls the host directly, so shutdown cannot discard the notification. That
+call can run on the goroutine that called `Server.Shutdown`, so a host must not
+hold a lock that its `Closed` takes while it calls `Shutdown`. Host callbacks must
+not block.
+
+`Grant` contains `Pub`, `Sub`, and optional `Resp`. Each direction has standard
+`Allow` and `Deny` subject lists and token-prefix `AllowPrefix` rules. Empty allows
+grant nothing. The hook replaces JWT, scoped-template, xpermissions, and account
+default permissions. Identity validation, source and time restrictions, transport
+restrictions, bearer policy, proxy requirements, and account limits still apply.
+The earlier of JWT expiry and a nonzero grant expiry ends the connection.
+Grant expiry uses its own timer, so updating a grant cannot strand CONNECT waiting
+for a canceled authentication timeout.
+Response permission defaults match normal JWT response permissions.
+
+A prefix token such as `device-*` matches `device-123`, but not `device-`.
+A rule must contain at least one prefix token. Other tokens use standard subject
+syntax. For example, `$KV.device-*.>` permits a subscription to `$KV.device-123.>`
+but not `$KV.*.>`. The subscription's entire subject space must fit a rule.
+Standard denies still apply. Each subject or prefix list permits at most 4096
+entries. Invalid entries reject the complete grant.
+
+Accepted leaves reverse publish and subscribe rules with their standard lists.
+Leaf INFO advertises standard wildcard supersets of prefix rules because the
+upstream wire format cannot express token prefixes. The hub enforces the exact
+grant on actual messages. Leaf interest follows the standard lists and prefix
+rules, with denies applied, even when response permissions are enabled. Response
+routing may advertise an export superset with the configured denies retained.
+The hub forwards exact reply interest only after delivering a request that permits
+that response. Hub interest advertisement uses intersection matching, so a broad
+hub subscription still receives allowed leaf publications. Grant connections have
+no built-in exception for MQTT, service replies, JetStream acknowledgements, or
+gateway-routed replies; each needs a grant. Non-grant connections keep the
+upstream exceptions. Since v2.15.2, upstream has no MQTT exception for leaf
+connections, so a leaf without a grant also needs explicit `$MQTT.`
+permissions. Leaf wildcard interest retains upstream admission
+rules, while every actual delivery still passes the grant checks.
+
+## 8.2 Live replacement and planned close
+
+`Server.UpdateClientGrant(authverify.GrantUpdate)` requires the client ID, account
+public key, user nkey, and a generation greater than the installed generation.
+It replaces CLIENT permissions, clears the publish permission cache, removes
+unauthorized subscriptions with permission errors, and preserves reply tracking
+when response permissions are unchanged. Expiry can be extended only within the
+JWT limit. Reload retains the installed grant without another `Verify` call.
+
+A LEAF update closes the connection with `AuthorizationChanged`; reconnect runs
+`Verify` again. An invalid update closes with `GrantRejected` and returns
+`ErrGrantRejected`. Other errors are `ErrUnknownClient`, `ErrNotGrantMode`, and
+`ErrStaleGeneration`. Account or user mismatch returns `ErrUnknownClient`.
+
+`Server.UpdateAccountClaims` preserves the current account auth mode and
+`xpermissions`, because typed claims cannot express these raw JWT extensions.
+Raw signed JWT updates can replace them.
+
+`Server.DisconnectClient(id, code)` acts only on grant connections. It returns
+`ErrNotGrantMode` for a non-grant connection and `ErrUnknownClient` for an unknown
+ID. It accepts either reject code:
+
+| Code | Wire error | Planned-close reason |
+|---|---|---|
+| `CodeDenied` | `Authorization Violation` | `GrantRejected` |
+| `CodeResourceLimit` | `maximum connections exceeded` | `ResourceLimit` |
+
+Admission denial uses `AuthenticationViolation` for `CodeDenied`. Resource-limit
+admission uses `ResourceLimit`. Hook rejection reasons appear only in server logs.
+Both APIs can run from any goroutine. A caller must not hold a lock that its own
+`Closed` implementation needs.
+
+## 8.3 Code and tests
+
+- `server/authverify/grant.go` defines the host API.
+- `server/auth_grant.go` owns admission, stored grants, timers, updates, and callbacks.
+- `server/auth_grant_mode.go` parses signed account and user mode blocks.
+- `server/auth_grant_leaf.go` projects leaf permissions and advertises request reply interest.
+- `server/auth_grant_prefix.go` compiles and matches token-prefix rules.
+- `server/auth_grant*_test.go` covers modes, lifecycle, matching, and transport behavior.
+
+```sh
+go test -race -run 'AuthGrant|AuthVerify' ./server ./server/authverify -count=1
+```
+
+The [grant-mode design](docs/superpowers/specs/2026-10-23-grant-mode-design.md)
+records the complete API and admission contract.
+
+
+Scoped user JWTs must still pass upstream scoped-signer validation. Explicit
+user permission or limit fields are invalid for that JWT form and reject before
+`Verify`. Grant replacement applies after this identity-validation prerequisite.

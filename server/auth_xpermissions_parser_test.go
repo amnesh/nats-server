@@ -167,14 +167,14 @@ func TestJWTXPermissionsRawSchema(t *testing.T) {
 			ac, xp, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 			require_NoError(t, err)
 			require_True(t, ac != nil)
-			require_True(t, xp[f.signer] != nil)
+			require_True(t, xp.xpermissions[f.signer] != nil)
 		})
 	}
 	t.Run("valid absent", func(t *testing.T) {
 		f := newXPermissionsRawFixture(t, "")
 		_, xp, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 		require_NoError(t, err)
-		require_Len(t, len(xp), 0)
+		require_Len(t, len(xp.xpermissions), 0)
 	})
 
 	invalid := []struct {

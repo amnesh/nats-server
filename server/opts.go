@@ -37,6 +37,7 @@ import (
 
 	"github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats-server/v2/conf"
+	"github.com/nats-io/nats-server/v2/server/authverify"
 	"github.com/nats-io/nats-server/v2/server/certidp"
 	"github.com/nats-io/nats-server/v2/server/certstore"
 	"github.com/nats-io/nkeys"
@@ -573,6 +574,8 @@ type Options struct {
 	// typically used by custom Authentication implementations who embeds
 	// the server and so not presented as a configuration option
 	AlwaysEnableNonce bool
+
+	AuthGrant authverify.GrantHook `json:"-"`
 
 	CustomClientAuthentication Authentication `json:"-"`
 	CustomRouterAuthentication Authentication `json:"-"`

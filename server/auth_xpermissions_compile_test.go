@@ -26,7 +26,7 @@ func mustXPermissions(t *testing.T, raw string) *xPermissions {
 	f := newXPermissionsRawFixture(t, raw)
 	_, extensions, _, err := f.server.verifyAccountClaimsWithXPermissions(f.token)
 	require_NoError(t, err)
-	return extensions[f.signer]
+	return extensions.xpermissions[f.signer]
 }
 
 func TestJWTXPermissionsCompileGroups(t *testing.T) {

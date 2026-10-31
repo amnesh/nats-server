@@ -2548,6 +2548,7 @@ func (s *Server) sendPermsAndAccountInfo(c *client) {
 	info.CID = c.cid
 	info.Import = c.opts.Import
 	info.Export = c.opts.Export
+	c.setGrantLeafInfoPermissions(info)
 	info.RemoteAccount = c.acc.Name
 	// s.SystemAccount() uses an atomic operation and does not get the server lock, so this is safe.
 	info.IsSystemAccount = c.acc == s.SystemAccount()
@@ -2599,7 +2600,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// Since leaf nodes only send on interest, if the bound
 	// account has import services we need to send those over.
 	for isubj := range acc.imports.services {
-		if c.isSpokeLeafNode() && !c.canSubscribe(isubj) {
+		if c.isSpokeLeafNode() && !c.canAdvertiseLeafInterest(isubj) {
 			c.Debugf("Not permitted to import service %q on behalf of %s%s", isubj, accName, accNTag)
 			continue
 		}
@@ -2607,7 +2608,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	}
 	// Likewise for mappings.
 	for _, m := range acc.mappings {
-		if c.isSpokeLeafNode() && !c.canSubscribe(m.src) {
+		if c.isSpokeLeafNode() && !c.canAdvertiseLeafInterest(m.src) {
 			c.Debugf("Not permitted to import mapping %q on behalf of %s%s", m.src, accName, accNTag)
 			continue
 		}
@@ -2664,7 +2665,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			continue
 		}
 		// Check perms regardless of role.
-		if c.perms != nil && !c.canSubscribe(string(sub.subject)) {
+		if c.perms != nil && !c.canAdvertiseLeafInterest(string(sub.subject)) {
 			c.Debugf("Not permitted to subscribe to %q on behalf of %s%s", sub.subject, accName, accNTag)
 			continue
 		}
@@ -2818,7 +2819,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 		// the detection of loops as long as different cluster.
 		clusterDifferent := cluster != ln.remoteCluster()
 		update := (isLDS && clusterDifferent) ||
-			((cluster == _EMPTY_ || clusterDifferent) && (delta <= 0 || ln.canSubscribeInternal(subject)))
+			((cluster == _EMPTY_ || clusterDifferent) && (delta <= 0 || ln.canAdvertiseLeafInterestInternal(subject)))
 		ln.mu.RUnlock()
 		if update {
 			ln.mu.Lock()
@@ -2826,7 +2827,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 			// for the connection. Recheck canSubscribe here since permissions
 			// can change, and to initializes mperms for wildcard subscriptions
 			// that collide with deny rules.
-			if isLDS || delta <= 0 || ln.canSubscribe(subject) {
+			if isLDS || delta <= 0 || ln.canAdvertiseLeafInterest(subject) {
 				ln.updateSmap(sub, delta, isLDS)
 			}
 			ln.mu.Unlock()
@@ -2947,7 +2948,7 @@ func (c *client) sendLeafNodeSubUpdate(key string, n int64) {
 			} else {
 				subject = key
 			}
-			if !c.canSubscribe(subject) {
+			if !c.canAdvertiseLeafInterest(subject) {
 				return
 			}
 		}
@@ -3523,8 +3524,8 @@ func (c *client) leafMsgAllowed() bool {
 
 	// Service-import replies (_R_), JS ack subjects ($JS.ACK.)
 	// are internal routing subjects forwarded via LS+ without
-	// permission checks.
-	if isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck) {
+	// permission checks. A grant connection has no such exception.
+	if (isServiceReply(subjectToCheck) || isJSAckSubject(subjectToCheck)) && !c.authGrantMode.Load() {
 		return true
 	}
 
@@ -3532,7 +3533,7 @@ func (c *client) leafMsgAllowed() bool {
 	if c.isSpokeLeafNode() {
 		// Gateway routed replies are forwarded without
 		// permission checks.
-		if isGW || c.leafReceiveAllowed(subjectToCheck) {
+		if (isGW && !c.authGrantMode.Load()) || c.leafReceiveAllowed(subjectToCheck) {
 			c.mu.RUnlock()
 			return true
 		}
@@ -3590,6 +3591,10 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 				break
 			}
 		}
+	}
+
+	if !allowed && c.authGrantMode.Load() {
+		allowed = c.perms.sub.prefix.allows(subject)
 	}
 
 	if allowed && len(perms.Deny) > 0 {

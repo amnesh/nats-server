@@ -242,7 +242,7 @@ func TestJWTXPermissionsConcurrentAccountGeneration(t *testing.T) {
 	scopeTwo.Key = f.signer
 	scopeTwo.Role = "two"
 	claimTwo.SigningKeys.AddScopedSigner(scopeTwo)
-	xpTwo := accountXPermissions{f.signer: {Stream: []xStreamPermission{{Op: "ro", Stream: "two"}}}}
+	xpTwo := accountClaimExtensions{xpermissions: accountXPermissions{f.signer: {Stream: []xStreamPermission{{Op: "ro", Stream: "two"}}}}}
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -316,12 +316,14 @@ func TestJWTXPermissionsIncompleteAccountRefresh(t *testing.T) {
 	require_Equal(t, importer.claimJWT, importerJWT)
 	importer.mu.RUnlock()
 
-	// A typed update has no signed extension payload, but must retain the stored
-	// JWT so resolving the missing exporter can rebuild the complete generation.
+	// Typed claims cannot express extensions, so retain them and the signed JWT
+	// needed to resolve the missing exporter.
 	s.UpdateAccountClaims(importer, importerClaim)
 	_, xp, ok := importer.issuerScopeAndXPermissions(importerSignerPub)
 	require_True(t, ok)
-	require_True(t, xp == nil)
+	require_NotNil(t, xp)
+	require_Len(t, len(xp.Stream), 1)
+	require_Equal(t, xp.Stream[0].Stream, "restored")
 
 	require_NoError(t, s.AccountResolver().Store(exporterPub, exporterJWT))
 	_, err = s.LookupAccount(exporterPub)
