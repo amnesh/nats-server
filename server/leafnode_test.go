@@ -29,6 +29,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -361,6 +362,60 @@ func (l *captureErrorLogger) Errorf(format string, v ...any) {
 	}
 }
 
+func waitForLeafAccountLookupErr(errCh <-chan string, host string, timeout time.Duration) error {
+	refused := regexp.MustCompile("^" +
+		regexp.QuoteMeta(fmt.Sprintf("Error trying to connect as leafnode to remote server %q (attempt ", host)) +
+		`[1-9][0-9]*` +
+		regexp.QuoteMeta(fmt.Sprintf("): dial tcp %s: connect: connection refused", host)) + "$")
+	deadline := time.After(timeout)
+	for {
+		select {
+		case e := <-errCh:
+			if strings.Contains(e, "Unable to lookup account") {
+				return nil
+			}
+			if !refused.MatchString(e) {
+				return fmt.Errorf("Expected error about no local account, got %s", e)
+			}
+		case <-deadline:
+			return fmt.Errorf("Did not get the error")
+		}
+	}
+}
+
+func TestLeafNodeAccountNotFoundErrorWait(t *testing.T) {
+	const host = "127.0.0.1:7422"
+	lookup := "Unable to lookup account foo"
+	refused := func(remote string, attempt int) string {
+		return fmt.Sprintf("Error trying to connect as leafnode to remote server %q (attempt %d): dial tcp %s: connect: connection refused", remote, attempt, remote)
+	}
+	for _, tc := range []struct {
+		name     string
+		messages []string
+		timeout  time.Duration
+		want     string
+	}{
+		{"lookup only", []string{lookup}, 5 * time.Second, ""},
+		{"transient first", []string{refused(host, 1), refused(host, 2), lookup}, 5 * time.Second, ""},
+		{"foreign remote", []string{refused("127.0.0.1:7423", 1), lookup}, 5 * time.Second, "Expected error about no local account"},
+		{"unexpected dial error", []string{fmt.Sprintf("Error trying to connect as leafnode to remote server %q (attempt 1): dial tcp %s: i/o timeout", host, host), lookup}, 5 * time.Second, "Expected error about no local account"},
+		{"missing lookup", []string{refused(host, 1)}, 20 * time.Millisecond, "Did not get the error"},
+	} {
+		errCh := make(chan string, len(tc.messages))
+		for _, message := range tc.messages {
+			errCh <- message
+		}
+		err := waitForLeafAccountLookupErr(errCh, host, tc.timeout)
+		if tc.want == "" {
+			if err != nil {
+				t.Errorf("%s: unexpected error: %v", tc.name, err)
+			}
+		} else if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: error = %v, want %q", tc.name, err, tc.want)
+		}
+	}
+}
+
 func TestLeafNodeAccountNotFound(t *testing.T) {
 	ob := DefaultOptions()
 	ob.LeafNode.Host = "127.0.0.1"
@@ -400,14 +455,8 @@ func TestLeafNodeAccountNotFound(t *testing.T) {
 	sb = RunServer(ob)
 	defer sb.Shutdown()
 
-	// Wait for report of error
-	select {
-	case e := <-l.errCh:
-		if !strings.Contains(e, "Unable to lookup account") {
-			t.Fatalf("Expected error about no local account, got %s", e)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("Did not get the error")
+	if err := waitForLeafAccountLookupErr(l.errCh, u.Host, 2*time.Second); err != nil {
+		t.Fatal(err)
 	}
 
 	// TODO below test is bogus. Instead add the account, do a reload, and make sure the connection works.
@@ -6311,6 +6360,11 @@ leafnodes:{
 `, accs, sd2, sA.opts.LeafNode.Port, sA.opts.LeafNode.Port)))
 	sL, _ := RunServerWithConfig(confL)
 	defer sL.Shutdown()
+
+	checkLeafNodeConnectedCount(t, sA, 2)
+	checkLeafNodeConnectedCount(t, sL, 2)
+	checkAccountLeafInterest(t, sA, "A", "$JS.dl.API.INFO")
+	checkAccountLeafInterest(t, sL, "A", "$JS.da.API.INFO")
 
 	ncA := natsConnect(t, sA.ClientURL(), nats.UserInfo("a1", "a1"))
 	defer ncA.Close()
