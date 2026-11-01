@@ -378,25 +378,49 @@ the old timer and invalidates callbacks that already started. A second CONNECT
 for the same identity refreshes the JWT expiry cap. Changing the identity of a
 grant connection requires a new connection.
 
-Prefix permissions have no upstream leaf INFO representation. INFO carries
-standard wildcard supersets, and the accepted hub enforces exact rules on actual
-messages. Interest advertisements use prefix intersection so broad hub interests
-receive allowed leaf traffic. Prefix subscription permission checks retain subset semantics. Standard leaf
-wildcard interest retains upstream overlap behavior and filters each delivery. Grant connections
-have no built-in exception for MQTT, service replies, JetStream acknowledgements, or
-gateway-routed replies; non-grant connections keep the upstream exceptions. Since v2.15.2, upstream has no MQTT
-exception for leaf connections. Leaf wildcard interest retains upstream admission rules,
-while every actual delivery still passes the grant checks. Prefix checks run only for grant connections. The non-grant leaf
-message path keeps the upstream lock-free fast path.
+Grant leaf interest is projected per source. Ordinary subscriptions, mapping
+sources, and service-import subjects contribute their intersections with the
+standard publish allows and the wildcard wire forms of prefix rules. Fully
+denied rows are removed; partial deny overlaps retain delivery-time enforcement.
+An empty standard allow remains deny-all. Ordinary and virtual source ownership
+are separate, including when their projected rows collide. Queue weights are
+summed once per source row. Mapping and service-import notifications reconcile
+current account inventory under the client-before-account lock order.
 
+The existing INFO Import and Export values retain their wire representation.
+A grant hub adds optional `export_grant` with exact `allow`, `deny`, and
+`allow_prefix` lists. `allow` has no omission tag. A solicited spoke consumes
+that field without entering grant mode and merges its local DenyExports.
+Missing or null `allow` means an empty allow. Invalid field types, subjects,
+or prefix rules close the link without falling back to Export. Older spokes
+ignore the field and receive the projected standard interest. Both peers need
+the new revision for exact local rejection inside prefix wildcard supersets.
 
-Leaf interest advertisement follows the standard lists and prefix rules, with denies applied.
-Enabling response permissions does not reveal unrelated account subscriptions. Response
-routing uses an INFO export superset that retains denies. The hub forwards exact reply
-interest only after delivering a request that permits that response. A spoke may send a
-candidate reply, but the hub accepts it only when the exact publish grant or a tracked response
-permission allows it. Reply tracking uses the original
-publish direction before the accepted-leaf permission swap.
+An exact-export spoke accepts the hub's LS+ rows. Message forwarding requires
+the exact publish grant or a plain literal hub row for that wire subject.
+The literal-row exception excludes loop detection, wildcard and queue rows,
+and retains denies on both the raw and gateway-stripped permission subject.
+The hub advertises a response's literal interest before delivering the request.
+Its response budget, expiry, and final leaf message enforcement do not change.
+
+After its full permission check, including response allowance, an accepted grant
+leaf drops unauthorized literal LS+ without registering or propagating interest,
+sending an error, or closing the link. One bool tracks whether the connection has
+already logged its warning; subsequent drops use debug logging. Wildcard LS+,
+static subscription violations, and unauthorized LMSG handling remain unchanged.
+No import_grant field or spoke filter is added. The hub correction works with
+older spokes. Public UpdateClientGrant already reconnects every leaf, so a Sub
+widening obtains the new authoritative grant and replays dropped interest.
+The ReverseMatch traversal includes descendants below single-token wildcard nodes.
+Broad leaf interest such as `in.>` therefore sees an `in.*.>` permission while
+retaining the one-or-more-token semantics of `>`.
+
+A live internal grant reinstall restores accepted-leaf permission orientation,
+refreshes INFO, and sends only differences in the aggregate source projection.
+Transport denies merged by CONNECT and JetStream survive permission replacement
+in their live directions. Retained transport state never includes old grant denies.
+The public UpdateClientGrant leaf path still closes and reconnects. Initial
+installation remains swapped once by the existing CONNECT path.
 
 
 Scoped user JWTs must still pass upstream scoped-signer validation. Explicit

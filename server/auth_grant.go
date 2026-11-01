@@ -266,6 +266,7 @@ func (c *client) installAuthGrant(p *Permissions, pub, sub grantPrefixRules) {
 		c.perms.sub.allow = NewSublistNoCache()
 	}
 	c.perms.pub.prefix, c.perms.sub.prefix = pub, sub
+	liveLeaf := c.projectsGrantLeafInterest() && c.leaf.smap != nil
 	if keepReplies {
 		c.replies = replies
 	} else if p.Response == nil {
@@ -273,6 +274,13 @@ func (c *client) installAuthGrant(p *Permissions, pub, sub grantPrefixRules) {
 	}
 	for _, sub := range c.subs {
 		c.canSubscribe(string(sub.subject), string(sub.queue))
+	}
+	if liveLeaf {
+		c.opts.Import, c.opts.Export = p.Subscribe, p.Publish
+		c.perms.pub, c.perms.sub = c.perms.sub, c.perms.pub
+		c.restoreGrantLeafDenies()
+		c.refreshGrantLeafInfo()
+		c.reprojectGrantLeafInterest()
 	}
 }
 

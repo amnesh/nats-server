@@ -30,6 +30,7 @@ import (
 	"path"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -96,7 +97,12 @@ type leaf struct {
 	// Used to suppress sub and unsub interest. Same as routes but our audience
 	// here is tied to this leaf node. This will hold all subscriptions except this
 	// leaf nodes. This represents all the interest we want to send to the other side.
-	smap map[string]int64
+	smap                 map[string]int64
+	gsrc                 map[grantLeafSourceKey]grantLeafSource
+	exportGrant          bool
+	grantDenyPub         []string
+	grantDenySub         []string
+	grantInterestDropped bool
 	// This map will contain all the subscriptions that have been added to the smap
 	// during initLeafNodeSmapAndSendSubs. It is short lived and is there to avoid
 	// race between processing of a sub where sub is added to account sublist but
@@ -1828,27 +1834,13 @@ func (c *client) processLeafnodeInfo(info *Info) {
 	}
 
 	// Only solicited leafnode connections trust permission updates from INFO.
-	if didSolicit && (info.Import != nil || info.Export != nil) {
-		perms := &Permissions{
-			Publish:   info.Export,
-			Subscribe: info.Import,
+	if didSolicit && (info.Import != nil || info.Export != nil || len(info.ExportGrant) > 0) {
+		if err := c.setLeafInfoPermissions(info); err != nil {
+			c.mu.Unlock()
+			c.sendErrAndErr(err.Error())
+			c.closeConnection(ProtocolViolation)
+			return
 		}
-		// Check if we have local deny clauses that we need to merge.
-		if remote := c.leaf.remote; remote != nil {
-			if len(remote.DenyExports) > 0 {
-				if perms.Publish == nil {
-					perms.Publish = &SubjectPermission{}
-				}
-				perms.Publish.Deny = append(perms.Publish.Deny, remote.DenyExports...)
-			}
-			if len(remote.DenyImports) > 0 {
-				if perms.Subscribe == nil {
-					perms.Subscribe = &SubjectPermission{}
-				}
-				perms.Subscribe.Deny = append(perms.Subscribe.Deny, remote.DenyImports...)
-			}
-		}
-		c.setPermissions(perms)
 	}
 
 	var resumeConnect bool
@@ -2427,7 +2419,7 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 
 	// When a leaf solicits a connection to a hub, the perms that it will use on the soliciting leafnode's
 	// behalf are correct for them, but inside the hub need to be reversed since data is flowing in the opposite direction.
-	if !c.isSolicitedLeafNode() && c.perms != nil {
+	if !c.isSolicitedLeafNode() && c.perms != nil && !(c.projectsGrantLeafInterest() && c.leaf.smap != nil) {
 		sp, pp := c.perms.sub, c.perms.pub
 		c.perms.sub, c.perms.pub = pp, sp
 		// setPermissions populated darray from the subscribe permissions,
@@ -2600,7 +2592,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// Since leaf nodes only send on interest, if the bound
 	// account has import services we need to send those over.
 	for isubj := range acc.imports.services {
-		if c.isSpokeLeafNode() && !c.canAdvertiseLeafInterest(isubj) {
+		if c.isSpokeLeafNode() && !c.projectsGrantLeafInterest() && !c.canAdvertiseLeafInterest(isubj) {
 			c.Debugf("Not permitted to import service %q on behalf of %s%s", isubj, accName, accNTag)
 			continue
 		}
@@ -2608,7 +2600,7 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	}
 	// Likewise for mappings.
 	for _, m := range acc.mappings {
-		if c.isSpokeLeafNode() && !c.canAdvertiseLeafInterest(m.src) {
+		if c.isSpokeLeafNode() && !c.projectsGrantLeafInterest() && !c.canAdvertiseLeafInterest(m.src) {
 			c.Debugf("Not permitted to import mapping %q on behalf of %s%s", m.src, accName, accNTag)
 			continue
 		}
@@ -2658,6 +2650,10 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// Now walk the results and add them to our smap
 	rc := c.leaf.remoteCluster
 	c.leaf.smap = make(map[string]int64)
+	grantInterest := c.projectsGrantLeafInterest()
+	if grantInterest {
+		c.leaf.gsrc = make(map[grantLeafSourceKey]grantLeafSource)
+	}
 	for _, sub := range subs {
 		// Don't advertise interest from leafnodes to other isolated leafnodes.
 		// Checked before perms, which would only be wasted on this interest.
@@ -2665,7 +2661,8 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			continue
 		}
 		// Check perms regardless of role.
-		if c.perms != nil && !c.canAdvertiseLeafInterest(string(sub.subject)) {
+		project := grantInterest && !bytes.HasPrefix(sub.subject, []byte(leafNodeLoopDetectionSubjectPrefix))
+		if c.perms != nil && !project && !c.canAdvertiseLeafInterest(string(sub.subject)) {
 			c.Debugf("Not permitted to subscribe to %q on behalf of %s%s", sub.subject, accName, accNTag)
 			continue
 		}
@@ -2677,7 +2674,11 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 			if len(sub.queue) > 0 && sub.qw > 0 {
 				count = int64(sub.qw)
 			}
-			c.leaf.smap[keyFromSub(sub)] += count
+			if project {
+				c.addGrantLeafSource(keyFromSub(sub), false, count, false)
+			} else {
+				c.leaf.smap[keyFromSub(sub)] += count
+			}
 			if c.leaf.tsub == nil {
 				c.leaf.tsub = make(map[*subscription]struct{})
 			}
@@ -2686,7 +2687,11 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	}
 	// FIXME(dlc) - We need to update appropriately on an account claims update.
 	for _, isubj := range ims {
-		c.leaf.smap[isubj]++
+		if grantInterest {
+			c.addGrantLeafSource(isubj, true, 1, false)
+		} else {
+			c.leaf.smap[isubj]++
+		}
 	}
 	// If we have gateways enabled we need to make sure the other side sends us responses
 	// that have been augmented from the original subscription.
@@ -2707,8 +2712,19 @@ func (s *Server) initLeafNodeSmapAndSendSubs(c *client) {
 	// Queue all protocols. There is no max pending limit for LN connection,
 	// so we don't need chunking. The writes will happen from the writeLoop.
 	var b bytes.Buffer
-	for key, n := range c.leaf.smap {
-		c.writeLeafSub(&b, key, n)
+	if grantInterest {
+		keys := make([]string, 0, len(c.leaf.smap))
+		for key := range c.leaf.smap {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		for _, key := range keys {
+			c.writeLeafSub(&b, key, c.leaf.smap[key])
+		}
+	} else {
+		for key, n := range c.leaf.smap {
+			c.writeLeafSub(&b, key, n)
+		}
 	}
 	if b.Len() > 0 {
 		c.enqueueProto(b.Bytes())
@@ -2819,7 +2835,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 		// the detection of loops as long as different cluster.
 		clusterDifferent := cluster != ln.remoteCluster()
 		update := (isLDS && clusterDifferent) ||
-			((cluster == _EMPTY_ || clusterDifferent) && (delta <= 0 || ln.canAdvertiseLeafInterestInternal(subject)))
+			((cluster == _EMPTY_ || clusterDifferent) && (delta <= 0 || ln.projectsGrantLeafInterest() || ln.canAdvertiseLeafInterestInternal(subject)))
 		ln.mu.RUnlock()
 		if update {
 			ln.mu.Lock()
@@ -2827,7 +2843,7 @@ func (acc *Account) updateLeafNodesEx(sub *subscription, delta int32, hubOnly bo
 			// for the connection. Recheck canSubscribe here since permissions
 			// can change, and to initializes mperms for wildcard subscriptions
 			// that collide with deny rules.
-			if isLDS || delta <= 0 || ln.canAdvertiseLeafInterest(subject) {
+			if isLDS || delta <= 0 || ln.projectsGrantLeafInterest() || ln.canAdvertiseLeafInterest(subject) {
 				ln.updateSmap(sub, delta, isLDS)
 			}
 			ln.mu.Unlock()
@@ -2856,6 +2872,10 @@ func (c *client) updateSmap(sub *subscription, delta int32, isLDS bool) {
 		return
 	}
 
+	if c.leaf.gsrc != nil && sub.si {
+		c.reconcileGrantLeafVirtualSource(string(sub.subject))
+	}
+
 	// For additions, check if that sub has just been processed during initLeafNodeSmapAndSendSubs
 	if delta > 0 && c.leaf.tsub != nil {
 		if _, present := c.leaf.tsub[sub]; present {
@@ -2870,6 +2890,10 @@ func (c *client) updateSmap(sub *subscription, delta int32, isLDS bool) {
 	}
 
 	key := keyFromSub(sub)
+	if c.leaf.gsrc != nil && !isLDS {
+		c.addGrantLeafSource(key, false, int64(delta), true)
+		return
+	}
 	n, ok := c.leaf.smap[key]
 	if delta < 0 && !ok {
 		return
@@ -2897,6 +2921,10 @@ func (c *client) forceAddToSmap(subj string) {
 	if c.leaf.smap == nil {
 		return
 	}
+	if c.leaf.gsrc != nil {
+		c.reconcileGrantLeafVirtualSource(subj)
+		return
+	}
 	n := c.leaf.smap[subj]
 	if n != 0 {
 		return
@@ -2912,6 +2940,10 @@ func (c *client) forceRemoveFromSmap(subj string) {
 	defer c.mu.Unlock()
 
 	if c.leaf.smap == nil {
+		return
+	}
+	if c.leaf.gsrc != nil {
+		c.reconcileGrantLeafVirtualSource(subj)
 		return
 	}
 	n := c.leaf.smap[subj]
@@ -2932,7 +2964,7 @@ func (c *client) forceRemoveFromSmap(subj string) {
 // Lock should be held.
 func (c *client) sendLeafNodeSubUpdate(key string, n int64) {
 	// If we are a spoke, we need to check if we are allowed to send this subscription over to the hub.
-	if c.isSpokeLeafNode() {
+	if c.isSpokeLeafNode() && !c.projectsGrantLeafInterest() {
 		checkPerms := true
 		if len(key) > 0 && (key[0] == '$' || key[0] == '_') {
 			if strings.HasPrefix(key, leafNodeLoopDetectionSubjectPrefix) ||
@@ -3121,7 +3153,18 @@ func (c *client) processLeafSub(argo []byte) (err error) {
 	// If we are a hub check that we can publish to this subject.
 	if checkPerms {
 		subj := string(sub.subject)
-		if subjectIsLiteral(subj) && !c.pubAllowedFullCheck(subj, true, true) {
+		if !c.leaf.exportGrant && subjectIsLiteral(subj) && !c.pubAllowedFullCheck(subj, true, true) {
+			if c.authGrantMode.Load() && !c.isSolicitedLeafNode() {
+				first := !c.leaf.grantInterestDropped
+				c.leaf.grantInterestDropped = true
+				c.mu.Unlock()
+				if first {
+					c.Warnf("Dropped literal leaf interest outside session grant for %q", subj)
+				} else {
+					c.Debugf("Dropped literal leaf interest outside session grant for %q", subj)
+				}
+				return nil
+			}
 			c.mu.Unlock()
 			c.leafSubPermViolation(sub.subject)
 			c.Debugf(fmt.Sprintf("Permissions Violation for Subscription to %q", sub.subject))

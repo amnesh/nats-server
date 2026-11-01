@@ -1122,20 +1122,40 @@ Standard denies still apply. Each subject or prefix list permits at most 4096
 entries. Invalid entries reject the complete grant.
 
 Accepted leaves reverse publish and subscribe rules with their standard lists.
-Leaf INFO advertises standard wildcard supersets of prefix rules because the
-upstream wire format cannot express token prefixes. The hub enforces the exact
-grant on actual messages. Leaf interest follows the standard lists and prefix
-rules, with denies applied, even when response permissions are enabled. Response
-routing may advertise an export superset with the configured denies retained.
-The hub forwards exact reply interest only after delivering a request that permits
-that response. Hub interest advertisement uses intersection matching, so a broad
-hub subscription still receives allowed leaf publications. Grant connections have
-no built-in exception for MQTT, service replies, JetStream acknowledgements, or
-gateway-routed replies; each needs a grant. Non-grant connections keep the
-upstream exceptions. Since v2.15.2, upstream has no MQTT exception for leaf
-connections, so a leaf without a grant also needs explicit `$MQTT.`
-permissions. Leaf wildcard interest retains upstream admission
-rules, while every actual delivery still passes the grant checks.
+For grant leaves, each ordinary subscription, mapping source, and service import
+contributes the intersection of its subject with the exact publish grant. Prefix
+rules contribute standard wildcard supersets. Source ownership retains overlaps
+and queue weights across initialization, live changes, and reconnects. Mapping
+and service-import notifications reconcile the current account inventory.
+
+Legacy INFO Import and Export remain unchanged. A grant hub also sends the optional
+INFO `export_grant` object with `allow`, `deny`, and `allow_prefix`. The `allow`
+field is always present. A new solicited spoke installs this exact export grant;
+missing or null `allow` grants no standard subjects. An invalid object, subject,
+or prefix rule closes the link. Local `deny_exports` remains effective.
+Older spokes ignore the field and use the narrower standard interest rows.
+Exact wrong-prefix rejection requires both peers to run this fork revision.
+
+The spoke admits the hub's reply interest but forwards only exact grant traffic
+or a plain literal subject explicitly advertised by the hub. Literal reply
+forwarding retains denies on the raw and gateway-stripped permission subject.
+It never treats loop-detection or queue interest as reply authority. The hub's
+response budget, expiry, and final message checks remain authoritative.
+
+An accepted grant leaf drops unauthorized literal subscription interest after
+its full permission and response check. The hub registers no subscription,
+sends no error, and keeps the link open. It warns once per connection and logs
+later drops at debug level. This also fixes older spokes using the Import prefix
+superset. Static subscription violations and unauthorized publications retain
+their existing close behavior. A public grant update still reconnects the leaf,
+so widening the Sub grant replays previously dropped interest.
+ReverseMatch visits descendants below single-token wildcard nodes, so broad leaf
+interest sees permissions such as `in.*.>` without losing deeper subjects.
+
+Grant connections have no built-in exception for MQTT, service replies,
+JetStream acknowledgements, or gateway-routed replies. Non-grant connections
+keep their existing behavior. Since v2.15.2, upstream also requires explicit
+MQTT permissions on non-grant leaf connections.
 
 ## 8.2 Live replacement and planned close
 
@@ -1145,6 +1165,8 @@ It replaces CLIENT permissions, clears the publish permission cache, removes
 unauthorized subscriptions with permission errors, and preserves reply tracking
 when response permissions are unchanged. Expiry can be extended only within the
 JWT limit. Reload retains the installed grant without another `Verify` call.
+CONNECT and JetStream transport denies survive internal leaf reinstall and exact
+INFO updates independently of replaceable grant denies.
 
 A LEAF update closes the connection with `AuthorizationChanged`; reconnect runs
 `Verify` again. An invalid update closes with `GrantRejected` and returns

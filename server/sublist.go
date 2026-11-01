@@ -1809,6 +1809,7 @@ func getAllNodes(l *level, results *SublistResult) {
 	}
 	if l.pwc != nil {
 		addNodeToResults(l.pwc, results)
+		getAllNodes(l.pwc.next, results)
 	}
 	if l.fwc != nil {
 		addNodeToResults(l.fwc, results)

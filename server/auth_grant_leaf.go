@@ -22,6 +22,9 @@ func (c *client) setGrantLeafInfoPermissions(info *Info) {
 	if !c.authGrantMode.Load() || c.perms == nil {
 		return
 	}
+	if c.projectsGrantLeafInterest() {
+		info.ExportGrant = c.grantLeafExportJSON()
+	}
 	info.Import = grantLeafWirePermission(info.Import, c.perms.pub.prefix)
 	info.Export = grantLeafWirePermission(info.Export, c.perms.sub.prefix)
 	if c.perms.resp != nil {

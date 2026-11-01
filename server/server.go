@@ -160,7 +160,8 @@ type Info struct {
 	GatewayIOM        bool     `json:"gateway_iom,omitempty"`         // Indicate that all accounts will be switched to InterestOnly mode "right away"
 
 	// LeafNode Specific
-	LeafNodeURLs []string `json:"leafnode_urls,omitempty"` // LeafNode URLs that the server can reconnect to.
+	LeafNodeURLs []string        `json:"leafnode_urls,omitempty"` // LeafNode URLs that the server can reconnect to.
+	ExportGrant  json.RawMessage `json:"export_grant,omitempty"`
 
 	XKey string `json:"xkey,omitempty"` // Public server's x25519 key.
 }

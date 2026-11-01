@@ -1336,6 +1336,7 @@ func (c *client) mergeDenyPermissions(what denyType, denyPubs []string) {
 	if len(denyPubs) == 0 {
 		return
 	}
+	c.rememberGrantLeafDenies(what, denyPubs)
 	if c.perms == nil {
 		c.perms = &permissions{}
 	}
@@ -3906,8 +3907,9 @@ func (c *client) deliverMsg(prodIsMQTT bool, sub *subscription, acc *Account, su
 		// prefix is stripped from its result, because the header path transforms
 		// the complete subject as well. Stripping first could authorize a
 		// subject that differs from the one placed on the wire.
-		subjectToCheck, _ := getGWRoutedSubjectOrSelf(sub.importTargetSubject(subject))
-		if !client.pubAllowedFullCheck(string(subjectToCheck), true, true) {
+		wireSubject := sub.importTargetSubject(subject)
+		subjectToCheck, _ := getGWRoutedSubjectOrSelf(wireSubject)
+		if !client.pubAllowedFullCheck(string(subjectToCheck), true, true) && !client.grantLeafLiteralInterestAllowed(wireSubject, subjectToCheck) {
 			mt.addEgressEvent(client, sub, errMsgTracePubViolation)
 			client.mu.Unlock()
 			client.Debugf("Not permitted to deliver to %q", subjectToCheck)
@@ -4333,7 +4335,7 @@ func (c *client) pubAllowedFullCheck(subject string, fullCheck, hasLock bool) bo
 	if checkAllow && c.perms.pub.allow != nil {
 		np, _ := c.perms.pub.allow.NumInterest(subject)
 		allowed = np != 0
-		allowed = allowed || (c.authGrantMode.Load() && c.perms.pub.prefix.allows(subject))
+		allowed = allowed || ((c.authGrantMode.Load() || c.isSolicitedLeafNode()) && c.perms.pub.prefix.allows(subject))
 	}
 	// If we have a deny list and are currently allowed, check that as well.
 	if allowed && c.perms.pub.deny != nil {
