@@ -171,6 +171,13 @@ Static accounts ignore the user block without parsing or enforcing it:
 
 ## 5. Connect rules for a grant-mode account
 
+Authenticated identity reports use the verified user JWT subject. Optional
+CONNECT `nkey` and `user` fields do not replace that identity in request
+headers, system events, or CONNZ results and filters. The rule also applies to
+static JWT users. Other authentication modes retain their existing identity
+fallbacks. This correction changes no wire field and adds no authorization
+hook.
+
 Hook point: the deferred block of `processClientOrLeafAuthentication` (`auth.go:704-720`), next to
 the existing `authVerificationApplies` branch. For a connection of a grant-mode account, take the
 grant branch and do NOT run the v1 callout. Keep the upstream file change to one small call; put

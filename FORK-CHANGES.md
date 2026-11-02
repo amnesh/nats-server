@@ -348,7 +348,7 @@ detailed fields (JWT, issuer key, server/cluster, start time):
 | JSON field | Meaning |
 |---|---|
 | `acc` | account name / public key |
-| `user` | user id (raw auth user) |
+| `user` | verified JWT subject, or the raw auth user for another authentication mode |
 | `name` | client `name` from CONNECT |
 | `tags` | authenticated user JWT tags (omitted for non-JWT users or an empty tag list) |
 | `kind` | connection kind (e.g. `Client`, `Leafnode`) |
@@ -359,6 +359,12 @@ detailed fields (JWT, issuer key, server/cluster, start time):
 | `reply` | (LEAF only) preserved original reply subject when forwarded across a leaf — see §2.6 |
 
 Header name: **`Nats-Request-Info`** (`ClientInfoHdr`).
+
+For an authenticated JWT connection, `getRawAuthUser` returns the verified
+subject before optional CONNECT `nkey` or `user` fields. The same rule applies
+to system events and CONNZ results and user filters. It adds no wire field.
+Static nkey, username, token, and auth-callout names keep their existing
+fallbacks. An auth callout clears the original JWT before it installs its user.
 
 ## 2.6 LEAF handling (forwarded requests)
 
@@ -425,13 +431,18 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
 - `server/soo-changes.go` — `stampRequestInfoHeaderIfNeeded` (hot path + cache),
   `getClientInfoForRequest`, `skipRequestInfoStamp` + the skip-prefix list.
 - `server/client.go` — call site in `processInboundClientMsg`; the
-  `client.ciStampHdr` cache field and its invalidation points.
+  `client.ciStampHdr` cache field and its invalidation points. `getRawAuthUser`
+  selects the verified JWT subject for stamps, events, and monitoring.
 - `server/leafnode.go` — leaf inbound call site.
 - `server/server.go` — the `Server.stampReqInfo` atomic mirror, set at startup and
   on reload.
 - `server/opts.go` — `Options.StampRequestInfo` + the `stamp_request_info` key.
 - `server/reload.go` — `stampRequestInfoReload` (hot-reload apply).
-- Tests: `server/soo-changes_test.go` and `test/soo-changes_test.go`.
+- Tests: `server/soo-changes_test.go`, `server/soo_identity_test.go`, and
+  `test/soo-changes_test.go`. `TestClientInfoForRequestVerifiedJWTIdentity`
+  covers static JWT and grant JWT connections over CLIENT and LEAF protocols.
+  It checks request headers, system events, and CONNZ results and filters with
+  optional CONNECT identity fields present.
 
 ---
 

@@ -6960,6 +6960,8 @@ func isClientProbeTLSHandshakeError(err error) bool {
 // Lock should be held.
 func (c *client) getRawAuthUser() string {
 	switch {
+	case c.opts.JWT != _EMPTY_ && c.pubKey != _EMPTY_:
+		return c.pubKey
 	case c.opts.Nkey != _EMPTY_:
 		return c.opts.Nkey
 	case c.opts.Username != _EMPTY_:

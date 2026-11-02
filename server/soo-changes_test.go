@@ -119,6 +119,10 @@ func TestGetClientInfoForRequestAuthUser(t *testing.T) {
 		{"username", func(c *client) { c.opts.Username = "bob" }, "bob"},
 		{"nkey", func(c *client) { c.opts.Nkey = "UABC" }, "UABC"},
 		{"jwt", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB" }, "UPUB"},
+		{"jwt with nkey", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB"; c.opts.Nkey = "UOTHER" }, "UPUB"},
+		{"jwt with username", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB"; c.opts.Username = "other" }, "UPUB"},
+		{"unverified jwt", func(c *client) { c.opts.JWT = "ey.jwt"; c.opts.Nkey = "UOTHER" }, "UOTHER"},
+		{"callout username", func(c *client) { c.pubKey = "UPUB"; c.opts.Username = "callout-user" }, "callout-user"},
 		{"token", func(c *client) { c.opts.Token = "s3cr3t" }, "[REDACTED]"},
 		{"anonymous", func(c *client) {}, ""},
 	} {
