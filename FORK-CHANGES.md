@@ -1148,6 +1148,16 @@ the grant again. The copy prevents that field from widening the projected
 interest in this interval. `TestAuthGrantLeafSecondConnectExportKeepsInterestConfined`
 holds this interval open and checks that no row outside the grant goes to the leaf.
 
+A live leaf connection that authenticated without grant mode cannot enter grant
+mode with a later CONNECT. Its interest map belongs to the earlier session and
+has no grant sources, so the hub would send interest outside any grant until the
+next snapshot. The server rejects the CONNECT with `Authorization Violation`
+before it calls `Verify`, as it already does for a grant connection that changes
+identity or leaves grant mode. A new connection is admitted normally. Other
+re-CONNECTs keep their upstream behavior.
+`TestAuthGrantLeafStaticToGrantReconnectRejected` covers the switch and a static
+re-CONNECT control.
+
 Legacy INFO Import and Export remain unchanged. A grant hub also sends the optional
 INFO `export_grant` object with `allow`, `deny`, and `allow_prefix`. The `allow`
 field is always present. A new solicited spoke installs this exact export grant;

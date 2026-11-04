@@ -46,6 +46,13 @@ func authGrantRawLeaf(t *testing.T, hub *Server, credentials nats.Option, hubRol
 // without sending them.
 func authGrantDialLeaf(t *testing.T, hub *Server, credentials nats.Option) (net.Conn, *bufio.Reader, map[string]any) {
 	t.Helper()
+	conn, r, nonce := authGrantDialLeafNonce(t, hub)
+	return conn, r, authGrantLeafConnectFields(t, credentials, nonce)
+}
+
+// authGrantDialLeafNonce reads the hub INFO and returns its nonce.
+func authGrantDialLeafNonce(t *testing.T, hub *Server) (net.Conn, *bufio.Reader, string) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", hub.getOpts().LeafNode.Port), time.Second)
 	require_NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
@@ -55,13 +62,20 @@ func authGrantDialLeaf(t *testing.T, hub *Server, credentials nats.Option) (net.
 	require_NoError(t, err)
 	var info Info
 	require_NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(strings.TrimSpace(line), "INFO ")), &info))
+	return conn, r, info.Nonce
+}
+
+// authGrantLeafConnectFields signs nonce with credentials and returns the
+// CONNECT fields.
+func authGrantLeafConnectFields(t *testing.T, credentials nats.Option, nonce string) map[string]any {
+	t.Helper()
 	opts := nats.GetDefaultOptions()
 	require_NoError(t, credentials(&opts))
 	token, err := opts.UserJWT()
 	require_NoError(t, err)
-	sig, err := opts.SignatureCB([]byte(info.Nonce))
+	sig, err := opts.SignatureCB([]byte(nonce))
 	require_NoError(t, err)
-	return conn, r, map[string]any{"jwt": token, "sig": base64.RawURLEncoding.EncodeToString(sig), "name": "grant-test-leaf", "headers": true}
+	return map[string]any{"jwt": token, "sig": base64.RawURLEncoding.EncodeToString(sig), "name": "grant-test-leaf", "headers": true}
 }
 
 func authGrantLeafUntilPong(t *testing.T, r *bufio.Reader) []string {
@@ -495,6 +509,120 @@ func TestAuthGrantLeafSecondConnectExportKeepsInterestConfined(t *testing.T) {
 				lines = append(lines, strings.TrimSpace(line))
 			}
 			authGrantRequireInterestRows(t, lines, "LS+", "secret.", nil)
+		})
+	}
+}
+
+// A live leaf that authenticated with a static credential cannot switch into
+// grant mode with a second CONNECT. During such a switch the leaf is in grant
+// mode with the interest map of its static session and no grant sources, so
+// the hub would send it interest outside any grant. A second static CONNECT
+// remains an ordinary re-CONNECT.
+func TestAuthGrantLeafStaticToGrantReconnectRejected(t *testing.T) {
+	for _, toGrant := range []bool{true, false} {
+		t.Run(fmt.Sprintf("to_grant=%t", toGrant), func(t *testing.T) {
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			defer close(release)
+			hook := &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-release:
+				case <-time.After(5 * time.Second):
+				}
+				return &authverify.GrantVerdict{Reject: true, Reason: "static to grant switch"}
+			}}
+			f := newGrantFixture(t, hook)
+			hub := grantTransportCloneHub(t, f, hook, true)
+			static := grantTransportCredentials(t, f, true)
+			nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(static), nats.NoReconnect())
+			require_NoError(t, err)
+			defer nc.Close()
+
+			conn, reader, nonce := authGrantDialLeafNonce(t, hub)
+			first, err := json.Marshal(authGrantLeafConnectFields(t, nats.UserCredentials(static), nonce))
+			require_NoError(t, err)
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", first)
+			require_NoError(t, err)
+			authGrantLeafUntilPong(t, reader)
+			lc := hub.GetLeafNode(authGrantSingleLeafID(t, hub))
+			require_True(t, lc != nil && !lc.authGrantMode.Load())
+
+			credentials := nats.UserCredentials(static)
+			if toGrant {
+				credentials = f.creds(t, f.signer, true, "", 0)
+			}
+			second, err := json.Marshal(authGrantLeafConnectFields(t, credentials, nonce))
+			require_NoError(t, err)
+			lines := make(chan string, 64)
+			go func() {
+				defer close(lines)
+				for {
+					line, err := reader.ReadString('\n')
+					if err != nil {
+						return
+					}
+					lines <- strings.TrimSpace(line)
+				}
+			}()
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", second)
+			require_NoError(t, err)
+
+			var got []string
+			hookCalled := false
+		wait:
+			for {
+				select {
+				case <-entered:
+					// The leaf is inside the switch: in grant mode, in the
+					// grant account, before its interest snapshot.
+					hookCalled = true
+					_, err = nc.SubscribeSync("secret.value")
+					require_NoError(t, err)
+					require_NoError(t, nc.Flush())
+					timeout := time.After(250 * time.Millisecond)
+					for {
+						select {
+						case line, ok := <-lines:
+							if !ok {
+								break wait
+							}
+							got = append(got, line)
+						case <-timeout:
+							break wait
+						}
+					}
+				case line, ok := <-lines:
+					if !ok {
+						break wait
+					}
+					got = append(got, line)
+					// A scoped JWT re-CONNECT can first get the pre-existing
+					// "maximum subscriptions exceeded" error; keep reading.
+					if line == "PONG" || line == "-ERR 'Authorization Violation'" {
+						break wait
+					}
+				case <-time.After(3 * time.Second):
+					t.Fatalf("no reply to the second CONNECT: %q", got)
+				}
+			}
+			t.Logf("leaf lines after the second CONNECT: %q", got)
+			authGrantRequireInterestRows(t, got, "LS+", "secret.", nil)
+			if toGrant {
+				if hookCalled {
+					t.Error("grant hook ran for a static-to-grant switch")
+				}
+				if !slices.Contains(got, "-ERR 'Authorization Violation'") {
+					t.Error("static-to-grant switch was not rejected")
+				}
+			} else {
+				require_False(t, hookCalled)
+				require_True(t, slices.Contains(got, "PONG"))
+				require_Equal(t, authGrantSingleLeafID(t, hub), lc.cid)
+			}
 		})
 	}
 }

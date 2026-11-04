@@ -63,9 +63,15 @@ func (s *Server) authGrantApplies(c *client, juc *jwt.UserClaims, acc *Account, 
 	c.mu.Lock()
 	st := c.authGrant
 	changed := st != nil && (!applies || st.account != acc.Name || st.user != juc.Subject)
+	// A live leaf keeps the interest state of its earlier non-grant session,
+	// which grant mode would project without the grant.
+	switched := st == nil && applies && c.kind == LEAF && c.leaf != nil && c.leaf.smap != nil
 	c.mu.Unlock()
 	if changed {
 		return false, authModeStatic, errors.New("cannot change a grant connection identity")
+	}
+	if switched {
+		return false, authModeStatic, errors.New("cannot switch a live leaf connection into grant mode")
 	}
 	if applies {
 		if us, scoped := scope.(*jwt.UserScope); !scoped || us.Role == "" {

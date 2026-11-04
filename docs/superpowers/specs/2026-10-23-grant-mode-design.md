@@ -383,7 +383,9 @@ active subscription deny filters before releasing the lock.
 The timer stores a version checked under the client lock. Replacing a grant stops
 the old timer and invalidates callbacks that already started. A second CONNECT
 for the same identity refreshes the JWT expiry cap. Changing the identity of a
-grant connection requires a new connection.
+grant connection requires a new connection. A live leaf that authenticated
+without grant mode also needs a new connection to enter grant mode: its interest
+map has no grant sources. `authGrantApplies` rejects that CONNECT before `Verify`.
 
 Grant leaf interest is projected per source. Ordinary subscriptions, mapping
 sources, and service-import subjects contribute their intersections with the
