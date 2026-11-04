@@ -25,8 +25,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 8 | Grant mode | operator-signed account JWT `nats.authverify.mode: "grant"` and programmatic `Options.AuthGrant` | `server/authverify/grant.go`, `server/auth_grant*.go` | `server/accounts.go`, `server/auth.go`, `server/client.go`, `server/leafnode.go`, `server/monitor.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
 | 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
 | 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
+| 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect.
 
 ---
 
@@ -1296,3 +1297,29 @@ rtk proxy env GOWORK=off GOFLAGS='-p=2 -buildvcs=false' GOMAXPROCS=4 GOCACHE=/wo
 
 The owner publishes the tested clean commit as `v2.15.3-amnesh.1` on upstream base `v2.15.2`.
 The existing `v2.15.2` tag stays at its current commit.
+
+
+# 11. Leaf removal during the initial interest window
+
+This section corrects an upstream defect. Upstream `v2.15.2` contains it. On
+2026-11-04, upstream `release/v2.15.3` (`ab05672b`, `v2.15.3-RC.1`) and `main`
+(`ca2c4da1`) still contained it.
+
+`initLeafNodeSmapAndSendSubs` records each snapshot subscription in `tsub` and
+starts the `tsubt` timer. The timer clears `tsub` after 5 seconds. A
+subscription can enter the snapshot before its own leaf update runs. That
+update then removes the subscription from `tsub` and does not count it again.
+
+`removeLeafNodeConnection` stopped the timer and set `tsubt` to nil, but kept
+`tsub`. The account lists the leaf until `acc.removeClient` runs. A late leaf
+update in that interval removed the last `tsub` entry and called `Stop` on the
+nil timer. The panic stopped the server. A leaf credential holder that connects
+and closes while hub subscriptions change can cause it.
+
+The fork clears `tsub` in `removeLeafNodeConnection`. `updateSmap` stops the
+timer only when it is present. The interest that a live leaf receives does not
+change.
+
+```sh
+go test -race ./server -run 'TestLeafNodeTsubUpdateAfterLeafRemoval' -count=1
+```

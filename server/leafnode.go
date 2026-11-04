@@ -2247,6 +2247,9 @@ func (s *Server) removeLeafNodeConnection(c *client) {
 			c.leaf.tsubt.Stop()
 			c.leaf.tsubt = nil
 		}
+		// The timer no longer clears tsub. Clear it here, since the account
+		// can still list this leaf for a late interest update.
+		c.leaf.tsub = nil
 		if c.leaf.gwSub != nil {
 			s.gwLeafSubs.Remove(c.leaf.gwSub)
 			// We need to set this to nil for GC to release the connection
@@ -2882,8 +2885,10 @@ func (c *client) updateSmap(sub *subscription, delta int32, isLDS bool) {
 			delete(c.leaf.tsub, sub)
 			if len(c.leaf.tsub) == 0 {
 				c.leaf.tsub = nil
-				c.leaf.tsubt.Stop()
-				c.leaf.tsubt = nil
+				if c.leaf.tsubt != nil {
+					c.leaf.tsubt.Stop()
+					c.leaf.tsubt = nil
+				}
 			}
 			return
 		}
