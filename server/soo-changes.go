@@ -135,18 +135,29 @@ func (c *client) getClientInfoForRequest() *ClientInfo {
 	return &ci
 }
 
-// getConnectRawAuthUser returns the auth user in the upstream order, with the
-// CONNECT nkey and user fields before a JWT subject. Surfaces from before
-// authentication completes use it: the auth callout request and the auth
-// error events. An auth callout decides the identity of a sentinel JWT
-// connection from the CONNECT fields. getRawAuthUser serves authenticated
-// connections. Lock should be held.
+// calloutDecidesIdentity reports whether an auth callout decides who this
+// connection is: its account has external authorization and the verified
+// user is not one of the account's auth users. This is the condition under
+// which processClientOrLeafAuthentication calls the callout for a JWT user.
+// Lock should be held; the account read lock is taken after it.
+func (c *client) calloutDecidesIdentity() bool {
+	return c.acc != nil && c.acc.hasExternalAuth() && !c.acc.isExternalAuthUser(c.pubKey)
+}
+
+// getConnectRawAuthUser returns the auth user for the auth callout request,
+// the auth error events, and the authentication error log. While a callout
+// decides the identity, for example of a sentinel JWT connection, it keeps
+// the upstream order with the CONNECT nkey and user fields before the JWT
+// subject. Otherwise it equals getRawAuthUser, so a verified JWT subject that
+// a grant or verification hook rejects is reported. Lock should be held.
 func (c *client) getConnectRawAuthUser() string {
-	switch {
-	case c.opts.Nkey != _EMPTY_:
-		return c.opts.Nkey
-	case c.opts.Username != _EMPTY_:
-		return c.opts.Username
+	if c.calloutDecidesIdentity() {
+		switch {
+		case c.opts.Nkey != _EMPTY_:
+			return c.opts.Nkey
+		case c.opts.Username != _EMPTY_:
+			return c.opts.Username
+		}
 	}
 	return c.getRawAuthUser()
 }
@@ -154,11 +165,13 @@ func (c *client) getConnectRawAuthUser() string {
 // getConnectAuthUser is the log form of getConnectRawAuthUser, for the
 // authentication error log. Lock should be held.
 func (c *client) getConnectAuthUser() string {
-	switch {
-	case c.opts.Nkey != _EMPTY_:
-		return fmt.Sprintf("Nkey %q", c.opts.Nkey)
-	case c.opts.Username != _EMPTY_:
-		return fmt.Sprintf("User %q", c.opts.Username)
+	if c.calloutDecidesIdentity() {
+		switch {
+		case c.opts.Nkey != _EMPTY_:
+			return fmt.Sprintf("Nkey %q", c.opts.Nkey)
+		case c.opts.Username != _EMPTY_:
+			return fmt.Sprintf("User %q", c.opts.Username)
+		}
 	}
 	return c.getAuthUser()
 }

@@ -370,15 +370,19 @@ subscription removal notices) take the same first case. This rule is always on
 for an operator-mode server; it does not depend on `stamp_request_info`. It
 adds no wire field.
 
-Surfaces from before authentication completes keep the upstream order, with
-CONNECT `nkey` and `user` before the JWT subject. The auth callout request
-`client_info.user`, both auth error events, and the authentication error log
-use `getConnectRawAuthUser` and `getConnectAuthUser`. An auth callout decides
-the identity of a sentinel JWT connection, including `default_sentinel`, from
-the CONNECT fields, so these surfaces name the CONNECT user, not the sentinel
-subject. Static nkey, username, token, and auth-callout names keep their
-existing fallbacks. An auth callout clears the original JWT before it installs
-its user.
+The auth callout request `client_info.user`, both auth error events, and the
+authentication error log use `getConnectRawAuthUser` and `getConnectAuthUser`.
+While an auth callout decides the identity, they keep the upstream order, with
+CONNECT `nkey` and `user` before the JWT subject. A callout decides the
+identity when the connection's account has external authorization and the
+user is not one of its auth users (`calloutDecidesIdentity`, the same
+condition that calls the callout). A sentinel JWT connection, including
+`default_sentinel`, therefore reports the CONNECT user, not the sentinel
+subject. In every other case these surfaces report like `getRawAuthUser`: a
+grant or verification hook that rejects a verified JWT user reports the
+verified subject, because no callout decides that identity. Static nkey,
+username, token, and auth-callout names keep their existing fallbacks. An
+auth callout clears the original JWT before it installs its user.
 
 ## 2.6 LEAF handling (forwarded requests)
 
@@ -444,9 +448,9 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
 
 - `server/soo-changes.go` — `stampRequestInfoHeaderIfNeeded` (hot path + cache),
   `getClientInfoForRequest`, `skipRequestInfoStamp` + the skip-prefix list.
-  `getConnectRawAuthUser` and `getConnectAuthUser` keep the upstream name
-  order for the auth callout request, auth error events, and the
-  authentication error log.
+  `getConnectRawAuthUser` and `getConnectAuthUser` serve the auth callout
+  request, auth error events, and the authentication error log; they keep the
+  upstream name order only while `calloutDecidesIdentity` is true.
 - `server/client.go` — call site in `processInboundClientMsg`; the
   `client.ciStampHdr` cache field and its invalidation points. `getRawAuthUser`
   selects the verified JWT subject for stamps, events, and monitoring;
@@ -462,7 +466,10 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
   It checks request headers, system events, and CONNZ results and filters with
   optional CONNECT identity fields present. `TestAuthCalloutSentinelKeepsConnectUser`
   checks that a sentinel connection's callout request, auth error events, and
-  authentication error log name the CONNECT user. `TestAuthUserLogLabelsPreferVerifiedJWT`
+  authentication error log name the CONNECT user.
+  `TestAuthHookRejectionNamesVerifiedSubject` checks that a grant or
+  verification hook rejection names the verified subject on the same three
+  surfaces. `TestAuthUserLogLabelsPreferVerifiedJWT`
   and the connection log label check in the identity test cover log labels.
 
 ---
@@ -1087,7 +1094,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
   ```sh
   # Features 1, 2, 4, 5, 6, 7 and 8, and section 11
-  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 

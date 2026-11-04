@@ -367,3 +367,150 @@ func TestAuthCalloutSentinelKeepsConnectUser(t *testing.T) {
 		}
 	}
 }
+
+// A grant or verification hook rejects a connection after the server verified
+// its JWT. No callout decides that identity, so both auth error events and
+// the authentication error log name the verified subject, not a CONNECT nkey.
+func TestAuthHookRejectionNamesVerifiedSubject(t *testing.T) {
+	for _, hook := range []string{"grant", "verify"} {
+		t.Run(hook, func(t *testing.T) {
+			var s *Server
+			var systemKeyPair nkeys.KeyPair
+			var credentials, observer nats.Option
+			connect := map[string]any{}
+			if hook == "grant" {
+				account, accountKey, _ := newRequestInfoJWTAccount(t)
+				t.Cleanup(account.Wipe)
+				signer, err := nkeys.CreateAccount()
+				require_NoError(t, err)
+				t.Cleanup(signer.Wipe)
+				signingKey, err := signer.PublicKey()
+				require_NoError(t, err)
+				claims := jwt.NewAccountClaims(accountKey)
+				scope := jwt.NewUserScope()
+				scope.Key, scope.Role = signingKey, "identity-probe"
+				scope.Template.Pub.Deny.Add(">")
+				scope.Template.Sub.Deny.Add(">")
+				claims.SigningKeys.AddScopedSigner(scope)
+				accountJWT, err := claims.Encode(oKp)
+				require_NoError(t, err)
+				accountJWT = authGrantJWTBlock(t, accountJWT, oKp, `{"mode":"grant"}`)
+				var systemKey, systemJWT string
+				systemKeyPair, systemKey, systemJWT = newRequestInfoJWTAccount(t)
+				s, _ = runRequestInfoJWTServer(t, accountKey, accountJWT, func(opts *Options) {
+					opts.SystemAccount = systemKey
+					require_NoError(t, opts.AccountResolver.Store(systemKey, systemJWT))
+					opts.AuthGrant = &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+						return &authverify.GrantVerdict{Reject: true, Reason: "identity probe"}
+					}}
+				})
+				credentials = authHookRejectionUser(t, signer, accountKey, "")
+				observer = authHookRejectionUser(t, account, "", `{"mode":"static"}`)
+			} else {
+				var accountKeyPair nkeys.KeyPair
+				s, systemKeyPair, accountKeyPair = runAuthVerifyOperatorServer(t)
+				t.Cleanup(s.Shutdown)
+				responder := startAuthVerifyResponder(t, s, systemKeyPair)
+				defer responder.Close()
+				credentials = authHookRejectionUser(t, accountKeyPair, "", "")
+				observer = authHookRejectionUser(t, accountKeyPair, "", "")
+				connect["auth_token"] = "reject"
+			}
+			logged := make(chan string, 64)
+			s.SetLogger(&captureErrorLogger{errCh: logged}, false, false)
+			sys := natsConnect(t, s.ClientURL(), createUserCreds(t, nil, systemKeyPair))
+			defer sys.Close()
+			serverErrors, err := sys.SubscribeSync("$SYS.SERVER.*.CLIENT.AUTH.ERR")
+			require_NoError(t, err)
+			require_NoError(t, sys.Flush())
+			watch := natsConnect(t, s.ClientURL(), observer)
+			defer watch.Close()
+			accountErrors, err := watch.SubscribeSync(authErrorAccountEventSubj)
+			require_NoError(t, err)
+			require_NoError(t, watch.Flush())
+
+			opts := nats.GetDefaultOptions()
+			require_NoError(t, credentials(&opts))
+			token, err := opts.UserJWT()
+			require_NoError(t, err)
+			verified, err := jwt.DecodeUserClaims(token)
+			require_NoError(t, err)
+			other, err := nkeys.CreateUser()
+			require_NoError(t, err)
+			t.Cleanup(other.Wipe)
+			otherKey, err := other.PublicKey()
+			require_NoError(t, err)
+			conn, err := net.DialTimeout("tcp", s.Addr().String(), time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+			require_NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			reader := bufio.NewReader(conn)
+			line, err := reader.ReadString('\n')
+			require_NoError(t, err)
+			var info Info
+			require_NoError(t, json.Unmarshal([]byte(strings.TrimPrefix(line, "INFO ")), &info))
+			signature, err := opts.SignatureCB([]byte(info.Nonce))
+			require_NoError(t, err)
+			connect["jwt"], connect["sig"] = token, base64.RawURLEncoding.EncodeToString(signature)
+			connect["protocol"], connect["verbose"], connect["headers"] = 1, false, true
+			connect["name"], connect["nkey"] = "identity-probe", otherKey
+			data, err := json.Marshal(connect)
+			require_NoError(t, err)
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", data)
+			require_NoError(t, err)
+			line, err = reader.ReadString('\n')
+			require_NoError(t, err)
+			require_True(t, strings.HasPrefix(line, "-ERR"))
+
+			for _, surface := range []struct {
+				name         string
+				subscription *nats.Subscription
+			}{{"server auth error event", serverErrors}, {"account auth error event", accountErrors}} {
+				message, err := surface.subscription.NextMsg(2 * time.Second)
+				require_NoError(t, err)
+				var dm DisconnectEventMsg
+				require_NoError(t, json.Unmarshal(message.Data, &dm))
+				if dm.Client.User != verified.Subject {
+					t.Errorf("%s user is not the verified JWT subject", surface.name)
+				}
+			}
+			deadline := time.After(2 * time.Second)
+			for {
+				select {
+				case entry := <-logged:
+					if !strings.Contains(entry, ErrAuthentication.Error()) {
+						continue
+					}
+					if !strings.Contains(entry, verified.Subject) || strings.Contains(entry, otherKey) {
+						t.Error("authentication error log does not name the verified JWT subject")
+					}
+					return
+				case <-deadline:
+					t.Fatal("no authentication error log")
+				}
+			}
+		})
+	}
+}
+
+// authHookRejectionUser returns credentials for a user signed by signer. A
+// scoped user has an issuer account; block, when set, is a user mode block.
+func authHookRejectionUser(t *testing.T, signer nkeys.KeyPair, issuerAccount, block string) nats.Option {
+	t.Helper()
+	user, err := nkeys.CreateUser()
+	require_NoError(t, err)
+	t.Cleanup(user.Wipe)
+	userKey, err := user.PublicKey()
+	require_NoError(t, err)
+	claims := jwt.NewUserClaims(userKey)
+	if issuerAccount != "" {
+		claims.SetScoped(true)
+		claims.IssuerAccount = issuerAccount
+	}
+	token, err := claims.Encode(signer)
+	require_NoError(t, err)
+	if block != "" {
+		token = authGrantJWTBlock(t, token, signer, block)
+	}
+	return nats.UserJWT(func() (string, error) { return token, nil }, user.Sign)
+}

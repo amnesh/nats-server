@@ -180,10 +180,13 @@ hook. Grant and verification hook requests run after JWT verification, so
 their `client` information also names the verified subject. Connection log
 labels follow the same rule.
 
-Surfaces from before authentication completes keep the upstream order, with
-CONNECT `nkey` and `user` first: the auth callout request, both auth error
-events, and the authentication error log. A callout decides the identity of a
-sentinel JWT connection from those fields.
+The auth callout request, both auth error events, and the authentication
+error log keep the upstream order, with CONNECT `nkey` and `user` first, only
+while an auth callout decides the identity: the account has external
+authorization and the user is not one of its auth users, as for a sentinel JWT
+connection. A grant-mode account cannot have external authorization, so a
+grant hook rejection reports the verified subject on these surfaces, as does a
+verification hook rejection.
 
 Hook point: the deferred block of `processClientOrLeafAuthentication` (`auth.go:704-720`), next to
 the existing `authVerificationApplies` branch. For a connection of a grant-mode account, take the
