@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 )
 
 // Subject prefixes for which we skip stamping ClientInfoHdr: the receivers
@@ -132,4 +133,32 @@ func (c *client) getClientInfoForRequest() *ClientInfo {
 	ci.RTT = c.rtt
 	c.mu.Unlock()
 	return &ci
+}
+
+// getConnectRawAuthUser returns the auth user in the upstream order, with the
+// CONNECT nkey and user fields before a JWT subject. Surfaces from before
+// authentication completes use it: the auth callout request and the auth
+// error events. An auth callout decides the identity of a sentinel JWT
+// connection from the CONNECT fields. getRawAuthUser serves authenticated
+// connections. Lock should be held.
+func (c *client) getConnectRawAuthUser() string {
+	switch {
+	case c.opts.Nkey != _EMPTY_:
+		return c.opts.Nkey
+	case c.opts.Username != _EMPTY_:
+		return c.opts.Username
+	}
+	return c.getRawAuthUser()
+}
+
+// getConnectAuthUser is the log form of getConnectRawAuthUser, for the
+// authentication error log. Lock should be held.
+func (c *client) getConnectAuthUser() string {
+	switch {
+	case c.opts.Nkey != _EMPTY_:
+		return fmt.Sprintf("Nkey %q", c.opts.Nkey)
+	case c.opts.Username != _EMPTY_:
+		return fmt.Sprintf("User %q", c.opts.Username)
+	}
+	return c.getAuthUser()
 }

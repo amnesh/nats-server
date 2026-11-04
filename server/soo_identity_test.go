@@ -244,3 +244,115 @@ func requestInfoIdentityCheck(t *testing.T, surface, user, account, wantUser, wa
 		t.Errorf("%s account is not the authenticated JWT account", surface)
 	}
 }
+
+// The auth callout decides who a sentinel connection is. Before that decision
+// completes, the callout request, both auth error events, and the
+// authentication error log name the CONNECT user, as upstream does, not the
+// sentinel's JWT subject.
+func TestAuthCalloutSentinelKeepsConnectUser(t *testing.T) {
+	systemKeyPair, systemKey := createKey(t)
+	systemClaims := jwt.NewAccountClaims(systemKey)
+	systemClaims.Name = "$SYS"
+	systemJWT, err := systemClaims.Encode(oKp)
+	require_NoError(t, err)
+	targetKeyPair, targetKey := createKey(t)
+	targetClaims := jwt.NewAccountClaims(targetKey)
+	targetClaims.Name = "TEST"
+	targetJWT, err := targetClaims.Encode(oKp)
+	require_NoError(t, err)
+	authKeyPair, err := nkeys.FromSeed([]byte(authCalloutIssuerSeed))
+	require_NoError(t, err)
+	authKey, err := authKeyPair.PublicKey()
+	require_NoError(t, err)
+	serviceKey, serviceCreds := createAuthServiceUser(t, authKeyPair)
+	defer removeFile(t, serviceCreds)
+	authClaims := jwt.NewAccountClaims(authKey)
+	authClaims.Name = "AUTH"
+	authClaims.EnableExternalAuthorization(serviceKey)
+	authClaims.Authorization.AllowedAccounts.Add(targetKey)
+	authJWT, err := authClaims.Encode(oKp)
+	require_NoError(t, err)
+	conf := fmt.Sprintf(`
+		listen: 127.0.0.1:-1
+		operator: %s
+		system_account: %s
+		resolver: MEM
+		resolver_preload: {
+			%s: %s
+			%s: %s
+			%s: %s
+		}
+	`, ojwt, systemKey, authKey, authJWT, targetKey, targetJWT, systemKey, systemJWT)
+
+	requests := make(chan [2]string, 8)
+	handler := func(m *nats.Msg) {
+		user, server, info, opts, _ := decodeAuthRequest(t, m.Data)
+		requests <- [2]string{opts.Username, info.User}
+		if opts.Username == "alice" {
+			userJWT := createAuthUser(t, user, "alice", targetKey, "", targetKeyPair, 0, nil)
+			m.Respond(serviceResponse(t, user, server.ID, userJWT, "", 0))
+			return
+		}
+		m.Respond(nil)
+	}
+	ac := NewAuthTest(t, conf, handler, nats.UserCredentials(serviceCreds))
+	defer ac.Cleanup()
+	logged := make(chan string, 64)
+	ac.srv.SetLogger(&captureErrorLogger{errCh: logged}, false, false)
+	accountErrors, err := ac.authClient.SubscribeSync(authErrorAccountEventSubj)
+	require_NoError(t, err)
+	require_NoError(t, ac.authClient.Flush())
+	sys := natsConnect(t, ac.srv.ClientURL(), createUserCreds(t, nil, systemKeyPair))
+	defer sys.Close()
+	serverErrors, err := sys.SubscribeSync("$SYS.SERVER.*.CLIENT.AUTH.ERR")
+	require_NoError(t, err)
+	require_NoError(t, sys.Flush())
+	sentinel := createBasicAccountUser(t, authKeyPair)
+	defer removeFile(t, sentinel)
+
+	request := func(want string) {
+		t.Helper()
+		select {
+		case got := <-requests:
+			if got[0] != want || got[1] != want {
+				t.Errorf("callout request for CONNECT user %q has client_info.user %q, want %q", got[0], got[1], want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no callout request for %q", want)
+		}
+	}
+	event := func(name string, subscription *nats.Subscription) {
+		t.Helper()
+		message, err := subscription.NextMsg(2 * time.Second)
+		require_NoError(t, err)
+		var dm DisconnectEventMsg
+		require_NoError(t, json.Unmarshal(message.Data, &dm))
+		if dm.Client.User != "mallory" {
+			t.Errorf("%s user = %q, want the CONNECT user %q", name, dm.Client.User, "mallory")
+		}
+	}
+
+	nc := ac.Connect(nats.UserCredentials(sentinel), nats.UserInfo("alice", "pwd"))
+	defer nc.Close()
+	request("alice")
+
+	ac.RequireConnectError(nats.UserCredentials(sentinel), nats.UserInfo("mallory", "pwd"))
+	request("mallory")
+	event("account auth error event", accountErrors)
+	event("server auth error event", serverErrors)
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case line := <-logged:
+			if !strings.Contains(line, ErrAuthentication.Error()) {
+				continue
+			}
+			if !strings.Contains(line, `User "mallory"`) {
+				t.Errorf("authentication error log does not name the CONNECT user: %q", line)
+			}
+			return
+		case <-deadline:
+			t.Fatal("no authentication error log")
+		}
+	}
+}

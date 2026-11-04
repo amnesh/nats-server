@@ -176,7 +176,13 @@ CONNECT `nkey` and `user` fields do not replace that identity in request
 headers, system events, or CONNZ results and filters. The rule also applies to
 static JWT users. Other authentication modes retain their existing identity
 fallbacks. This correction changes no wire field and adds no authorization
-hook.
+hook. Grant and verification hook requests run after JWT verification, so
+their `client` information also names the verified subject.
+
+Surfaces from before authentication completes keep the upstream order, with
+CONNECT `nkey` and `user` first: the auth callout request, both auth error
+events, and the authentication error log. A callout decides the identity of a
+sentinel JWT connection from those fields.
 
 Hook point: the deferred block of `processClientOrLeafAuthentication` (`auth.go:704-720`), next to
 the existing `authVerificationApplies` branch. For a connection of a grant-mode account, take the

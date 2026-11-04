@@ -362,10 +362,21 @@ detailed fields (JWT, issuer key, server/cluster, start time):
 Header name: **`Nats-Request-Info`** (`ClientInfoHdr`).
 
 For an authenticated JWT connection, `getRawAuthUser` returns the verified
-subject before optional CONNECT `nkey` or `user` fields. The same rule applies
-to system events and CONNZ results and user filters. It adds no wire field.
-Static nkey, username, token, and auth-callout names keep their existing
-fallbacks. An auth callout clears the original JWT before it installs its user.
+subject before optional CONNECT `nkey` or `user` fields. Request headers,
+connect and disconnect events, CONNZ results and user filters, and the
+`client` information of grant and verification hook requests use it. This rule
+is always on for an operator-mode server; it does not depend on
+`stamp_request_info`. It adds no wire field.
+
+Surfaces from before authentication completes keep the upstream order, with
+CONNECT `nkey` and `user` before the JWT subject. The auth callout request
+`client_info.user`, both auth error events, and the authentication error log
+use `getConnectRawAuthUser` and `getConnectAuthUser`. An auth callout decides
+the identity of a sentinel JWT connection, including `default_sentinel`, from
+the CONNECT fields, so these surfaces name the CONNECT user, not the sentinel
+subject. Static nkey, username, token, and auth-callout names keep their
+existing fallbacks. An auth callout clears the original JWT before it installs
+its user.
 
 ## 2.6 LEAF handling (forwarded requests)
 
@@ -431,6 +442,9 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
 
 - `server/soo-changes.go` — `stampRequestInfoHeaderIfNeeded` (hot path + cache),
   `getClientInfoForRequest`, `skipRequestInfoStamp` + the skip-prefix list.
+  `getConnectRawAuthUser` and `getConnectAuthUser` keep the upstream name
+  order for the auth callout request, auth error events, and the
+  authentication error log.
 - `server/client.go` — call site in `processInboundClientMsg`; the
   `client.ciStampHdr` cache field and its invalidation points. `getRawAuthUser`
   selects the verified JWT subject for stamps, events, and monitoring.
@@ -443,7 +457,9 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
   `test/soo-changes_test.go`. `TestClientInfoForRequestVerifiedJWTIdentity`
   covers static JWT and grant JWT connections over CLIENT and LEAF protocols.
   It checks request headers, system events, and CONNZ results and filters with
-  optional CONNECT identity fields present.
+  optional CONNECT identity fields present. `TestAuthCalloutSentinelKeepsConnectUser`
+  checks that a sentinel connection's callout request, auth error events, and
+  authentication error log name the CONNECT user.
 
 ---
 
@@ -1053,7 +1069,10 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
   with a `SignatureCB`. Feature 7 is an API that does nothing until it is
-  called. An unconfigured server behaves like upstream.
+  called. Two changes are always on: the verified JWT identity rule of
+  section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
+  or `user`), and the upstream defect correction of section 11. Otherwise an
+  unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
   `server/auth_xpermissions_compile.go`) with minimal, stable hooks in upstream
@@ -1062,8 +1081,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4, 5, 6 and 7
-  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  # Features 1, 2, 4, 5, 6, 7 and 8, and section 11
+  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 

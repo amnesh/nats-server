@@ -2608,7 +2608,7 @@ func (c *client) authViolation() {
 	if s = c.srv; s != nil {
 		defer s.sendAuthErrorEvent(c, reason.String())
 		if c.getRawAuthUser() != _EMPTY_ {
-			c.Errorf("%v - %s", ErrAuthentication, c.getAuthUser())
+			c.Errorf("%v - %s", ErrAuthentication, c.getConnectAuthUser())
 		} else {
 			c.Errorf(ErrAuthentication.Error())
 		}

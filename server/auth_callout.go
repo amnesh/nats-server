@@ -393,6 +393,8 @@ func (s *Server) processClientOrLeafCallout(c *client, opts *Options, proxyRequi
 	// Grab client info for the request.
 	c.mu.Lock()
 	c.fillClientInfo(&claim.ClientInformation)
+	// The callout decides the identity, so it sees the CONNECT user.
+	claim.ClientInformation.User = c.getConnectRawAuthUser()
 	c.fillConnectOpts(&claim.ConnectOptions, ujwt)
 	// If we have a sig in the client opts, fill in nonce.
 	if claim.ConnectOptions.SignedNonce != _EMPTY_ {
