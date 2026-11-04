@@ -136,6 +136,37 @@ func TestGetClientInfoForRequestAuthUser(t *testing.T) {
 	}
 }
 
+// Log labels of an authenticated JWT connection name the verified subject
+// before the CONNECT nkey and user fields, as the request info does.
+func TestAuthUserLogLabelsPreferVerifiedJWT(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		setup       func(c *client)
+		user, label string
+	}{
+		{"username", func(c *client) { c.opts.Username = "bob" }, `User "bob"`, "user:bob"},
+		{"nkey", func(c *client) { c.opts.Nkey = "UABC" }, `Nkey "UABC"`, "nkey:UABC"},
+		{"jwt", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB" }, `JWT User "UPUB"`, "jwt:UPUB"},
+		{"jwt with nkey", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB"; c.opts.Nkey = "UOTHER" }, `JWT User "UPUB"`, "jwt:UPUB"},
+		{"jwt with username", func(c *client) { c.opts.JWT = "ey.jwt"; c.pubKey = "UPUB"; c.opts.Username = "other" }, `JWT User "UPUB"`, "jwt:UPUB"},
+		{"unverified jwt", func(c *client) { c.opts.JWT = "ey.jwt"; c.opts.Nkey = "UOTHER" }, `Nkey "UOTHER"`, "nkey:UOTHER"},
+		{"callout username", func(c *client) { c.pubKey = "UPUB"; c.opts.Username = "callout-user" }, `User "callout-user"`, "user:callout-user"},
+		{"token", func(c *client) { c.opts.Token = "s3cr3t" }, `Token "[REDACTED]"`, "token"},
+		{"anonymous", func(c *client) {}, `User "N/A"`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &client{kind: CLIENT}
+			tc.setup(c)
+			if got := c.getAuthUser(); got != tc.user {
+				t.Errorf("getAuthUser() = %q, want %q", got, tc.user)
+			}
+			if got := c.getAuthUserLabel(); got != tc.label {
+				t.Errorf("getAuthUserLabel() = %q, want %q", got, tc.label)
+			}
+		})
+	}
+}
+
 // stampRequestInfoHeaderIfNeeded must stamp exactly when the option is on, the
 // connection is a CLIENT/LEAF, the message carries a reply, and the subject is
 // not one of the skipped prefixes — and otherwise return the message untouched.

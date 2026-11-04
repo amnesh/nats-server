@@ -364,9 +364,11 @@ Header name: **`Nats-Request-Info`** (`ClientInfoHdr`).
 For an authenticated JWT connection, `getRawAuthUser` returns the verified
 subject before optional CONNECT `nkey` or `user` fields. Request headers,
 connect and disconnect events, CONNZ results and user filters, and the
-`client` information of grant and verification hook requests use it. This rule
-is always on for an operator-mode server; it does not depend on
-`stamp_request_info`. It adds no wire field.
+`client` information of grant and verification hook requests use it. The log
+labels `getAuthUser` and `getAuthUserLabel` (the connection log suffix and the
+subscription removal notices) take the same first case. This rule is always on
+for an operator-mode server; it does not depend on `stamp_request_info`. It
+adds no wire field.
 
 Surfaces from before authentication completes keep the upstream order, with
 CONNECT `nkey` and `user` before the JWT subject. The auth callout request
@@ -447,7 +449,8 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
   authentication error log.
 - `server/client.go` — call site in `processInboundClientMsg`; the
   `client.ciStampHdr` cache field and its invalidation points. `getRawAuthUser`
-  selects the verified JWT subject for stamps, events, and monitoring.
+  selects the verified JWT subject for stamps, events, and monitoring;
+  `getAuthUser` and `getAuthUserLabel` do the same for log labels.
 - `server/leafnode.go` — leaf inbound call site.
 - `server/server.go` — the `Server.stampReqInfo` atomic mirror, set at startup and
   on reload.
@@ -459,7 +462,8 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
   It checks request headers, system events, and CONNZ results and filters with
   optional CONNECT identity fields present. `TestAuthCalloutSentinelKeepsConnectUser`
   checks that a sentinel connection's callout request, auth error events, and
-  authentication error log name the CONNECT user.
+  authentication error log name the CONNECT user. `TestAuthUserLogLabelsPreferVerifiedJWT`
+  and the connection log label check in the identity test cover log labels.
 
 ---
 
@@ -1071,7 +1075,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   with a `SignatureCB`. Feature 7 is an API that does nothing until it is
   called. Two changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
-  or `user`), and the upstream defect correction of section 11. Otherwise an
+  or `user`; it changes reported identity and log labels), and the upstream
+  defect correction of section 11. Otherwise an
   unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
@@ -1082,7 +1087,7 @@ Adding a macro for another resource is a one-line addition to `permMacros`
 
   ```sh
   # Features 1, 2, 4, 5, 6, 7 and 8, and section 11
-  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 

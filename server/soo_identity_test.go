@@ -80,6 +80,9 @@ func TestClientInfoForRequestVerifiedJWTIdentity(t *testing.T) {
 						if r.UserNkey != userKey {
 							t.Error("grant hook received a different authenticated user")
 						}
+						if r.Client.User != userKey {
+							t.Error("grant hook client user is not the authenticated JWT subject")
+						}
 						return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
 					}}
 				}
@@ -123,6 +126,14 @@ func TestClientInfoForRequestVerifiedJWTIdentity(t *testing.T) {
 						defer conn.Close()
 						connected := requestInfoIdentityEvent(t, connects)
 						requestInfoIdentityCheck(t, "connect event", connected.User, connected.Account, userKey, accountKey)
+						peer := s.getClient(connected.ID)
+						if leaf {
+							peer = s.GetLeafNode(connected.ID)
+						}
+						require_True(t, peer != nil)
+						if label, _ := peer.ncsUser.Load().(string); label != "jwt:"+userKey {
+							t.Error("connection log label is not the authenticated JWT subject")
+						}
 						command := "PUB"
 						if leaf {
 							command = "LMSG"

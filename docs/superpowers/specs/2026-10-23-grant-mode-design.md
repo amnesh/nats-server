@@ -177,7 +177,8 @@ headers, system events, or CONNZ results and filters. The rule also applies to
 static JWT users. Other authentication modes retain their existing identity
 fallbacks. This correction changes no wire field and adds no authorization
 hook. Grant and verification hook requests run after JWT verification, so
-their `client` information also names the verified subject.
+their `client` information also names the verified subject. Connection log
+labels follow the same rule.
 
 Surfaces from before authentication completes keep the upstream order, with
 CONNECT `nkey` and `user` first: the auth callout request, both auth error

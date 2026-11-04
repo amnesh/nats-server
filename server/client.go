@@ -6979,6 +6979,8 @@ func (c *client) getRawAuthUser() string {
 // Lock should be held.
 func (c *client) getAuthUser() string {
 	switch {
+	case c.opts.JWT != _EMPTY_ && c.pubKey != _EMPTY_:
+		return fmt.Sprintf("JWT User %q", c.pubKey)
 	case c.opts.Nkey != _EMPTY_:
 		return fmt.Sprintf("Nkey %q", c.opts.Nkey)
 	case c.opts.Username != _EMPTY_:
@@ -6995,6 +6997,8 @@ func (c *client) getAuthUser() string {
 // getAuthUserLabel returns a label for the auth user for the client.
 func (c *client) getAuthUserLabel() string {
 	switch {
+	case c.opts.JWT != _EMPTY_ && c.pubKey != _EMPTY_:
+		return fmt.Sprintf("jwt:%s", c.pubKey)
 	case c.opts.Nkey != _EMPTY_:
 		return fmt.Sprintf("nkey:%s", c.opts.Nkey)
 	case c.opts.Username != _EMPTY_:
