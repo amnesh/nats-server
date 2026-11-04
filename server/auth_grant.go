@@ -262,6 +262,9 @@ func (c *client) installAuthGrant(p *Permissions, pub, sub grantPrefixRules) {
 	c.user.Permissions = p
 	c.user.defaultPerms = false
 	c.setPermissions(p)
+	if c.kind == LEAF && c.leaf != nil {
+		c.leaf.grantPub = &SubjectPermission{Allow: append([]string{}, p.Publish.Allow...), Deny: slices.Clone(p.Publish.Deny)}
+	}
 	if c.perms.sub.allow == nil {
 		c.perms.sub.allow = NewSublistNoCache()
 	}

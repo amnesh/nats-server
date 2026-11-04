@@ -28,13 +28,24 @@ type grantLeafExport struct {
 	AllowPrefix []string `json:"allow_prefix,omitempty"`
 }
 
+// leafExportPermission returns what the remote leaf may publish into this
+// server. For a grant leaf it is the copy that installAuthGrant keeps, because
+// a CONNECT can replace c.opts.Export before re-authentication installs the
+// grant again. The client lock is held.
+func (c *client) leafExportPermission() *SubjectPermission {
+	if c.leaf != nil && c.leaf.grantPub != nil {
+		return c.leaf.grantPub
+	}
+	return c.opts.Export
+}
+
 func (c *client) grantLeafExportJSON() json.RawMessage {
 	grant := grantLeafExport{Allow: []string{fwcs}}
-	if c.opts.Export != nil {
-		if c.opts.Export.Allow != nil {
-			grant.Allow = append([]string{}, c.opts.Export.Allow...)
+	if export := c.leafExportPermission(); export != nil {
+		if export.Allow != nil {
+			grant.Allow = append([]string{}, export.Allow...)
 		}
-		grant.Deny = slices.Clone(c.opts.Export.Deny)
+		grant.Deny = slices.Clone(export.Deny)
 	}
 	for _, rule := range c.perms.sub.prefix {
 		tokens := make([]string, len(rule))

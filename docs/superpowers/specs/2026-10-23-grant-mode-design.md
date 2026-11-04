@@ -394,6 +394,13 @@ are separate, including when their projected rows collide. Queue weights are
 summed once per source row. Mapping and service-import notifications reconcile
 current account inventory under the client-before-account lock order.
 
+The projection, the `export_grant` field, and the inbound publish check of an
+accepted grant leaf read a server-owned copy of the publish grant. Each grant
+installation sets this copy. CONNECT decoding cannot change it. A second CONNECT
+decodes `export` into the connection options, and the JSON decoder can write
+into the installed permission object. Re-authentication installs the grant
+again only later. Static leaves keep reading the connection options.
+
 The existing INFO Import and Export values retain their wire representation.
 A grant hub adds optional `export_grant` with exact `allow`, `deny`, and
 `allow_prefix` lists. `allow` has no omission tag. A solicited spoke consumes

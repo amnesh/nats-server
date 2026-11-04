@@ -1140,6 +1140,14 @@ rules contribute standard wildcard supersets. Source ownership retains overlaps
 and queue weights across initialization, live changes, and reconnects. Mapping
 and service-import notifications reconcile the current account inventory.
 
+The hub keeps its own copy of the publish grant of each accepted grant leaf.
+Interest projection, the INFO `export_grant` object, and the inbound publish
+check read that copy. Each CONNECT decodes its `export` field into the
+connection options. A second CONNECT does this before re-authentication installs
+the grant again. The copy prevents that field from widening the projected
+interest in this interval. `TestAuthGrantLeafSecondConnectExportKeepsInterestConfined`
+holds this interval open and checks that no row outside the grant goes to the leaf.
+
 Legacy INFO Import and Export remain unchanged. A grant hub also sends the optional
 INFO `export_grant` object with `allow`, `deny`, and `allow_prefix`. The `allow`
 field is always present. A new solicited spoke installs this exact export grant;

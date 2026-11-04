@@ -59,13 +59,14 @@ func intersectGrantLeafSubjects(a, b string) string {
 // The client lock protects the permission snapshot and delivery deny filters.
 func (c *client) projectGrantLeafSource(key string) []string {
 	subject, queue, hasQueue := strings.Cut(key, " ")
+	export := c.leafExportPermission()
 	var rows []string
 	add := func(row string) {
 		if row == _EMPTY_ {
 			return
 		}
-		if c.opts.Export != nil {
-			for _, deny := range c.opts.Export.Deny {
+		if export != nil {
+			for _, deny := range export.Deny {
 				if subjectIsSubsetMatch(row, deny) {
 					return
 				}
@@ -78,8 +79,8 @@ func (c *client) projectGrantLeafSource(key string) []string {
 		rows = append(rows, row)
 	}
 	allows := []string{fwcs}
-	if c.opts.Export != nil && c.opts.Export.Allow != nil {
-		allows = c.opts.Export.Allow
+	if export != nil && export.Allow != nil {
+		allows = export.Allow
 	}
 	for _, allow := range allows {
 		add(intersectGrantLeafSubjects(subject, allow))

@@ -31,6 +31,21 @@ import (
 
 func authGrantRawLeaf(t *testing.T, hub *Server, credentials nats.Option, hubRole ...bool) (net.Conn, *bufio.Reader) {
 	t.Helper()
+	conn, r, fields := authGrantDialLeaf(t, hub, credentials)
+	if len(hubRole) > 0 {
+		fields["is_hub"] = hubRole[0]
+	}
+	connect, err := json.Marshal(fields)
+	require_NoError(t, err)
+	_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", connect)
+	require_NoError(t, err)
+	return conn, r
+}
+
+// authGrantDialLeaf reads the hub INFO and returns the signed CONNECT fields
+// without sending them.
+func authGrantDialLeaf(t *testing.T, hub *Server, credentials nats.Option) (net.Conn, *bufio.Reader, map[string]any) {
+	t.Helper()
 	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", hub.getOpts().LeafNode.Port), time.Second)
 	require_NoError(t, err)
 	t.Cleanup(func() { conn.Close() })
@@ -46,15 +61,7 @@ func authGrantRawLeaf(t *testing.T, hub *Server, credentials nats.Option, hubRol
 	require_NoError(t, err)
 	sig, err := opts.SignatureCB([]byte(info.Nonce))
 	require_NoError(t, err)
-	fields := map[string]any{"jwt": token, "sig": base64.RawURLEncoding.EncodeToString(sig), "name": "grant-test-leaf", "headers": true}
-	if len(hubRole) > 0 {
-		fields["is_hub"] = hubRole[0]
-	}
-	connect, err := json.Marshal(fields)
-	require_NoError(t, err)
-	_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", connect)
-	require_NoError(t, err)
-	return conn, r
+	return conn, r, map[string]any{"jwt": token, "sig": base64.RawURLEncoding.EncodeToString(sig), "name": "grant-test-leaf", "headers": true}
 }
 
 func authGrantLeafUntilPong(t *testing.T, r *bufio.Reader) []string {
@@ -424,4 +431,70 @@ func TestAuthGrantLeafResponseInterestRemovedAfterUse(t *testing.T) {
 	lines := request(second)
 	require_True(t, slices.Contains(lines, "LS+ "+second))
 	require_True(t, slices.Contains(lines, "LS- "+first))
+}
+
+// A second CONNECT on an admitted grant leaf decodes its export field into
+// c.opts before re-authentication installs the grant again. JSON decoding
+// writes into the existing permission or replaces it. Interest that the hub
+// projects for its subscriptions in that interval must still follow the
+// grant.
+func TestAuthGrantLeafSecondConnectExportKeepsInterestConfined(t *testing.T) {
+	for _, test := range []struct{ name, export, decoded string }{
+		{"allow_all", `{"allow":[">"]}`, `{"allow":["\u003e"]}`},
+		{"allow_null", `{"allow":null}`, `{}`},
+		{"null", `null`, `null`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			hook := authGrantOrdinaryInterestHook()
+			f := newGrantFixture(t, hook)
+			hub := grantTransportCloneHub(t, f, hook, true)
+			nc, err := nats.Connect(hub.ClientURL(), nats.UserCredentials(grantTransportCredentials(t, f, true)), nats.NoReconnect())
+			require_NoError(t, err)
+			defer nc.Close()
+
+			conn, reader, fields := authGrantDialLeaf(t, hub, f.creds(t, f.signer, true, "", 0))
+			first, err := json.Marshal(fields)
+			require_NoError(t, err)
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", first)
+			require_NoError(t, err)
+			authGrantLeafUntilPong(t, reader)
+			lc := hub.GetLeafNode(authGrantSingleLeafID(t, hub))
+			require_True(t, lc != nil)
+			fields["export"] = json.RawMessage(test.export)
+			second, err := json.Marshal(fields)
+			require_NoError(t, err)
+
+			// After the second CONNECT is decoded, clearAccountSubs and
+			// re-authentication take the server lock. Hold it to keep the
+			// leaf in its account with the decoded CONNECT fields.
+			hub.mu.Lock()
+			defer hub.mu.Unlock()
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\n", second)
+			require_NoError(t, err)
+			checkFor(t, 2*time.Second, time.Millisecond, func() error {
+				lc.mu.Lock()
+				got, err := json.Marshal(lc.opts.Export)
+				lc.mu.Unlock()
+				if err != nil || string(got) != test.decoded {
+					return fmt.Errorf("second CONNECT export = %s, want %s", got, test.decoded)
+				}
+				return nil
+			})
+
+			// A hub SUB reaches the leaf projection without the server lock.
+			// Rows leave in order, so the in-grant row is a barrier for any
+			// earlier row of the subject outside the grant.
+			_, err = nc.SubscribeSync("secret.value")
+			require_NoError(t, err)
+			_, err = nc.SubscribeSync("out.allowed")
+			require_NoError(t, err)
+			var lines []string
+			for !slices.Contains(lines, "LS+ out.allowed") {
+				line, err := reader.ReadString('\n')
+				require_NoError(t, err)
+				lines = append(lines, strings.TrimSpace(line))
+			}
+			authGrantRequireInterestRows(t, lines, "LS+", "secret.", nil)
+		})
+	}
 }

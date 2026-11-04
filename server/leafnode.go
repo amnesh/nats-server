@@ -103,6 +103,9 @@ type leaf struct {
 	grantDenyPub         []string
 	grantDenySub         []string
 	grantInterestDropped bool
+	// grantPub is a copy of the Pub permission of the installed grant. Every
+	// CONNECT decodes into c.opts.Export, never into this copy.
+	grantPub *SubjectPermission
 	// This map will contain all the subscriptions that have been added to the smap
 	// during initLeafNodeSmapAndSendSubs. It is short lived and is there to avoid
 	// race between processing of a sub where sub is added to account sublist but
@@ -3626,7 +3629,7 @@ func (c *client) leafSendAllowed(bsubject []byte) bool {
 	// the normal forwarding path, and applying them here would reject
 	// legitimate inbound JS API requests.
 	subject := bytesToString(bsubject)
-	perms := c.opts.Export
+	perms := c.leafExportPermission()
 	if perms == nil || (perms.Allow == nil && perms.Deny == nil) {
 		return true
 	}
