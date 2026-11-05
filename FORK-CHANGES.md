@@ -26,8 +26,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
 | 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
 | 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
+| 12 | Grant reject codes | a reject code from the grant hook, `DisconnectClient`, or the static callout `code` | `server/auth_reject_codes.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect. Section 12 documents the reject codes.
 
 ---
 
@@ -170,12 +171,16 @@ engine needs. It is not signed: the security boundary is the system account.
     "sub": { "allow": ["_INBOX.>"] },
     "resp":{ "max": 1, "ttl": 2000000000 }
   },
-  "expires":       0                 // optional unix-seconds; only honored if SOONER than the JWT exp
+  "expires":       0,                // optional unix-seconds; only honored if SOONER than the JWT exp
+  "code":          0                 // optional reject code (section 12); only used with reject
 }
 ```
 
 Outcomes:
-- `reject: true` → connection denied.
+- `reject: true` → connection denied. The optional `code` selects the wire
+  text and close state of section 12. An absent, unknown, or malformed `code`
+  is a denial (`Authorization Violation`). A malformed `code` makes the
+  complete response invalid, so it also rejects.
 - no `permissions`/`expires` → admit unchanged.
 - `permissions`/`expires` present → the server narrows the verified claims and
   re-registers the user before admitting.
@@ -1240,15 +1245,9 @@ Raw signed JWT updates can replace them.
 
 `Server.DisconnectClient(id, code)` acts only on grant connections. It returns
 `ErrNotGrantMode` for a non-grant connection and `ErrUnknownClient` for an unknown
-ID. It accepts either reject code:
-
-| Code | Wire error | Planned-close reason |
-|---|---|---|
-| `CodeDenied` | `Authorization Violation` | `GrantRejected` |
-| `CodeResourceLimit` | `maximum connections exceeded` | `ResourceLimit` |
-
-Admission denial uses `AuthenticationViolation` for `CodeDenied`. Resource-limit
-admission uses `ResourceLimit`. Hook rejection reasons appear only in server logs.
+ID. It accepts every reject code. Section 12 gives the wire error and the
+close state of each code, for a planned close and for an admission rejection.
+Hook rejection reasons appear only in server logs.
 Both APIs can run from any goroutine. A caller must not hold a lock that its own
 `Closed` implementation needs.
 
@@ -1371,4 +1370,68 @@ change.
 
 ```sh
 go test -race ./server -run 'TestLeafNodeTsubUpdateAfterLeafRemoval' -count=1
+```
+
+
+# 12. Grant reject codes
+
+`authverify.RejectCode` classifies a rejection. The values are wire values of
+the static callout (`AuthVerifyResponse.code`), so new codes are only
+appended. The grant hook (`GrantVerdict.Code`), the static callout, and
+`Server.DisconnectClient` use the same codes. An unknown code is `CodeDenied`.
+
+| Code | Value | Admission `-ERR` | Admission close state | Planned close `-ERR` | Planned close state |
+|---|---|---|---|---|---|
+| `CodeDenied` | 0 | `Authorization Violation` | `AuthenticationViolation` | `Authorization Violation` | `GrantRejected` |
+| `CodeResourceLimit` | 1 | `maximum connections exceeded` | `ResourceLimit` | `maximum connections exceeded` | `ResourceLimit` |
+| `CodeRetry` | 2 | `Authorization Temporarily Unavailable` | `AuthorizationUnavailable` | none | `AuthorizationUnavailable` |
+| `CodeQuarantined` | 3 | `Account Quarantined` | `AccountQuarantined` | none | `AccountQuarantined` |
+| `CodeRevoked` | 4 | `User Authentication Revoked` | `Revocation` | `User Authentication Revoked` | `Revocation` |
+
+The new close states `AuthorizationUnavailable` and `AccountQuarantined` come
+after `ResourceLimit`. Their strings are `Authorization Unavailable` and
+`Account Quarantined`. A WebSocket close uses status 1008 (policy violation)
+for both, as for `Revocation`. An admission rejection sends the `$SYS` auth
+error events (`$SYS.SERVER.<id>.CLIENT.AUTH.ERR`, and
+`$SYS.ACCOUNT.CLIENT.AUTH.ERR` in the account) with the close state string as
+the reason. The planned close sends the normal disconnect event with the
+close state string.
+
+Client behavior with nats.go v1.53.1:
+
+- `Authorization Temporarily Unavailable` and `Account Quarantined` are not
+  authentication error texts. A client retries with its normal reconnect wait
+  and does not stop after two equal errors. A first `Connect` fails unless the
+  client sets `RetryOnFailedConnect`.
+- A planned close for `CodeRetry` or `CodeQuarantined` sends no `-ERR`. While
+  connected, nats.go closes for good on an error text that it does not know.
+  After a close without `-ERR` it reconnects.
+- nats.go classifies `User Authentication Revoked` as `ErrAuthRevoked`. It
+  stops after the second equal rejection on one server, unless the client sets
+  `IgnoreAuthErrorAbort`.
+- A leaf remote reconnects after `LeafNode.ReconnectInterval` for every code.
+
+Only `CodeRevoked` sends the revoked text at admission. A JWT that the account
+JWT revokes (upstream `checkUserRevoked`) still gets `Authorization Violation`
+at admission. Upstream live revocation of a connected user keeps its text
+`User Authentication Revoked`.
+
+Code and tests:
+
+- `server/authverify/grant.go` defines the codes. `server/authverify/req.go`
+  adds `AuthVerifyResponse.Code`.
+- `server/auth_reject_codes.go` maps a code to its authentication error, close
+  state, and wire text. Hooks: `server/auth_grant.go` (admission and
+  `DisconnectClient`), `server/auth_verification.go` (static callout; only
+  the consumed verdict sets the code), `server/auth.go`
+  (`getAuthErrClosedState`), `server/client.go` (close states and
+  `authViolation`), `server/monitor.go` (strings), `server/websocket.go`
+  (close status).
+- `server/auth_grant_transport_test.go` covers both wire paths, the nats.go
+  client retry and stop, and the leaf retry. `server/auth_verification_test.go`
+  (`TestAuthVerifyCalloutRejectCodes`) covers the static `code` and the `$SYS`
+  events.
+
+```sh
+go test -race -run 'AuthGrant(Reject|Disconnect|Client|Connected|Leaf)|AuthVerifyCallout' ./server ./server/authverify -count=1
 ```

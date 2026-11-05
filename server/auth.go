@@ -1891,9 +1891,10 @@ func (s *Server) processProxiesTrustedKeys() {
 
 // Returns the connection's `ClosedState` for the given authenication error.
 func getAuthErrClosedState(authErr error) ClosedState {
+	if reason, ok := authRejectClosedState(authErr); ok {
+		return reason
+	}
 	switch authErr {
-	case errAuthGrantResourceLimit:
-		return ResourceLimit
 	case ErrAuthProxyNotTrusted:
 		return ProxyNotTrusted
 	case ErrAuthProxyRequired:

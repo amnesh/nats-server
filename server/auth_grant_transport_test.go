@@ -148,6 +148,11 @@ func TestAuthGrantRejectWire(t *testing.T) {
 	}{
 		{"denied", authverify.CodeDenied, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 		{"resource limit", authverify.CodeResourceLimit, "-ERR 'maximum connections exceeded'\r\n", ResourceLimit},
+		{"retry", authverify.CodeRetry, "-ERR 'Authorization Temporarily Unavailable'\r\n", AuthorizationUnavailable},
+		{"quarantined", authverify.CodeQuarantined, "-ERR 'Account Quarantined'\r\n", AccountQuarantined},
+		{"revoked", authverify.CodeRevoked, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"unknown", authverify.RejectCode(99), "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"negative", authverify.RejectCode(-1), "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requests := make(chan *authverify.GrantRequest, 1)
@@ -182,6 +187,11 @@ func TestAuthGrantDisconnectWire(t *testing.T) {
 	}{
 		{"denied", authverify.CodeDenied, "-ERR 'Authorization Violation'\r\n", GrantRejected},
 		{"resource limit", authverify.CodeResourceLimit, "-ERR 'maximum connections exceeded'\r\n", ResourceLimit},
+		// No -ERR: nats.go closes for good on an unknown error text while connected.
+		{"retry", authverify.CodeRetry, "", AuthorizationUnavailable},
+		{"quarantined", authverify.CodeQuarantined, "", AccountQuarantined},
+		{"revoked", authverify.CodeRevoked, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"unknown", authverify.RejectCode(99), "-ERR 'Authorization Violation'\r\n", GrantRejected},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			requests := make(chan *authverify.GrantRequest, 1)
@@ -196,11 +206,14 @@ func TestAuthGrantDisconnectWire(t *testing.T) {
 			require_Equal(t, line, "PONG\r\n")
 			request := grantRecv(t, requests)
 			require_NoError(t, f.s.DisconnectClient(request.Client.ID, test.code))
-			line, err = reader.ReadString('\n')
+			if test.wire != "" {
+				line, err = reader.ReadString('\n')
+				require_NoError(t, err)
+				require_Equal(t, line, test.wire)
+			}
+			rest, err := io.ReadAll(reader)
 			require_NoError(t, err)
-			require_Equal(t, line, test.wire)
-			_, err = reader.ReadByte()
-			require_Equal(t, err, io.EOF)
+			require_Equal(t, string(rest), "")
 			require_Equal(t, grantRecv(t, closed), request.Client.ID)
 			grantTransportClosedReason(t, f.s, request.Client.ID, test.reason)
 			require_Equal(t, f.s.DisconnectClient(request.Client.ID, test.code), ErrUnknownClient)
@@ -530,4 +543,205 @@ func TestAuthGrantLeafStandardWildcardInterest(t *testing.T) {
 	_, err = sub.NextMsg(100 * time.Millisecond)
 	require_Equal(t, err, nats.ErrTimeout)
 	checkLeafNodeConnected(t, hub)
+}
+
+// grantCodeClient connects a nats.go client that retries a failed first
+// connect. The hook rejects the first rejects attempts with code, then admits.
+// The client does not set IgnoreAuthErrorAbort.
+func grantCodeClient(t *testing.T, code authverify.RejectCode, rejects int32) (*grantFixture, *nats.Conn, *atomic.Int32, chan struct{}, chan struct{}) {
+	t.Helper()
+	var attempts atomic.Int32
+	f := newGrantFixture(t, &testGrantHook{verify: func(*authverify.GrantRequest) *authverify.GrantVerdict {
+		if attempts.Add(1) <= rejects {
+			return &authverify.GrantVerdict{Reject: true, Code: code, Reason: "private rejection detail"}
+		}
+		return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+	}})
+	connected := make(chan struct{}, 4)
+	closed := make(chan struct{}, 1)
+	nc, err := nats.Connect(f.s.ClientURL(), f.creds(t, f.signer, true, "", 0),
+		nats.RetryOnFailedConnect(true), nats.DontRandomize(), nats.MaxReconnects(20),
+		nats.ReconnectWait(10*time.Millisecond), nats.ReconnectJitter(0, 0),
+		nats.ConnectHandler(func(*nats.Conn) { connected <- struct{}{} }),
+		nats.ReconnectHandler(func(*nats.Conn) { connected <- struct{}{} }),
+		nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }))
+	require_NoError(t, err)
+	t.Cleanup(nc.Close)
+	return f, nc, &attempts, connected, closed
+}
+
+// grantStableCount checks that the hook count stays at want for a short period.
+func grantStableCount(t *testing.T, attempts *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := attempts.Load(); got != want {
+			t.Fatalf("hook calls %d, want %d", got, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestAuthGrantClientRetryCodeReconnects(t *testing.T) {
+	_, nc, attempts, connected, closed := grantCodeClient(t, authverify.CodeRetry, 2)
+	grantRecv(t, connected)
+	require_True(t, nc.IsConnected())
+	require_Equal(t, attempts.Load(), int32(3))
+	select {
+	case <-closed:
+		t.Fatal("client closed after retry rejections")
+	default:
+	}
+	t.Run("denied control stops", func(t *testing.T) {
+		_, nc, attempts, _, closed := grantCodeClient(t, authverify.CodeDenied, 100)
+		grantRecv(t, closed)
+		require_True(t, nc.IsClosed())
+		require_Equal(t, nc.LastError().Error(), "nats: Authorization Violation")
+		grantStableCount(t, attempts, 2)
+	})
+}
+
+func TestAuthGrantClientQuarantineCodeReconnects(t *testing.T) {
+	_, nc, attempts, connected, closed := grantCodeClient(t, authverify.CodeQuarantined, 2)
+	grantRecv(t, connected)
+	require_True(t, nc.IsConnected())
+	require_Equal(t, attempts.Load(), int32(3))
+	select {
+	case <-closed:
+		t.Fatal("client closed after quarantine rejections")
+	default:
+	}
+}
+
+func TestAuthGrantClientRevokedCodeStops(t *testing.T) {
+	t.Run("connect rejection", func(t *testing.T) {
+		_, nc, attempts, _, closed := grantCodeClient(t, authverify.CodeRevoked, 100)
+		grantRecv(t, closed)
+		require_True(t, nc.IsClosed())
+		// nats.go classifies this text as ErrAuthRevoked and stops after the
+		// second equal rejection on one server.
+		require_Equal(t, nc.LastError().Error(), "nats: User Authentication Revoked")
+		grantStableCount(t, attempts, 2)
+	})
+	t.Run("planned disconnect", func(t *testing.T) {
+		var attempts atomic.Int32
+		requests := make(chan *authverify.GrantRequest, 8)
+		f := newGrantFixture(t, &testGrantHook{verify: func(request *authverify.GrantRequest) *authverify.GrantVerdict {
+			requests <- request
+			if attempts.Add(1) > 1 {
+				return &authverify.GrantVerdict{Reject: true, Code: authverify.CodeRevoked}
+			}
+			return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+		}})
+		closed := make(chan struct{}, 1)
+		errs := make(chan error, 8)
+		nc, err := nats.Connect(f.s.ClientURL(), f.creds(t, f.signer, true, "", 0),
+			nats.DontRandomize(), nats.MaxReconnects(20), nats.ReconnectWait(10*time.Millisecond),
+			nats.ReconnectJitter(0, 0), nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) { errs <- err }))
+		require_NoError(t, err)
+		defer nc.Close()
+		first := grantRecv(t, requests)
+		require_NoError(t, f.s.DisconnectClient(first.Client.ID, authverify.CodeRevoked))
+		require_Equal(t, grantRecv(t, errs), nats.ErrAuthRevoked)
+		grantRecv(t, closed)
+		require_Equal(t, nc.LastError().Error(), "nats: User Authentication Revoked")
+		grantTransportClosedReason(t, f.s, first.Client.ID, Revocation)
+		grantStableCount(t, &attempts, 2)
+	})
+}
+
+func TestAuthGrantConnectedRetryDisconnectReconnects(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		code   authverify.RejectCode
+		reason ClosedState
+	}{
+		{"retry", authverify.CodeRetry, AuthorizationUnavailable},
+		{"quarantined", authverify.CodeQuarantined, AccountQuarantined},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			requests := make(chan *authverify.GrantRequest, 8)
+			f := newGrantFixture(t, &testGrantHook{verify: func(request *authverify.GrantRequest) *authverify.GrantVerdict {
+				requests <- request
+				return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+			}})
+			reconnected := make(chan struct{}, 4)
+			closed := make(chan struct{}, 1)
+			errs := make(chan error, 4)
+			nc, err := nats.Connect(f.s.ClientURL(), f.creds(t, f.signer, true, "", 0),
+				nats.DontRandomize(), nats.MaxReconnects(20), nats.ReconnectWait(10*time.Millisecond),
+				nats.ReconnectJitter(0, 0),
+				nats.ReconnectHandler(func(*nats.Conn) { reconnected <- struct{}{} }),
+				nats.ClosedHandler(func(*nats.Conn) { closed <- struct{}{} }),
+				nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) { errs <- err }))
+			require_NoError(t, err)
+			defer nc.Close()
+			first := grantRecv(t, requests)
+			require_NoError(t, f.s.DisconnectClient(first.Client.ID, test.code))
+			grantRecv(t, reconnected)
+			second := grantRecv(t, requests)
+			require_True(t, second.Client.ID != first.Client.ID)
+			require_True(t, nc.IsConnected())
+			grantTransportClosedReason(t, f.s, first.Client.ID, test.reason)
+			select {
+			case <-closed:
+				t.Fatal("client closed after a planned retry disconnect")
+			case err := <-errs:
+				t.Fatalf("client received an error: %v", err)
+			default:
+			}
+		})
+	}
+}
+
+func TestAuthGrantLeafRetryCodesReconnect(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		code   authverify.RejectCode
+		reason ClosedState
+	}{
+		{"retry", authverify.CodeRetry, AuthorizationUnavailable},
+		{"quarantined", authverify.CodeQuarantined, AccountQuarantined},
+	} {
+		t.Run(test.name+" connect rejection", func(t *testing.T) {
+			var attempts atomic.Int32
+			requests := make(chan *authverify.GrantRequest, 16)
+			hook := &testGrantHook{verify: func(request *authverify.GrantRequest) *authverify.GrantVerdict {
+				requests <- request
+				if attempts.Add(1) <= 2 {
+					return &authverify.GrantVerdict{Reject: true, Code: test.code}
+				}
+				return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+			}}
+			f := newGrantFixture(t, hook)
+			hub := grantTransportCloneHub(t, f, hook, true)
+			leaf := grantTransportLeaf(t, grantTransportCredentials(t, f, false), hub)
+			rejected := grantRecv(t, requests)
+			checkLeafNodeConnected(t, hub)
+			checkLeafNodeConnected(t, leaf)
+			require_Equal(t, attempts.Load(), int32(3))
+			grantTransportClosedReason(t, hub, rejected.Client.ID, test.reason)
+		})
+		t.Run(test.name+" planned disconnect", func(t *testing.T) {
+			requests := make(chan *authverify.GrantRequest, 16)
+			hook := &testGrantHook{verify: func(request *authverify.GrantRequest) *authverify.GrantVerdict {
+				requests <- request
+				return &authverify.GrantVerdict{Generation: 1, Grant: grantAll(), Done: func(bool) {}}
+			}}
+			f := newGrantFixture(t, hook)
+			hub := grantTransportCloneHub(t, f, hook, true)
+			leaf := grantTransportLeaf(t, grantTransportCredentials(t, f, false), hub)
+			first := grantRecv(t, requests)
+			checkLeafNodeConnected(t, hub)
+			checkLeafNodeConnected(t, leaf)
+			require_NoError(t, hub.DisconnectClient(first.Client.ID, test.code))
+			second := grantRecv(t, requests)
+			require_True(t, second.Client.ID != first.Client.ID)
+			require_Equal(t, second.UserNkey, first.UserNkey)
+			checkLeafNodeConnected(t, hub)
+			checkLeafNodeConnected(t, leaf)
+			grantTransportClosedReason(t, hub, first.Client.ID, test.reason)
+		})
+	}
 }

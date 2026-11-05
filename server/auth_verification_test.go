@@ -14,8 +14,12 @@
 package server
 
 import (
+	"bufio"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -316,5 +320,94 @@ func TestAuthVerifyOperatorFailClosedOnTimeout(t *testing.T) {
 	if err == nil {
 		nc.Close()
 		t.Fatal("expected connection to fail closed when no verification service responds")
+	}
+}
+
+// The static callout can classify a rejection with the same codes as grant
+// mode. The connection gets the wire text and close state of the code, and
+// both $SYS auth error events carry the exact reason. An absent, unknown, or
+// malformed code is a denial. A code without reject does not reject.
+func TestAuthVerifyCalloutRejectCodes(t *testing.T) {
+	s, skp, tkp := runAuthVerifyOperatorServer(t)
+	defer s.Shutdown()
+	rc, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, skp))
+	require_NoError(t, err)
+	defer rc.Close()
+	// The client token selects the raw response fields after the nonce.
+	_, err = rc.Subscribe(authverify.AuthVerificationSubject, func(m *nats.Msg) {
+		var req authverify.AuthVerifyRequest
+		if err := json.Unmarshal(m.Data, &req); err != nil {
+			return
+		}
+		m.Respond([]byte(fmt.Sprintf(`{"request_nonce":%q,%s}`, req.Nonce, req.Connect.Token)))
+	})
+	require_NoError(t, err)
+	serverEvents, err := rc.SubscribeSync(fmt.Sprintf(authErrorEventSubj, s.ID()))
+	require_NoError(t, err)
+	require_NoError(t, rc.Flush())
+	// The account event goes to the account of the connection, not to $SYS.
+	ac, err := nats.Connect(s.ClientURL(), createUserCreds(t, s, tkp), nats.Token(`"reject":false`))
+	require_NoError(t, err)
+	defer ac.Close()
+	accountEvents, err := ac.SubscribeSync(authErrorAccountEventSubj)
+	require_NoError(t, err)
+	require_NoError(t, ac.Flush())
+
+	for _, test := range []struct {
+		name     string
+		response string
+		wire     string
+		reason   ClosedState
+	}{
+		{"absent", `"reject":true`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"denied", `"reject":true,"code":0`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"resource limit", `"reject":true,"code":1`, "-ERR 'maximum connections exceeded'\r\n", ResourceLimit},
+		{"retry", `"reject":true,"code":2`, "-ERR 'Authorization Temporarily Unavailable'\r\n", AuthorizationUnavailable},
+		{"quarantined", `"reject":true,"code":3`, "-ERR 'Account Quarantined'\r\n", AccountQuarantined},
+		{"revoked", `"reject":true,"code":4`, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"unknown", `"reject":true,"code":99`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"negative", `"reject":true,"code":-1`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"malformed", `"reject":true,"code":"4"`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
+		{"admit ignores code", `"code":4`, "PONG\r\n", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", s.Addr().String(), time.Second)
+			require_NoError(t, err)
+			defer conn.Close()
+			require_NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			reader := bufio.NewReader(conn)
+			line, err := reader.ReadString('\n')
+			require_NoError(t, err)
+			var info Info
+			require_NoError(t, json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "INFO "))), &info))
+			options := nats.GetDefaultOptions()
+			require_NoError(t, createUserCreds(t, s, tkp)(&options))
+			token, err := options.UserJWT()
+			require_NoError(t, err)
+			sig, err := options.SignatureCB([]byte(info.Nonce))
+			require_NoError(t, err)
+			connect, err := json.Marshal(map[string]any{"jwt": token, "sig": base64.RawURLEncoding.EncodeToString(sig),
+				"auth_token": test.response, "verbose": false})
+			require_NoError(t, err)
+			_, err = fmt.Fprintf(conn, "CONNECT %s\r\nPING\r\n", connect)
+			require_NoError(t, err)
+			line, err = reader.ReadString('\n')
+			require_NoError(t, err)
+			require_Equal(t, line, test.wire)
+			if test.reason == 0 {
+				return
+			}
+			_, err = reader.ReadByte()
+			require_Equal(t, err, io.EOF)
+			var events [2]DisconnectEventMsg
+			for i, sub := range []*nats.Subscription{serverEvents, accountEvents} {
+				msg, err := sub.NextMsg(2 * time.Second)
+				require_NoError(t, err)
+				require_NoError(t, json.Unmarshal(msg.Data, &events[i]))
+				require_Equal(t, events[i].Reason, test.reason.String())
+			}
+			require_Equal(t, events[0].Client.ID, events[1].Client.ID)
+			grantTransportClosedReason(t, s, events[0].Client.ID, test.reason)
+		})
 	}
 }

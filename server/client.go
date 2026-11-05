@@ -228,6 +228,8 @@ const (
 	GrantRejected
 	AuthModeChanged
 	ResourceLimit
+	AuthorizationUnavailable
+	AccountQuarantined
 )
 
 // Some flags passed to processMsgResults
@@ -2617,11 +2619,7 @@ func (c *client) authViolation() {
 		c.mqttEnqueueConnAck(mqttConnAckRCNotAuthorized, false)
 	} else {
 		// Send this to client, regardless of the authErr override.
-		if reason == ResourceLimit {
-			c.sendErr(ErrTooManyConnections.Error())
-		} else {
-			c.sendErr("Authorization Violation")
-		}
+		c.sendErr(authRejectWireText(reason))
 	}
 	c.closeConnection(reason)
 }

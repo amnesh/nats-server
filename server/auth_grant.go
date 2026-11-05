@@ -165,8 +165,8 @@ func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Accoun
 		if v.Reason != "" {
 			c.Debugf("Auth grant rejected connection: %s", v.Reason)
 		}
-		if v.Code == authverify.CodeResourceLimit {
-			c.setAuthError(errAuthGrantResourceLimit)
+		if err := authRejectCodeError(v.Code); err != nil {
+			c.setAuthError(err)
 		}
 		return false
 	}
@@ -438,11 +438,10 @@ func (s *Server) DisconnectClient(clientID uint64, code authverify.RejectCode) e
 		return ErrNotGrantMode
 	}
 	c.mu.Unlock()
-	reason, message := GrantRejected, "Authorization Violation"
-	if code == authverify.CodeResourceLimit {
-		reason, message = ResourceLimit, ErrTooManyConnections.Error()
+	reason, message := authRejectDisconnect(code)
+	if message != _EMPTY_ {
+		c.sendErr(message)
 	}
-	c.sendErr(message)
 	c.closeConnection(reason)
 	return nil
 }

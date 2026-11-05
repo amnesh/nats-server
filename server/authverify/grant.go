@@ -15,12 +15,22 @@ package authverify
 
 import "github.com/nats-io/jwt/v2"
 
-// RejectCode classifies a rejection or a planned close.
+// RejectCode classifies a rejection or a planned close. The values are part of
+// the static callout wire format (AuthVerifyResponse.Code), so new codes are
+// only appended. The server treats an unknown code as CodeDenied.
 type RejectCode int
 
 const (
+	// CodeDenied rejects with "Authorization Violation".
 	CodeDenied RejectCode = iota
+	// CodeResourceLimit sends the client to another server.
 	CodeResourceLimit
+	// CodeRetry is a temporary rejection. The client tries again later.
+	CodeRetry
+	// CodeQuarantined is a temporary rejection of a quarantined account.
+	CodeQuarantined
+	// CodeRevoked rejects a revoked credential.
+	CodeRevoked
 )
 
 // GrantRequest describes a verified connection in a grant-mode account.

@@ -117,17 +117,23 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 	nonce := string(nb[:])
 
 	reply := s.newRespInbox()
-	respCh := make(chan string, 1)
+	// codeErr is the authentication error of the reject code, nil for a denial.
+	type verdict struct {
+		reason  string
+		codeErr error
+	}
+	respCh := make(chan verdict, 1)
 	// Non-blocking send: only the first response is consumed, so additional
 	// responses (e.g. several non-queue verification services replying to the same
 	// inbox) are dropped instead of blocking the internal delivery goroutine on a
 	// full channel.
-	send := func(reason string) {
+	sendCode := func(reason string, codeErr error) {
 		select {
-		case respCh <- reason:
+		case respCh <- verdict{reason, codeErr}:
 		default:
 		}
 	}
+	send := func(reason string) { sendCode(reason, nil) }
 
 	processReply := func(_ *subscription, rc *client, _ *Account, _, _ string, rmsg []byte) {
 		_, msg := rc.msgParts(rmsg)
@@ -145,7 +151,7 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 			if reason == _EMPTY_ {
 				reason = "rejected by auth verification service"
 			}
-			send(reason)
+			sendCode(reason, authRejectCodeError(resp.Code))
 			return
 		}
 		if err := s.applyAuthVerifyOverride(c, juc, acc, resp); err != nil {
@@ -175,8 +181,12 @@ func (s *Server) processAuthVerification(c *client, juc *jwt.UserClaims, acc *Ac
 	timer := time.NewTimer(authverify.AuthVerificationTimeout)
 	defer timer.Stop()
 	select {
-	case reason := <-respCh:
-		return reason == _EMPTY_, reason
+	case v := <-respCh:
+		// Only the consumed verdict sets the code of the rejection.
+		if v.codeErr != nil {
+			c.setAuthError(v.codeErr)
+		}
+		return v.reason == _EMPTY_, v.reason
 	case <-timer.C:
 		return false, "auth verification response not received in time"
 	}

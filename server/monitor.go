@@ -2720,6 +2720,10 @@ func (reason ClosedState) String() string {
 		return "Authorization Mode Changed"
 	case ResourceLimit:
 		return "Resource Limit"
+	case AuthorizationUnavailable:
+		return "Authorization Unavailable"
+	case AccountQuarantined:
+		return "Account Quarantined"
 	}
 
 	return "Unknown State"

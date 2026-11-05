@@ -62,6 +62,9 @@ type AuthVerifyResponse struct {
 	Reason      string           `json:"reason,omitempty"`
 	Permissions *jwt.Permissions `json:"permissions,omitempty"`
 	Expires     int64            `json:"expires,omitempty"`
+	// Code classifies a rejection. It is used only with Reject. An absent or
+	// unknown code is CodeDenied.
+	Code RejectCode `json:"code,omitempty"`
 }
 
 // ParseAuthVerifyResponse parses a verification service response. Internal account
