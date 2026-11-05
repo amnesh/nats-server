@@ -4474,6 +4474,9 @@ var clientNRGPrefix = []byte("$NRG.")
 // Return if the message was delivered, and if the message was not delivered
 // due to a permission issue.
 func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
+	if c.rejectMalformedRequestInfoHeader(msg) {
+		return false, false
+	}
 	msg = c.clearForwardedOriginMarker(msg)
 	// Update statistics
 	// The msg includes the CR_LF, so pull back out for accounting.

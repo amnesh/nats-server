@@ -30,6 +30,86 @@ func skipRequestInfoStamp(subject []byte) bool {
 	return false
 }
 
+// msgHeaderViolationErr is the -ERR text for a rejected header block. It is
+// the text of the upstream close state MsgHeaderViolation.
+const msgHeaderViolationErr = "Message Header Violation"
+
+var (
+	requestInfoHeaderStatus = []byte("NATS/1.0")
+	requestInfoHeaderEnd    = []byte("\r\n\r\n")
+)
+
+// requestInfoHeaderBlockValid reports whether a header block has the strict
+// wire form: it starts with "NATS/1.0", every line ends with CRLF, it has no
+// bare CR or LF, and its only empty line is the last line. A client header
+// parser (nats.go readMIMEHeader) ends a line at a bare LF and stops at the
+// first empty line, but removeHeaderIfPresent finds a key only after CRLF and
+// setHeader appends the server stamp at the end of the block. In the strict
+// form both agree on each line, so the strip removes every client copy of
+// Nats-Request-Info and a client parser reads the server stamp.
+func requestInfoHeaderBlockValid(hdr []byte) bool {
+	n := len(hdr)
+	if n < len(emptyHdrLine) || !bytes.HasPrefix(hdr, requestInfoHeaderStatus) {
+		return false
+	}
+	// The first CRLFCRLF ends the block, so no other line is empty.
+	if bytes.Index(hdr, requestInfoHeaderEnd) != n-len(requestInfoHeaderEnd) {
+		return false
+	}
+	for i, b := range hdr {
+		switch b {
+		case '\r':
+			if i+1 == n || hdr[i+1] != '\n' {
+				return false
+			}
+		case '\n':
+			if i == 0 || hdr[i-1] != '\r' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// malformedRequestInfoHeader reports whether an inbound CLIENT or LEAF message
+// has a header block that is not in the strict wire form while stamping is
+// on. It checks every such message, also without a reply subject and on a
+// skipped subject, because a stream stores the header block and removes only
+// the copies after CRLF. MQTT clients are not checked: the server writes their
+// header blocks.
+func (c *client) malformedRequestInfoHeader(msg []byte) bool {
+	if c.pa.hdr <= 0 || c.srv == nil || !c.srv.stampReqInfo.Load() {
+		return false
+	}
+	if c.kind != LEAF && (c.kind != CLIENT || c.isMqtt()) {
+		return false
+	}
+	return c.pa.hdr > len(msg) || !requestInfoHeaderBlockValid(msg[:c.pa.hdr])
+}
+
+// rejectMalformedRequestInfoHeader drops a message that
+// malformedRequestInfoHeader selects and returns true. The server gives a
+// CLIENT the -ERR "Message Header Violation" and closes it with
+// MsgHeaderViolation. A LEAF connection stays up, because one bad client behind
+// a leaf must not close the link of all the clients behind it; the hub logs a
+// rate-limited warning. No log contains header bytes.
+func (c *client) rejectMalformedRequestInfoHeader(msg []byte) bool {
+	if !c.malformedRequestInfoHeader(msg) {
+		return false
+	}
+	if mt, _ := c.isMsgTraceEnabled(); mt != nil {
+		mt.setIngressError(msgHeaderViolationErr)
+	}
+	if c.kind == LEAF {
+		c.RateLimitWarnf("Dropped a leafnode message with a malformed header block")
+		return true
+	}
+	c.sendErr(msgHeaderViolationErr)
+	c.Errorf("Message Header Violation - Subject %q", c.pa.subject)
+	c.closeConnection(MsgHeaderViolation)
+	return true
+}
+
 func (c *client) stampRequestInfoHeaderIfNeeded(msg []byte) []byte {
 	// Hot path: when disabled (the default), pay only one atomic load. The
 	// mirror is kept in sync with opts.StampRequestInfo by setOpts (which runs

@@ -345,6 +345,52 @@ A message is stamped only if **all** hold:
 Stamping is applied in the inbound publish path (`processInboundClientMsg`,
 `server/client.go`) and the leaf inbound path (`server/leafnode.go`).
 
+The server does not stamp and does not remove a client copy of the header on
+a message without a reply subject or on a skipped subject. Such a message
+keeps the client copy.
+
+### Header block check
+
+When the feature is enabled, the server also checks the header block of each
+CLIENT message (not MQTT) and each LEAF message that has headers. The check
+applies to all these messages, also to a message without a reply subject and
+to a message on a skipped subject. The block must have the strict wire form:
+
+- It starts with `NATS/1.0`. An inline status after it is permitted.
+- Each line ends with CRLF. A bare CR or a bare LF is not permitted.
+- The only empty line is the last line: the first CRLFCRLF ends the block.
+
+Reason: nats.go ends a header line at a bare LF and stops at the first empty
+line. The server strip finds a key only after CRLF, and the server writes its
+stamp at the end of the block. Without the check, a client can send the block
+`NATS/1.0\nNats-Request-Info: {forged}\r\n\r\n\r\n` with a reply subject. The
+strip does not find the forged key, the server stamp comes after the inner
+empty line, and nats.go reads only the forged value. A consumer cannot see
+this, because `nats.Msg` keeps no raw header bytes. In the strict form, the
+strip removes every client copy of the key (`removeHeaderIfPresent` repeats
+until it finds no copy), and nats.go reads the server stamp.
+
+Result of a failed check:
+
+- CLIENT: the server does not deliver the message. It sends
+  `-ERR 'Message Header Violation'` and closes the connection with the
+  upstream close state `MsgHeaderViolation`. nats.go also closes its
+  connection when it gets this text.
+- LEAF: the server does not deliver the message and logs a rate-limited
+  warning. The leaf connection stays up, because one bad client behind a leaf
+  must not stop the link for all the clients behind it.
+
+No log contains header bytes. Routes and gateways are not checked: each server
+that accepts CLIENT or LEAF connections must enable the feature. When the
+feature is disabled, the server does not check header blocks (upstream
+behavior).
+
+Header blocks that the server writes (status, flow control, heartbeat, and
+stream headers) have the strict form. A stream can still hold a block in
+another form that a server without the check stored. A LEAF delivery of such
+a message, for example a source or mirror delivery over a leaf link, is
+dropped. Enable the check on all servers before such data is stored.
+
 ## 2.5 What gets stamped
 
 The header value is a JSON `ClientInfo` (subset of the upstream type) carrying a
@@ -402,9 +448,16 @@ from a remote domain:
 - The **`reply`** field of the forwarded header is **preserved**, because chained
   service-import response routing across the leaf boundary depends on it.
 
+The replacement removes every forwarded copy only because the header block
+check (section 2.4) runs first. Without that check (fork `v2.15.3-amnesh.4`
+and earlier), a copy after a bare LF stayed beside the server stamp, and a
+copy before an inner empty line hid the server stamp from nats.go.
+
 ## 2.7 Performance & caching
 
 - **Disabled (default):** one atomic load, then return. No allocation.
+- **Header block check:** when enabled, one byte scan of the header block for
+  each CLIENT or LEAF message that has headers. No allocation.
 - **Enabled:** the marshaled header for a connection is **cached** on the client
   (`client.ciStampHdr`) and reused across requests, since the identity is stable
   for the life of the connection. The cache is invalidated when identity-affecting
@@ -449,18 +502,37 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
 > The header is informational identity provided by the trusted server (not the
 > client), so it is safe to use for auditing and account-aware routing.
 
+Trust the header only under these conditions:
+
+- The message is a request that a CLIENT or LEAF connection published to a
+  subject that is not skipped, so it has a reply subject. Require the reply
+  subject and exactly one header value (`m.Header.Values`), not only
+  `m.Header.Get`. A message without a reply subject keeps a client copy.
+- Each server that accepts the publish runs with `stamp_request_info` and
+  with the header block check (section 2.4). A server without the check
+  passes a client copy that nats.go reads as the only value.
+- Do not trust the header on a message that the server delivers from stored
+  or internal state, for example a JetStream push delivery: its reply subject
+  (`$JS.ACK...`) does not prove a server stamp. A stream removes only the
+  copies after CRLF, and a stream source or mirror can copy a block that a
+  server without the check accepted.
+
 ## 2.9 Code map & tests
 
 - `server/soo-changes.go` — `stampRequestInfoHeaderIfNeeded` (hot path + cache),
   `getClientInfoForRequest`, `skipRequestInfoStamp` + the skip-prefix list.
+  `requestInfoHeaderBlockValid`, `malformedRequestInfoHeader`, and
+  `rejectMalformedRequestInfoHeader` are the header block check (section 2.4).
   `getConnectRawAuthUser` and `getConnectAuthUser` serve the auth callout
   request, auth error events, and the authentication error log; they keep the
   upstream name order only while `calloutDecidesIdentity` is true.
-- `server/client.go` — call site in `processInboundClientMsg`; the
+- `server/client.go` — call sites in `processInboundClientMsg` (the header
+  block check first, then the stamp); the
   `client.ciStampHdr` cache field and its invalidation points. `getRawAuthUser`
   selects the verified JWT subject for stamps, events, and monitoring;
   `getAuthUser` and `getAuthUserLabel` do the same for log labels.
-- `server/leafnode.go` — leaf inbound call site.
+- `server/leafnode.go` — leaf inbound call sites (the header block check first,
+  then the stamp).
 - `server/server.go` — the `Server.stampReqInfo` atomic mirror, set at startup and
   on reload.
 - `server/opts.go` — `Options.StampRequestInfo` + the `stamp_request_info` key.
@@ -476,6 +548,18 @@ nc.Subscribe("orders.create", func(m *nats.Msg) {
   verification hook rejection names the verified subject on the same three
   surfaces. `TestAuthUserLogLabelsPreferVerifiedJWT`
   and the connection log label check in the identity test cover log labels.
+- Header block check tests: `server/soo_header_block_test.go`
+  (`TestRequestInfoHeaderBlockValid`, `TestRequestInfoHeaderBlockCheckScope`,
+  `TestStampRequestInfoRemovesEveryClientCopy`) and
+  `test/soo_header_block_test.go`. The black-box tests send raw frames that
+  nats.go cannot write: the N1 frame, a bare LF in the status line, a bare LF
+  before the key, an inner empty line, and a block without its final empty
+  line. `TestStampRequestInfoRejectsMalformedClientHeader` (raw CLIENT:
+  `-ERR`, close, no delivery), `TestStampRequestInfoDropsMalformedLeafHeader`
+  (raw LEAF: no delivery, the link stays up),
+  `TestStampRequestInfoStripsEveryClientCopy` (positive control: one server
+  stamp), and `TestStampRequestInfoDisabledKeepsHeaderBlock` (feature off:
+  upstream behavior).
 
 ---
 
