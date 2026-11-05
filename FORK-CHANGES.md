@@ -26,9 +26,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
 | 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
 | 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
-| 12 | Grant reject codes | a reject code from the grant hook, `DisconnectClient`, or the static callout `code` | `server/auth_reject_codes.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go` |
+| 12 | Grant reject codes, and no leaf CONNECT with a revoked JWT | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf check is always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect. Section 12 documents the reject codes.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect. Section 12 documents the reject codes and the leaf revoked-credential check.
 
 ---
 
@@ -1085,10 +1085,11 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
   with a `SignatureCB`. Feature 7 is an API that does nothing until it is
-  called. Two changes are always on: the verified JWT identity rule of
+  called. Three changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
-  or `user`; it changes reported identity and log labels), and the upstream
-  defect correction of section 11. Otherwise an
+  or `user`; it changes reported identity and log labels), the upstream
+  defect correction of section 11, and the leaf revoked-credential check of
+  section 12.1. Otherwise an
   unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
@@ -1098,8 +1099,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4, 5, 6, 7 and 8, and section 11
-  go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  # Features 1, 2, 4, 5, 6, 7 and 8, and sections 11 and 12
+  go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 
@@ -1409,14 +1410,40 @@ Client behavior with nats.go v1.53.1:
 - nats.go classifies `User Authentication Revoked` as `ErrAuthRevoked`. It
   stops after the second equal rejection on one server, unless the client sets
   `IgnoreAuthErrorAbort`.
-- A leaf remote reconnects after `LeafNode.ReconnectInterval` for every code.
+- A leaf remote reconnects after `LeafNode.ReconnectInterval` for every code,
+  but it does not send CONNECT again with a revoked JWT (section 12.1).
 
 Only `CodeRevoked` sends the revoked text at admission. A JWT that the account
 JWT revokes (upstream `checkUserRevoked`) still gets `Authorization Violation`
 at admission. Upstream live revocation of a connected user keeps its text
 `User Authentication Revoked`.
 
-Code and tests:
+## 12.1 Leaf remote: no CONNECT with a revoked JWT
+
+When a solicited leaf connection gets `User Authentication Revoked`, at
+CONNECT or as a planned close, the remote keeps a SHA-256 digest of the user
+JWT that it sent on that connection. It keeps only the last digest, in memory,
+in the remote configuration. Before each later CONNECT, after it gets the JWT
+from the credentials file or from `SignatureCB`, the remote compares the
+digest. On a match it sends no CONNECT, logs a warning, closes the connection
+with `Revocation`, and waits 30 seconds before the next check
+(`leafNodeReconnectAfterPermViolation`). A different JWT, also for the same
+user key, sends CONNECT normally. Each new JWT thus costs at most one CONNECT.
+Two JWTs that a signer issues for the same claims in the same second are equal,
+so a reissue in the same second as the revoked JWT stays blocked until the JWT
+changes. Retry and quarantine keep the normal reconnect.
+
+The JWT and the digest never reach a log. A restart, or a reload that removes
+and adds the remote, clears the digest. A reload that keeps the remote keeps
+it. A remote without a user JWT (nkey only, or user and password) is not
+affected. The digest is one per remote, for all URLs of the remote.
+
+This changes the upstream leaf behavior for the text
+`User Authentication Revoked`, also when an account JWT update revokes a
+connected leaf user. Upstream, the remote sends CONNECT with the same JWT
+again after each reconnect interval.
+
+## 12.2 Code and tests
 
 - `server/authverify/grant.go` defines the codes. `server/authverify/req.go`
   adds `AuthVerifyResponse.Code`.
@@ -1427,11 +1454,17 @@ Code and tests:
   (`getAuthErrClosedState`), `server/client.go` (close states and
   `authViolation`), `server/monitor.go` (strings), `server/websocket.go`
   (close status).
+- `server/leafnode_revoked.go` holds the digest check. Hooks in
+  `server/leafnode.go`: the `leaf` and `leafNodeCfg` fields, `sendLeafConnect`,
+  `leafProcessErr`, and `leafNodeResumeConnectProcess`.
 - `server/auth_grant_transport_test.go` covers both wire paths, the nats.go
   client retry and stop, and the leaf retry. `server/auth_verification_test.go`
   (`TestAuthVerifyCalloutRejectCodes`) covers the static `code` and the `$SYS`
-  events.
+  events. `server/leafnode_revoked_test.go` covers both credential sources and
+  both revocation moments: the hub gets no authentication attempt with the
+  revoked JWT over three check periods while the remote keeps dialing, and a
+  reissued JWT for the same user key connects at the next check.
 
 ```sh
-go test -race -run 'AuthGrant(Reject|Disconnect|Client|Connected|Leaf)|AuthVerifyCallout' ./server ./server/authverify -count=1
+go test -race -run 'AuthGrant(Reject|Disconnect|Client|Connected|Leaf)|AuthVerifyCallout|LeafRemoteRevoked' ./server ./server/authverify -count=1
 ```

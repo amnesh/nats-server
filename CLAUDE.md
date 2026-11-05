@@ -8,13 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - The custom commits are exactly `git log upstream/release/vX.Y.Z..origin/release/vX.Y.Z`. Each feature is one squashed, signed-off commit, so it cherry-picks cleanly onto the next upstream release.
 - Keep feature logic in dedicated files and add only the smallest hooks to upstream files, so cherry-picks stay conflict-free. Existing examples: `server/authverify/` + `server/auth_verification.go` (post-auth verification callout), `server/soo-changes.go` (`Nats-Request-Info` stamping on inbound requests), `server/auth_xpermissions.go` + `server/auth_xpermissions_compile.go` (scoped resource permission groups), `server/leafnode_isolation.go` + `server/leafnode_dupindex.go` + `server/leafnode_synccheck.go` (leafnode scaling for isolated hubs), and the custom listener/dialer fields in `server/opts.go`.
-- Every fork feature is off by default. An unconfigured server behaves like upstream. Exception: the leafnode scaling changes are always on, because they keep upstream behavior; only their coalesced source/mirror check (`leafnodes { sync_consumers_check_interval }`) is off by default.
+- Every fork feature is off by default. An unconfigured server behaves like upstream. Exception: the leafnode scaling changes are always on, because they keep upstream behavior; only their coalesced source/mirror check (`leafnodes { sync_consumers_check_interval }`) is off by default. The leaf revoked-credential check (`server/leafnode_revoked.go`, FORK-CHANGES section 12.1) is also always on: a leaf remote does not send CONNECT again with a JWT that the remote server reported revoked.
 - `FORK-CHANGES.md` documents each feature: config keys, wire formats, code map, tests. `docs/superpowers/specs/` holds the design specs. Update both when a feature changes.
 - To move the fork to a newer upstream release, use the `update-fork` skill in `.claude/skills/`. The fork tag `vX.Y.Z` points at the fork's top commit, not at upstream's release commit, so `go get <fork>@vX.Y.Z` includes the patches.
 - Fork feature tests:
 
 ```sh
-go test -race -run 'AuthGrant|AuthVerify|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' ./server ./server/authverify ./test -count=1
+go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' ./server ./server/authverify ./test -count=1
 ```
 
 ## Build, lint, and test

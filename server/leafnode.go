@@ -106,6 +106,9 @@ type leaf struct {
 	// grantPub is a copy of the Pub permission of the installed grant. Every
 	// CONNECT decodes into c.opts.Export, never into this copy.
 	grantPub *SubjectPermission
+	// connectJWT is the digest of the user JWT that a solicited connection
+	// sent, see leafnode_revoked.go.
+	connectJWT leafJWTDigest
 	// This map will contain all the subscriptions that have been added to the smap
 	// during initLeafNodeSmapAndSendSubs. It is short lived and is there to avoid
 	// race between processing of a sub where sub is added to account sublist but
@@ -136,6 +139,7 @@ type leafNodeCfg struct {
 	quitCh         chan struct{}
 	removed        bool
 	connInProgress bool
+	revokedJWT     leafJWTDigest // Last JWT that the remote server revoked, see leafnode_revoked.go.
 }
 
 // Check to see if this is a solicited leafnode. We do special processing for solicited.
@@ -1272,6 +1276,9 @@ func (c *client) sendLeafConnect(clusterName string, headers bool) error {
 		pkey, _ := kp.PublicKey()
 		cinfo.Nkey = pkey
 		cinfo.Sig = sig
+	}
+	if err := c.leafCheckRevokedJWTLocked(cinfo.JWT); err != nil {
+		return err
 	}
 	// In addition, and this is to allow auth callout, set user/password or
 	// token if applicable.
@@ -3709,6 +3716,7 @@ func (c *client) leafProcessErr(errStr string) {
 		c.Errorf("Leafnode connection dropped due to minimum version requirement. Delaying attempt to reconnect for %v", delay)
 		return
 	}
+	c.leafProcessRevokedErr(errStr)
 
 	// We will look for Loop detected error coming from the other side.
 	// If we solicit, set the connect delay.
@@ -3907,7 +3915,7 @@ func (s *Server) leafNodeResumeConnectProcess(c *client) {
 	}
 	if err := c.sendLeafConnect(clusterName, c.headers); err != nil {
 		c.mu.Unlock()
-		c.closeConnection(WriteError)
+		c.closeConnection(leafConnectErrClosedState(err))
 		return
 	}
 
