@@ -474,3 +474,32 @@ request/reply tests cover empty and unrelated nonempty publish allow lists.
 Independent reviews checked reload permissions, callback ordering, timer
 replacement, prefix subset and overlap matching, leaf wire projections, and
 delivery deny filters. Regression tests cover the issues found during review.
+
+
+## Amendment 2026-11-05: reject codes and leaf revoked-credential check
+
+This amendment extends Sections 3, 7, and 9. The earlier text stays as the
+record of the first release. `FORK-CHANGES.md` section 12 is the full
+reference.
+
+- `RejectCode` appends `CodeRetry` (2), `CodeQuarantined` (3), and
+  `CodeRevoked` (4) after `CodeResourceLimit`. The static callout response
+  gets an optional `code` with the same values. An absent or unknown code is
+  `CodeDenied`.
+- New close states `AuthorizationUnavailable` ("Authorization Unavailable")
+  and `AccountQuarantined` ("Account Quarantined") come after
+  `ResourceLimit`. `CodeRevoked` uses the existing `Revocation` state.
+- Admission rejection texts: retry `Authorization Temporarily Unavailable`,
+  quarantine `Account Quarantined`, revoked `User Authentication Revoked`.
+  `DisconnectClient` with retry or quarantine sends no `-ERR`; with revoked it
+  sends `User Authentication Revoked`. `CodeDenied` and `CodeResourceLimit`
+  keep the Section 7 behavior.
+- A solicited leaf remote does not send CONNECT again with a user JWT that the
+  remote server reported revoked. It keeps a SHA-256 digest of that JWT in
+  memory and checks every 30 seconds. A new JWT for the same user key
+  connects.
+
+Tests: `TestAuthGrantRejectWire`, `TestAuthGrantDisconnectWire`,
+`TestAuthGrantClient*Code*`, `TestAuthGrantConnectedRetryDisconnectReconnects`,
+`TestAuthGrantLeafRetryCodesReconnect`, `TestAuthVerifyCalloutRejectCodes`, and
+`TestLeafRemoteRevoked*`.
