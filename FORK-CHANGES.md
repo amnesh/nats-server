@@ -359,6 +359,12 @@ to a message on a skipped subject. The block must have the strict wire form:
 - It starts with `NATS/1.0`. An inline status after it is permitted.
 - Each line ends with CRLF. A bare CR or a bare LF is not permitted.
 - The only empty line is the last line: the first CRLFCRLF ends the block.
+- An inline status has at least three bytes. This is the rule of nats.go
+  `v1.54.0` `DecodeHeadersMsg`: when the first line is longer than
+  `NATS/1.0`, the remaining bytes after the trim of white space
+  (`strings.TrimSpace`) must have a length of 3 or more. Thus
+  `NATS/1.0 503` and `NATS/1.0 503 No Responders` pass, and `NATS/1.0 5` and
+  `NATS/1.0 ` (one space) fail.
 
 Reason: nats.go ends a header line at a bare LF and stops at the first empty
 line. The server strip finds a key only after CRLF, and the server writes its
@@ -369,6 +375,17 @@ empty line, and nats.go reads only the forged value. A consumer cannot see
 this, because `nats.Msg` keeps no raw header bytes. In the strict form, the
 strip removes every client copy of the key (`removeHeaderIfPresent` repeats
 until it finds no copy), and nats.go reads the server stamp.
+
+Reason for the status rule: nats.go `v1.53.1` and earlier do not check the
+status length. For `NATS/1.0 5` they evaluate `"5"[3:]` in the read loop of
+the connection. The slice is out of range, and the subscriber process stops
+with a panic. A client with a publish grant to a subject that such a process
+subscribes to (a service subject, or the inbox of a requester) can stop that
+process with one message. The check stops this attack only while
+`stamp_request_info` is on, and only for CLIENT and LEAF ingress. Consumers
+must also use nats.go `v1.54.0` or later. No header block that nats.go writes
+has an inline status, and each status that the server writes in
+`server/*.go` has three digits, so the rule rejects no correct block.
 
 Result of a failed check:
 
@@ -559,7 +576,10 @@ Trust the header only under these conditions:
   (raw LEAF: no delivery, the link stays up),
   `TestStampRequestInfoStripsEveryClientCopy` (positive control: one server
   stamp), and `TestStampRequestInfoDisabledKeepsHeaderBlock` (feature off:
-  upstream behavior).
+  upstream behavior). `TestStampRequestInfoRejectsShortStatusHeader` sends
+  `NATS/1.0 5` and `NATS/1.0 ` through a raw CLIENT and a raw LEAF, with a
+  raw subscriber as the observer (a nats.go `v1.53.1` subscriber panics on
+  these blocks), and `NATS/1.0 503 No Responders` as the positive control.
 
 ---
 

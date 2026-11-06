@@ -39,14 +39,19 @@ var (
 	requestInfoHeaderEnd    = []byte("\r\n\r\n")
 )
 
+// requestInfoHeaderStatusLen is the minimum length of an inline status after
+// "NATS/1.0" and the trim of white space. It is statusLen of nats.go.
+const requestInfoHeaderStatusLen = 3
+
 // requestInfoHeaderBlockValid reports whether a header block has the strict
 // wire form: it starts with "NATS/1.0", every line ends with CRLF, it has no
-// bare CR or LF, and its only empty line is the last line. A client header
-// parser (nats.go readMIMEHeader) ends a line at a bare LF and stops at the
-// first empty line, but removeHeaderIfPresent finds a key only after CRLF and
-// setHeader appends the server stamp at the end of the block. In the strict
-// form both agree on each line, so the strip removes every client copy of
-// Nats-Request-Info and a client parser reads the server stamp.
+// bare CR or LF, its only empty line is the last line, and an inline status
+// has at least three bytes. A client header parser (nats.go readMIMEHeader)
+// ends a line at a bare LF and stops at the first empty line, but
+// removeHeaderIfPresent finds a key only after CRLF and setHeader appends the
+// server stamp at the end of the block. In the strict form both agree on each
+// line, so the strip removes every client copy of Nats-Request-Info and a
+// client parser reads the server stamp.
 func requestInfoHeaderBlockValid(hdr []byte) bool {
 	n := len(hdr)
 	if n < len(emptyHdrLine) || !bytes.HasPrefix(hdr, requestInfoHeaderStatus) {
@@ -67,6 +72,26 @@ func requestInfoHeaderBlockValid(hdr []byte) bool {
 				return false
 			}
 		}
+	}
+	// The inline status rule of nats.go v1.54.0 DecodeHeadersMsg
+	// (nats.go:4517-4523):
+	//
+	//	if len(l) > hdrPreEnd {
+	//		status := strings.TrimSpace(l[hdrPreEnd:])
+	//		if len(status) < statusLen {
+	//			return nil, ErrBadHeaderMsg
+	//		}
+	//
+	// l is the first line without its CRLF, hdrPreEnd is len("NATS/1.0"), and
+	// statusLen is 3. nats.go v1.53.1 and earlier have no such check and slice
+	// status[3:] (nats.go:4441-4444), so "NATS/1.0 5" makes the subscriber
+	// panic in its read loop. bytes.TrimSpace trims the same white space as
+	// strings.TrimSpace. The loop above proved that each CR starts a CRLF, so
+	// the first CR ends the first line.
+	line := hdr[:bytes.IndexByte(hdr, '\r')]
+	if len(line) > len(requestInfoHeaderStatus) &&
+		len(bytes.TrimSpace(line[len(requestInfoHeaderStatus):])) < requestInfoHeaderStatusLen {
+		return false
 	}
 	return true
 }

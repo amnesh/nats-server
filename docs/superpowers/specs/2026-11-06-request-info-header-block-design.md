@@ -27,11 +27,22 @@ MQTT) and LEAF message that has headers, before any other inbound work. The
 check also applies without a reply subject and on the skipped subjects,
 because a stream stores the block and removes only the copies after CRLF.
 The block must start with `NATS/1.0`, end each line with CRLF, have no bare
-CR or LF, and have no empty line before its end.
+CR or LF, and have no empty line before its end. An inline status must have
+at least three bytes after the trim of white space (the rule of nats.go
+`v1.54.0` `DecodeHeadersMsg`).
 
 In this form the server strip and nats.go agree on each line. The existing
 loop in `removeHeaderIfPresent` removes every client copy, and nats.go reads
 the server stamp.
+
+Status rule (amendment, fork review R1): nats.go `v1.53.1` and earlier slice
+`status[3:]` without a length check, so the block `NATS/1.0 5\r\n\r\n` or
+`NATS/1.0 \r\n\r\n` makes a subscriber panic in its read loop. The check uses
+the exact `v1.54.0` rule on the first line `l` (the bytes before the first
+CRLF): if `len(l) > 8`, then `len(TrimSpace(l[8:])) >= 3`. The check stops
+this attack only while `stamp_request_info` is on and only for CLIENT and
+LEAF ingress; consumers must also use nats.go `v1.54.0` or later. Every
+status that the server writes has three digits.
 
 A failed check drops the message. A CLIENT gets
 `-ERR 'Message Header Violation'` and is closed with the upstream close state
@@ -59,8 +70,15 @@ connections must enable the feature.
 
 ## Verification
 
-- Unit: the block grammar, the check scope (kinds, MQTT, feature off), and
+- Unit: the block grammar (also the short inline status, with tab, NBSP, and
+  multibyte boundary rows), the check scope (kinds, MQTT, feature off), and
   the removal of three client copies by the stamp.
+- Black-box raw TCP, short status: `NATS/1.0 5` and `NATS/1.0 ` through a raw
+  CLIENT (`-ERR`, close, no delivery) and a raw LEAF (no delivery, the link
+  stays up). The observer is a raw subscriber, because a nats.go `v1.53.1`
+  subscriber panics on such a block. Positive control:
+  `NATS/1.0 503 No Responders` passes through both, and nats.go reads the
+  status and one server stamp.
 - Black-box raw TCP: the N1 frame, a bare LF in the status line, a bare LF
   before the key, an inner empty line, and a block without its final empty
   line, through a raw CLIENT (`-ERR`, close, no delivery) and a raw LEAF (no

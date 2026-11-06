@@ -42,11 +42,28 @@ var malformedHeaderFrames = []malformedHeaderFrame{
 	{"missing-final-empty-line", "NATS/1.0\r\nNats-Request-Info: " + forgedRequestInfo + "\r\n"},
 }
 
+// shortStatusHeaderFrames have an inline status with fewer than three bytes
+// after the trim of white space (fork review R1). nats.go v1.54.0 rejects such
+// a block. nats.go v1.53.1 (the version of this module) evaluates status[3:]
+// in its read loop and panics. Thus the legs send these frames to svc.short,
+// where only a raw subscriber listens: a server without the rule delivers the
+// frame to the raw subscriber, and the test process does not stop.
+var shortStatusHeaderFrames = []malformedHeaderFrame{
+	{"short-status", "NATS/1.0 5\r\n\r\n"},
+	{"status-space-only", "NATS/1.0 \r\n\r\n"},
+}
+
+// noRespondersStatusHeader has a three-digit inline status, a description, and
+// a client copy of the key. It passes the check (positive control for R1).
+const noRespondersStatusHeader = "NATS/1.0 503 No Responders\r\nNats-Request-Info: " + forgedRequestInfo + "\r\n\r\n"
+
 // stampObservation is one message that the nats.go service received.
 type stampObservation struct {
-	payload string
-	values  []string
-	trace   string
+	payload     string
+	values      []string
+	trace       string
+	status      string
+	description string
 }
 
 type stampService struct {
@@ -64,7 +81,13 @@ func runStampService(t *testing.T, url string) *stampService {
 	svc := &stampService{ch: make(chan stampObservation, 64)}
 	if _, err := nc.Subscribe("svc.echo", func(m *nats.Msg) {
 		values := append([]string(nil), m.Header.Values(server.ClientInfoHdr)...)
-		svc.ch <- stampObservation{payload: string(m.Data), values: values, trace: m.Header.Get("X-Trace")}
+		svc.ch <- stampObservation{
+			payload:     string(m.Data),
+			values:      values,
+			trace:       m.Header.Get("X-Trace"),
+			status:      m.Header.Get("Status"),
+			description: m.Header.Get("Description"),
+		}
 	}); err != nil {
 		t.Fatalf("Error subscribing service: %v", err)
 	}
@@ -169,15 +192,44 @@ func (r *rawProtoConn) closed(wait time.Duration) bool {
 // dialRawStampClient connects a raw CLIENT as user req with headers on.
 func dialRawStampClient(t *testing.T, opts *server.Options) *rawProtoConn {
 	t.Helper()
+	return dialRawStampUser(t, opts, "req", "")
+}
+
+// dialRawStampSubscriber connects a raw CLIENT as user svc with headers on and
+// subscribes it to subject. A raw subscriber reads every frame and cannot
+// panic on a header block.
+func dialRawStampSubscriber(t *testing.T, opts *server.Options, subject string) *rawProtoConn {
+	t.Helper()
+	return dialRawStampUser(t, opts, "svc", "SUB "+subject+" 1\r\n")
+}
+
+func dialRawStampUser(t *testing.T, opts *server.Options, user, after string) *rawProtoConn {
+	t.Helper()
 	conn := createClientConn(t, opts.Host, opts.Port)
 	t.Cleanup(func() { conn.Close() })
 	checkInfoMsg(t, conn)
 	raw := &rawProtoConn{t: t, conn: conn}
-	raw.send("CONNECT {\"verbose\":false,\"pedantic\":false,\"user\":\"req\",\"pass\":\"pwd\",\"name\":\"raw\",\"headers\":true,\"protocol\":1}\r\nPING\r\n")
+	raw.send("CONNECT {\"verbose\":false,\"pedantic\":false,\"user\":\"" + user +
+		"\",\"pass\":\"pwd\",\"name\":\"raw\",\"headers\":true,\"protocol\":1}\r\n" + after + "PING\r\n")
 	if _, ok := raw.until("PONG\r\n"); !ok {
 		t.Fatalf("Raw client closed at connect: %q", raw.seen)
 	}
 	return raw
+}
+
+// dialRawStampLeaf connects a raw LEAF as user leaf with headers on.
+func dialRawStampLeaf(t *testing.T, hub *server.Server, opts *server.Options) *rawProtoConn {
+	t.Helper()
+	conn := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
+	t.Cleanup(func() { conn.Close() })
+	checkInfoMsg(t, conn)
+	leaf := &rawProtoConn{t: t, conn: conn}
+	leaf.send("CONNECT {\"user\":\"leaf\",\"pass\":\"pwd\",\"headers\":true}\r\nPING\r\n")
+	if _, ok := leaf.until("PONG\r\n"); !ok {
+		t.Fatalf("Leaf connection closed at connect: %q", leaf.seen)
+	}
+	checkLeafNodeConnected(t, hub)
+	return leaf
 }
 
 func headerPub(op, subject, reply, hdr, payload string) string {
@@ -291,16 +343,7 @@ func TestStampRequestInfoStripsEveryClientCopy(t *testing.T) {
 func TestStampRequestInfoDropsMalformedLeafHeader(t *testing.T) {
 	hub, opts := runStampHeaderServer(t, true, true)
 	svc := runStampService(t, fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port))
-
-	conn := createLeafConn(t, opts.LeafNode.Host, opts.LeafNode.Port)
-	defer conn.Close()
-	checkInfoMsg(t, conn)
-	leaf := &rawProtoConn{t: t, conn: conn}
-	leaf.send("CONNECT {\"user\":\"leaf\",\"pass\":\"pwd\",\"headers\":true}\r\nPING\r\n")
-	if _, ok := leaf.until("PONG\r\n"); !ok {
-		t.Fatalf("Leaf connection closed at connect: %q", leaf.seen)
-	}
-	checkLeafNodeConnected(t, hub)
+	leaf := dialRawStampLeaf(t, hub, opts)
 
 	good := "NATS/1.0\r\nNats-Request-Info: " + forgedRequestInfo + "\r\n\r\n"
 	for _, frame := range malformedHeaderFrames {
@@ -322,6 +365,109 @@ func TestStampRequestInfoDropsMalformedLeafHeader(t *testing.T) {
 			requireServerStamp(t, control, "leaf")
 		})
 	}
+	checkLeafNodeConnected(t, hub)
+}
+
+// A header block with an inline status shorter than three bytes (fork review
+// R1) is not delivered. The raw subscriber on svc.short is the observer: it
+// reads all frames up to a control message that comes after the attack
+// frame. A raw CLIENT gets -ERR 'Message Header Violation' and is closed. A
+// raw LEAF stays connected and gets no -ERR. Positive control: a block with
+// the status "503 No Responders" passes, and the nats.go service reads the
+// status and one server stamp.
+func TestStampRequestInfoRejectsShortStatusHeader(t *testing.T) {
+	hub, opts := runStampHeaderServer(t, true, true)
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	svc := runStampService(t, url)
+	sub := dialRawStampSubscriber(t, opts, "svc.short")
+	leaf := dialRawStampLeaf(t, hub, opts)
+
+	ctl, err := nats.Connect(url, nats.UserInfo("req", "pwd"))
+	if err != nil {
+		t.Fatalf("Error connecting control client: %v", err)
+	}
+	defer ctl.Close()
+
+	// requireNoShortStatusDelivery publishes the control message and reads
+	// the raw subscriber up to it. The server handled the attack frame
+	// before the control message, so a delivered attack frame comes first.
+	requireNoShortStatusDelivery := func(t *testing.T, marker string) {
+		t.Helper()
+		sub.t = t
+		if err := ctl.Publish("svc.short", []byte(marker)); err != nil {
+			t.Fatalf("Error publishing control message: %v", err)
+		}
+		if err := ctl.Flush(); err != nil {
+			t.Fatalf("Error flushing control message: %v", err)
+		}
+		text, ok := sub.until(marker + "\r\n")
+		if !ok {
+			t.Fatalf("Raw subscriber closed; received %q", text)
+		}
+		if strings.Contains(text, "bad-") {
+			t.Errorf("Server delivered a short status block; the raw subscriber received %q", text)
+		}
+	}
+
+	for _, frame := range shortStatusHeaderFrames {
+		t.Run("client/"+frame.name, func(t *testing.T) {
+			raw := dialRawStampClient(t, opts)
+			raw.send(headerPub("HPUB", "svc.short", "_INBOX.raw.reply", frame.hdr, "bad-client-"+frame.name) + "PING\r\n")
+			text, open := raw.until("PONG\r\n")
+			closed := !open || raw.closed(time.Second)
+			requireNoShortStatusDelivery(t, "control-client-"+frame.name)
+			if !strings.Contains(text, "-ERR 'Message Header Violation'") {
+				t.Errorf("Raw client got no -ERR 'Message Header Violation'; received %q", text)
+			}
+			if !closed {
+				t.Errorf("Server did not close the raw client")
+			}
+		})
+		t.Run("leaf/"+frame.name, func(t *testing.T) {
+			leaf.t = t
+			leaf.send(headerPub("HMSG", "svc.short", "_INBOX.leaf.reply", frame.hdr, "bad-leaf-"+frame.name) + "PING\r\n")
+			text, open := leaf.until("PONG\r\n")
+			requireNoShortStatusDelivery(t, "control-leaf-"+frame.name)
+			if !open {
+				t.Fatalf("Hub closed the leaf connection; received %q", text)
+			}
+			if strings.Contains(text, "-ERR") {
+				t.Errorf("Hub sent an error to the leaf: %q", text)
+			}
+		})
+	}
+
+	requireNoRespondersStatus := func(t *testing.T, o stampObservation, user string) {
+		t.Helper()
+		requireServerStamp(t, o, user)
+		if o.status != "503" || o.description != "No Responders" {
+			t.Fatalf("Want status 503 and description %q, got status %q and description %q", "No Responders", o.status, o.description)
+		}
+	}
+	t.Run("client/status-503-passes", func(t *testing.T) {
+		raw := dialRawStampClient(t, opts)
+		raw.send(headerPub("HPUB", "svc.echo", "_INBOX.raw.reply", noRespondersStatusHeader, "status-503-client") + "PING\r\n")
+		if text, ok := raw.until("PONG\r\n"); !ok || strings.Contains(text, "-ERR") {
+			t.Fatalf("Raw client rejected or closed: %q", text)
+		}
+		before, o := svc.until(t, "status-503-client")
+		if len(before) != 0 {
+			t.Fatalf("Unexpected messages: %+v", before)
+		}
+		requireNoRespondersStatus(t, o, "req")
+	})
+	t.Run("leaf/status-503-passes", func(t *testing.T) {
+		leaf.t = t
+		leaf.send(headerPub("HMSG", "svc.echo", "_INBOX.leaf.reply", noRespondersStatusHeader, "status-503-leaf") + "PING\r\n")
+		if text, ok := leaf.until("PONG\r\n"); !ok || strings.Contains(text, "-ERR") {
+			t.Fatalf("Hub rejected or closed the leaf: %q", text)
+		}
+		before, o := svc.until(t, "status-503-leaf")
+		if len(before) != 0 {
+			t.Fatalf("Unexpected messages: %+v", before)
+		}
+		requireNoRespondersStatus(t, o, "leaf")
+	})
 	checkLeafNodeConnected(t, hub)
 }
 

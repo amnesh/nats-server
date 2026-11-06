@@ -32,6 +32,23 @@ func TestRequestInfoHeaderBlockValid(t *testing.T) {
 		{"two final empty lines", "NATS/1.0\r\nA: b\r\n\r\n\r\n", false},
 		{"bare CR", "NATS/1.0\r\nA: b\rNats-Request-Info: x\r\n\r\n", false},
 		{"CR before CRLF", "NATS/1.0\r\nA: b\r\r\n\r\n", false},
+		// The inline status rule of nats.go v1.54.0: after "NATS/1.0" and the
+		// trim of white space (strings.TrimSpace), a status has at least three
+		// bytes. nats.go v1.53.1 panics on a shorter status.
+		{"short status", "NATS/1.0 5\r\n\r\n", false},
+		{"status space only", "NATS/1.0 \r\n\r\n", false},
+		{"two-digit status", "NATS/1.0 50\r\n\r\n", false},
+		{"short status with spaces", "NATS/1.0  50  \r\n\r\n", false},
+		{"short status after tab", "NATS/1.0\t5\r\n\r\n", false},
+		{"short status before NBSP", "NATS/1.0 5 \r\n\r\n", false},
+		{"short status before a header", "NATS/1.0 5\r\nA: b\r\n\r\n", false},
+		{"short status without space", "NATS/1.05\r\n\r\n", false},
+		{"two-byte rune status", "NATS/1.0 é\r\n\r\n", false},
+		{"status without space", "NATS/1.0503\r\n\r\n", true},
+		{"status after tab", "NATS/1.0\t503\r\n\r\n", true},
+		{"status before NBSP", "NATS/1.0 503 \r\n\r\n", true},
+		{"three-byte rune status", "NATS/1.0 €\r\n\r\n", true},
+		{"no responders status", "NATS/1.0 503 No Responders\r\n\r\n", true},
 	} {
 		if got := requestInfoHeaderBlockValid([]byte(tc.hdr)); got != tc.valid {
 			t.Errorf("%s: requestInfoHeaderBlockValid(%q) = %v, want %v", tc.name, tc.hdr, got, tc.valid)
