@@ -23,8 +23,12 @@ without a reply subject and the case with two values, but not this frame.
 ## Policy
 
 When `stamp_request_info` is on, check the header block of each CLIENT (not
-MQTT) and LEAF message that has headers, before any other inbound work. The
-check also applies without a reply subject and on the skipped subjects,
+MQTT) and LEAF message that has headers. The check is the first statement of
+`processInboundClientMsg` and `processInboundLeafMsg`, so it runs before the
+origin-marker rewrite, the statistics, the permissions, delivery, the stamp,
+and the strip. It reads the header block that the parser gives to these
+functions: message-trace setup and subject mapping run before it (see
+"Message-trace setup" below). The check also applies without a reply subject and on the skipped subjects,
 because a stream stores the block and removes only the copies after CRLF.
 The block must start with `NATS/1.0`, end each line with CRLF, have no bare
 CR or LF, and have no empty line before its end. An inline status must have
@@ -48,12 +52,29 @@ A failed check drops the message. A CLIENT gets
 `-ERR 'Message Header Violation'` and is closed with the upstream close state
 `MsgHeaderViolation`, which upstream defines and does not use. A LEAF link
 stays up and the hub logs a rate-limited warning: one bad client behind a
-leaf must not stop the link for all clients behind it. No log contains
-header bytes.
+leaf must not stop the link for all clients behind it. The warning names the
+subject and the reply with `%q` (amendment, fork review R2). The format is
+the rate-limit key, so distinct subjects add no log lines. The logs of the
+check contain no header bytes. Upstream message-trace setup can log a header
+value (`Nats-Trace-Origin-Account`) before the check.
 
 When the feature is off, nothing changes (upstream behavior). Routes and
 gateways are not checked; each server that accepts CLIENT or LEAF
 connections must enable the feature.
+
+## Message-trace setup (amendment, fork review R3)
+
+The parser calls `initMsgTrace` before `processInboundMsg`. With a
+`Nats-Trace-Origin-Account` header, or with a `traceparent` header and a
+sampling miss, trace setup replaces the `Nats-Trace-Dest` value with
+`trace disabled` through `setHeader`. `setHeader` removes the last CRLF of
+the block and appends the new line and the final empty line. A block without
+its final empty line thus gets the strict form before the check, and passes.
+This is not a bypass: the new block is strict. The stamp strip removes the
+client copy of `Nats-Request-Info`, which is now merged with the appended
+line, and nats.go reads one value, the server stamp. A block with another
+defect (a bare LF, an inner empty line, a short status) keeps it after the
+change, and the check rejects it.
 
 ## Limits that stay
 
@@ -63,10 +84,21 @@ connections must enable the feature.
 - A message that the server delivers from stored or internal state, for
   example a JetStream push delivery, has a reply subject that does not prove
   a server stamp.
-- A stream can hold a block in another form that a server without the check
-  stored. A LEAF delivery of such a message (for example a source or mirror
-  delivery over a leaf link) is dropped. Server-written header blocks have
-  the strict form.
+- A stream can hold a block that is not strict. Sources: data stored before
+  the check was on, a message that came over a route or a gateway from a
+  server without the check, and a stream snapshot restore (the restore
+  payload carries the stored messages, so the check does not read them).
+  Server-written header blocks have the strict form. A server with the check
+  drops the LEAF delivery of such a message. A mirror, a source, or an
+  ordered consumer (for example a legacy nats.go KV watch) across a leaf
+  link then sees a sequence gap, creates its consumer again at the same
+  stream sequence, and gets the same drop again. It stops at that message
+  (amendment, fork review R2). The LEAF warning names the reply
+  (`$JS.ACK...`), which gives the stream, the consumer, and the stream
+  sequence. Recovery: delete that message at the origin, or purge the stream
+  up to the next sequence, or turn the feature off on the receiving server.
+  Prevention: run the fixed fork with the feature on all servers before data
+  enters the streams.
 
 ## Verification
 
@@ -84,3 +116,12 @@ connections must enable the feature.
   line, through a raw CLIENT (`-ERR`, close, no delivery) and a raw LEAF (no
   delivery, the link stays up). Positive control: a CRLF block with client
   copies arrives with one server stamp. Feature off: the frame passes.
+- Fork review R4: unit scope rows for each skipped subject prefix (`$KV.`,
+  `$JS.`, `$O.`, `$MQTT.`, `$NRG.`), with and without a reply subject; a
+  black-box leg that publishes the N1 frame without a reply subject to a
+  stream subject and to a `$KV.` subject (`-ERR`, close, no stored message);
+  and a trace leg: a `traceparent` block with its final empty line passes,
+  without it the client is rejected and the trace event has the ingress
+  error, and a block that trace setup changes passes with one server stamp.
+- Fork review R2: a unit test of the LEAF warning text (subject and reply,
+  no header bytes) and of its rate-limit key.

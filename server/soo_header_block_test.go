@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -103,6 +104,75 @@ func TestRequestInfoHeaderBlockCheckScope(t *testing.T) {
 	noServer.srv = nil
 	if noServer.malformedRequestInfoHeader(bad) {
 		t.Error("no server: want no check")
+	}
+
+	// The check also applies on the subjects that the stamp skips, with and
+	// without a reply subject, because a stream stores the block (fork review
+	// R4). A scope that used skipRequestInfoStamp would fail these rows.
+	for _, subject := range []string{"$KV.b.k", "$JS.API.X", "$O.b.C.x", "$MQTT.msgs.x", "$NRG.x"} {
+		if !skipRequestInfoStamp([]byte(subject)) {
+			t.Fatalf("%s: want a subject that the stamp skips", subject)
+		}
+		for _, kind := range []int{CLIENT, LEAF} {
+			for _, reply := range []string{"", "_INBOX.1"} {
+				c := mk(kind, true, badHdr)
+				c.pa.subject = []byte(subject)
+				c.pa.reply = []byte(reply)
+				if !c.malformedRequestInfoHeader(bad) {
+					t.Errorf("kind %d, subject %q, reply %q: malformedRequestInfoHeader = false, want true", kind, subject, reply)
+				}
+				c.pa.hdr = goodHdr
+				if c.malformedRequestInfoHeader(good) {
+					t.Errorf("kind %d, subject %q, reply %q: well formed block rejected", kind, subject, reply)
+				}
+			}
+		}
+	}
+}
+
+// A LEAF drop logs one rate-limited warning. It names the subject and the
+// reply with %q and contains no header bytes. The format is the rate-limit
+// key, so a drop on another subject in the same interval adds no line (fork
+// review R2).
+func TestStampRequestInfoLeafDropWarningNamesSubject(t *testing.T) {
+	hdr := "NATS/1.0\nNats-Request-Info: {\"user\":\"forged\"}\r\n\r\n\r\n"
+	msg := []byte(hdr + "hello\r\n")
+	s := &Server{opts: &Options{StampRequestInfo: true}}
+	s.stampReqInfo.Store(true)
+	l := &captureWarnLogger{warn: make(chan string, 4)}
+	s.SetLogger(l, false, false)
+	c := &client{kind: LEAF, srv: s}
+	c.pa.subject = []byte("$JS.M.abc")
+	c.pa.reply = []byte("$JS.ACK.ORIGIN.mirror.1.7.7.1700000000000000000.0")
+	c.pa.hdr = len(hdr)
+
+	if !c.rejectMalformedRequestInfoHeader(msg) {
+		t.Fatal("Want a dropped leaf message")
+	}
+	select {
+	case w := <-l.warn:
+		for _, want := range []string{`Subject "$JS.M.abc"`, `Reply "$JS.ACK.ORIGIN.mirror.1.7.7.1700000000000000000.0"`} {
+			if !strings.Contains(w, want) {
+				t.Errorf("Warning %q does not contain %s", w, want)
+			}
+		}
+		for _, banned := range []string{"NATS/1.0", "Nats-Request-Info", "forged"} {
+			if strings.Contains(w, banned) {
+				t.Errorf("Warning %q contains header bytes %q", w, banned)
+			}
+		}
+	default:
+		t.Fatal("Want a warning for the dropped leaf message")
+	}
+
+	c.pa.subject = []byte("svc.other")
+	if !c.rejectMalformedRequestInfoHeader(msg) {
+		t.Fatal("Want a dropped leaf message")
+	}
+	select {
+	case w := <-l.warn:
+		t.Fatalf("Want no second warning in the interval, got %q", w)
+	default:
 	}
 }
 

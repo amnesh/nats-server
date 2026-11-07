@@ -394,19 +394,62 @@ Result of a failed check:
   upstream close state `MsgHeaderViolation`. nats.go also closes its
   connection when it gets this text.
 - LEAF: the server does not deliver the message and logs a rate-limited
-  warning. The leaf connection stays up, because one bad client behind a leaf
-  must not stop the link for all the clients behind it.
+  warning:
+  `Dropped a leafnode message with a malformed header block - Subject "<subject>" - Reply "<reply>"`.
+  The subject and the reply are quoted with `%q`. The format is the
+  rate-limit key, so the server writes one line for each account in each
+  interval (1 s by default), for the first drop in that interval. The leaf
+  connection stays up, because one bad client behind a leaf must not stop the
+  link for all the clients behind it. The drop is not in the inbound message
+  statistics, because the check runs before the count.
 
-No log contains header bytes. Routes and gateways are not checked: each server
+The logs of the check contain no header bytes: the CLIENT error and the LEAF
+warning name only the subject (and, for LEAF, the reply). Upstream code can
+log a header value before the check: message-trace setup logs the value of
+`Nats-Trace-Origin-Account`. Routes and gateways are not checked: each server
 that accepts CLIENT or LEAF connections must enable the feature. When the
 feature is disabled, the server does not check header blocks (upstream
 behavior).
 
+The check reads the header block that the parser gives to
+`processInboundClientMsg` and `processInboundLeafMsg`. Message-trace setup
+(`initMsgTrace`, called in `server/parser.go`, code in `server/msgtrace.go`)
+runs first and can change the block. With a `Nats-Trace-Origin-Account`
+header, or with a `traceparent` header and a sampling miss, it replaces the
+`Nats-Trace-Dest` value with `trace disabled` through `setHeader`.
+`setHeader` removes the last CRLF of the block and appends the new line and
+the final empty line. Thus a block without its final empty line gets the
+strict form before the check, and passes. This is not a bypass: the new
+block is strict, the stamp strip removes the client copy of
+`Nats-Request-Info` that is now merged with the appended line, and nats.go
+reads one value, the server stamp. A subject mapping also runs before the
+check. A CLIENT close does not stop the parse of the same read buffer; a
+later message in that buffer also gets the check and the stamp.
+
 Header blocks that the server writes (status, flow control, heartbeat, and
-stream headers) have the strict form. A stream can still hold a block in
-another form that a server without the check stored. A LEAF delivery of such
-a message, for example a source or mirror delivery over a leaf link, is
-dropped. Enable the check on all servers before such data is stored.
+stream headers) have the strict form. A stream can still hold a block that
+is not strict. Such a block can come from data that a stream stored before
+the check was on, from a message that came over a route or a gateway from a
+server without the check, or from a stream snapshot restore
+(`$JS.API.STREAM.RESTORE` carries the stored messages in its payload, so the
+check does not read their header blocks). A server with the check drops the
+LEAF delivery of such a message. For a mirror, a source, or an ordered
+consumer (for example a legacy nats.go KV watch) across a leaf link, the
+drop causes a sequence gap. The reader then creates its consumer again at
+the same stream sequence, the server drops the message again, and the loop
+does not end. The reader stops at that message, and later messages do not
+arrive.
+
+- Find the message: read the LEAF warning. The reply of a JetStream delivery
+  names the stream, the consumer, and the stream sequence:
+  `$JS.ACK.<stream>.<consumer>.<count>.<stream sequence>...`, or
+  `$JS.ACK.<domain>.<account hash>.<stream>.<consumer>.<count>.<stream sequence>...`.
+- Recover: at the origin, delete that message, or purge the stream up to
+  the next sequence. Another option is to turn the feature off on the
+  receiving server.
+- Prevent: run the fixed fork with the feature on all servers before data
+  enters the streams. Before you turn the check on, examine the streams that
+  cross a leaf link.
 
 ## 2.5 What gets stamped
 
@@ -580,6 +623,15 @@ Trust the header only under these conditions:
   `NATS/1.0 5` and `NATS/1.0 ` through a raw CLIENT and a raw LEAF, with a
   raw subscriber as the observer (a nats.go `v1.53.1` subscriber panics on
   these blocks), and `NATS/1.0 503 No Responders` as the positive control.
+  `TestStampRequestInfoRejectsMalformedStreamHeader` publishes the N1 frame
+  without a reply subject to a stream subject and to a `$KV.` subject (`-ERR`,
+  close, no stored message). `TestStampRequestInfoTraceHeaderBlock` sends
+  `traceparent` blocks with and without the final empty line, and a block
+  that message-trace setup changes to the strict form (one server stamp).
+  `TestRequestInfoHeaderBlockCheckScope` also has rows for each skipped
+  subject prefix, with and without a reply subject.
+  `TestStampRequestInfoLeafDropWarningNamesSubject` checks the LEAF warning
+  text and its rate-limit key.
 
 ---
 

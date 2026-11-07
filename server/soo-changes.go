@@ -117,7 +117,7 @@ func (c *client) malformedRequestInfoHeader(msg []byte) bool {
 // CLIENT the -ERR "Message Header Violation" and closes it with
 // MsgHeaderViolation. A LEAF connection stays up, because one bad client behind
 // a leaf must not close the link of all the clients behind it; the hub logs a
-// rate-limited warning. No log contains header bytes.
+// rate-limited warning. The logs of this check contain no header bytes.
 func (c *client) rejectMalformedRequestInfoHeader(msg []byte) bool {
 	if !c.malformedRequestInfoHeader(msg) {
 		return false
@@ -126,7 +126,14 @@ func (c *client) rejectMalformedRequestInfoHeader(msg []byte) bool {
 		mt.setIngressError(msgHeaderViolationErr)
 	}
 	if c.kind == LEAF {
-		c.RateLimitWarnf("Dropped a leafnode message with a malformed header block")
+		// A dropped stored message (a mirror, source, or consumer delivery)
+		// comes again after each consumer reset. The subject and the reply let
+		// the operator find it: the reply of a JetStream delivery ($JS.ACK...)
+		// names the stream, the consumer, and the stream sequence. The format,
+		// not the statement, is the rate-limit key, so distinct subjects do not
+		// add log lines.
+		c.rateLimitFormatWarnf("Dropped a leafnode message with a malformed header block - Subject %q - Reply %q",
+			c.pa.subject, c.pa.reply)
 		return true
 	}
 	c.sendErr(msgHeaderViolationErr)

@@ -238,11 +238,23 @@ func headerPub(op, subject, reply, hdr, payload string) string {
 
 func runStampHeaderServer(t *testing.T, stamp bool, leaf bool) (*server.Server, *server.Options) {
 	t.Helper()
+	extra := ""
+	if leaf {
+		extra = "leafnodes { listen: 127.0.0.1:-1 }\n"
+	}
+	return runStampHeaderServerConf(t, stamp, "", extra)
+}
+
+// runStampHeaderServerConf adds accountExtra to the configuration of account
+// A and extra to the top level.
+func runStampHeaderServerConf(t *testing.T, stamp bool, accountExtra, extra string) (*server.Server, *server.Options) {
+	t.Helper()
 	conf := fmt.Sprintf(`
 		listen: 127.0.0.1:-1
 		stamp_request_info: %v
 		accounts: {
 			A: {
+				%s
 				users: [
 					{user: req, password: pwd}
 					{user: svc, password: pwd}
@@ -250,10 +262,8 @@ func runStampHeaderServer(t *testing.T, stamp bool, leaf bool) (*server.Server, 
 				]
 			}
 		}
-	`, stamp)
-	if leaf {
-		conf += "leafnodes { listen: 127.0.0.1:-1 }\n"
-	}
+		%s
+	`, stamp, accountExtra, extra)
 	file := createConfFile(t, []byte(conf))
 	t.Cleanup(func() { os.Remove(file) })
 	srv, opts := RunServerWithConfig(file)
@@ -469,6 +479,191 @@ func TestStampRequestInfoRejectsShortStatusHeader(t *testing.T) {
 		requireNoRespondersStatus(t, o, "leaf")
 	})
 	checkLeafNodeConnected(t, hub)
+}
+
+// A raw CLIENT publish without a reply subject to a stream subject also gets
+// the check, because a stream stores the header block and its strip removes
+// only the copies after CRLF (fork review R4). One leg uses a plain stream
+// subject. The other leg uses a $KV. subject, which the stamp skips. The N1
+// frame gets -ERR and a close, and the stream stores no message: the first
+// JetStream publish after the close gets sequence 1. The stream handles its
+// inbound messages in order, so that publish is the barrier.
+func TestStampRequestInfoRejectsMalformedStreamHeader(t *testing.T) {
+	_, opts := runStampHeaderServerConf(t, true, "jetstream: enabled",
+		fmt.Sprintf("jetstream: {store_dir: %q}", t.TempDir()))
+	nc, err := nats.Connect(fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port), nats.UserInfo("req", "pwd"))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	defer nc.Close()
+	js, err := nc.JetStream()
+	if err != nil {
+		t.Fatalf("Error getting JetStream context: %v", err)
+	}
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "ORDERS", Subjects: []string{"orders.>"}}); err != nil {
+		t.Fatalf("Error adding stream: %v", err)
+	}
+	if _, err := js.CreateKeyValue(&nats.KeyValueConfig{Bucket: "cfg"}); err != nil {
+		t.Fatalf("Error adding key-value bucket: %v", err)
+	}
+
+	frame := malformedHeaderFrames[0]
+	for _, tc := range []struct {
+		name    string
+		subject string
+		stream  string
+	}{
+		{"stream-subject", "orders.new", "ORDERS"},
+		{"kv-subject", "$KV.cfg.k1", "KV_cfg"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := "bad-" + tc.name
+			raw := dialRawStampClient(t, opts)
+			raw.send(fmt.Sprintf("HPUB %s %d %d\r\n%s%s\r\nPING\r\n",
+				tc.subject, len(frame.hdr), len(frame.hdr)+len(payload), frame.hdr, payload))
+			text, open := raw.until("PONG\r\n")
+			closed := !open || raw.closed(time.Second)
+			if !strings.Contains(text, "-ERR 'Message Header Violation'") {
+				t.Errorf("Raw client got no -ERR 'Message Header Violation'; received %q", text)
+			}
+			if !closed {
+				t.Errorf("Server did not close the raw client")
+			}
+
+			marker := "control-" + tc.name
+			ack, err := js.Publish(tc.subject, []byte(marker))
+			if err != nil {
+				t.Fatalf("Error publishing control message: %v", err)
+			}
+			if ack.Sequence != 1 {
+				t.Errorf("Control message got sequence %d, want 1: the stream stored the rejected frame", ack.Sequence)
+			}
+			si, err := js.StreamInfo(tc.stream)
+			if err != nil {
+				t.Fatalf("Error getting stream info: %v", err)
+			}
+			if si.State.Msgs != 1 {
+				t.Errorf("Stream %s has %d messages, want 1", tc.stream, si.State.Msgs)
+			}
+			m, err := js.GetMsg(tc.stream, si.State.FirstSeq)
+			if err != nil {
+				t.Fatalf("Error getting the first stream message: %v", err)
+			}
+			if string(m.Data) != marker {
+				t.Errorf("First stream message is %q, want %q", m.Data, marker)
+			}
+		})
+	}
+}
+
+// Message-trace setup runs before the check and can change the header block
+// (fork review R3). The account has a trace destination with the default
+// sampling (100%), so a traceparent header causes no change: the check reads
+// the block that the client sent. A traceparent block with its final empty
+// line passes with one server stamp. Without the final empty line, the
+// client gets -ERR and a close, and the trace event has the ingress error.
+// The Nats-Trace-Origin-Account header makes trace setup replace the
+// Nats-Trace-Dest value with "trace disabled". This is the same setHeader
+// call that a traceparent sampling miss does, but it does not depend on a
+// random sample. The new block has the strict form, so it passes. The stamp
+// strip removes the client copy, now merged with the appended line, and
+// nats.go reads one value: the server stamp.
+func TestStampRequestInfoTraceHeaderBlock(t *testing.T) {
+	_, opts := runStampHeaderServerConf(t, true, `msg_trace: {dest: "trace.dest"}`, "")
+	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
+	svc := runStampService(t, url)
+
+	tnc, err := nats.Connect(url, nats.UserInfo("svc", "pwd"))
+	if err != nil {
+		t.Fatalf("Error connecting trace subscriber: %v", err)
+	}
+	defer tnc.Close()
+	traces := make(chan *nats.Msg, 64)
+	if _, err := tnc.ChanSubscribe("trace.dest", traces); err != nil {
+		t.Fatalf("Error subscribing to the trace destination: %v", err)
+	}
+	if err := tnc.Flush(); err != nil {
+		t.Fatalf("Error flushing trace subscriber: %v", err)
+	}
+
+	ctl, err := nats.Connect(url, nats.UserInfo("req", "pwd"))
+	if err != nil {
+		t.Fatalf("Error connecting control client: %v", err)
+	}
+	defer ctl.Close()
+
+	const traceparent = "traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\r\n"
+	clientCopy := "Nats-Request-Info: " + forgedRequestInfo + "\r\n"
+
+	t.Run("traceparent-with-final-empty-line-passes", func(t *testing.T) {
+		raw := dialRawStampClient(t, opts)
+		hdr := "NATS/1.0\r\n" + traceparent + clientCopy + "\r\n"
+		raw.send(headerPub("HPUB", "svc.echo", "_INBOX.raw.reply", hdr, "trace-strict") + "PING\r\n")
+		if text, ok := raw.until("PONG\r\n"); !ok || strings.Contains(text, "-ERR") {
+			t.Fatalf("Raw client rejected or closed: %q", text)
+		}
+		before, o := svc.until(t, "trace-strict")
+		if len(before) != 0 {
+			t.Fatalf("Unexpected messages: %+v", before)
+		}
+		requireServerStamp(t, o, "req")
+	})
+
+	t.Run("traceparent-without-final-empty-line-rejected", func(t *testing.T) {
+		raw := dialRawStampClient(t, opts)
+		hdr := "NATS/1.0\r\n" + traceparent + clientCopy
+		raw.send(headerPub("HPUB", "svc.echo", "_INBOX.raw.reply", hdr, "bad-trace") + "PING\r\n")
+		text, open := raw.until("PONG\r\n")
+		closed := !open || raw.closed(time.Second)
+		marker := "control-trace"
+		if err := ctl.PublishRequest("svc.echo", "_INBOX.ctl.reply", []byte(marker)); err != nil {
+			t.Fatalf("Error publishing control request: %v", err)
+		}
+		before, control := svc.until(t, marker)
+		for _, o := range before {
+			t.Errorf("Server delivered %q; nats.go read Nats-Request-Info values %q", o.payload, o.values)
+		}
+		if !strings.Contains(text, "-ERR 'Message Header Violation'") {
+			t.Errorf("Raw client got no -ERR 'Message Header Violation'; received %q", text)
+		}
+		if !closed {
+			t.Errorf("Server did not close the raw client")
+		}
+		requireServerStamp(t, control, "req")
+
+		timeout := time.After(5 * time.Second)
+		for {
+			select {
+			case m := <-traces:
+				var e server.MsgTraceEvent
+				if err := json.Unmarshal(m.Data, &e); err != nil {
+					t.Fatalf("Bad trace event %q: %v", m.Data, err)
+				}
+				if in := e.Ingress(); in != nil && in.Error == "Message Header Violation" {
+					if in.Subject != "svc.echo" {
+						t.Fatalf("Trace event ingress subject %q, want svc.echo", in.Subject)
+					}
+					return
+				}
+			case <-timeout:
+				t.Fatal("No trace event with the ingress error 'Message Header Violation'")
+			}
+		}
+	})
+
+	t.Run("trace-setup-rewrite-passes-with-one-stamp", func(t *testing.T) {
+		raw := dialRawStampClient(t, opts)
+		hdr := "NATS/1.0\r\n" + traceparent + "Nats-Trace-Dest: trace.other\r\nNats-Trace-Origin-Account: A\r\n" + clientCopy
+		raw.send(headerPub("HPUB", "svc.echo", "_INBOX.raw.reply", hdr, "trace-rewrite") + "PING\r\n")
+		if text, ok := raw.until("PONG\r\n"); !ok || strings.Contains(text, "-ERR") {
+			t.Fatalf("Raw client rejected or closed: %q", text)
+		}
+		before, o := svc.until(t, "trace-rewrite")
+		if len(before) != 0 {
+			t.Fatalf("Unexpected messages: %+v", before)
+		}
+		requireServerStamp(t, o, "req")
+	})
 }
 
 // With stamp_request_info off (the default) the server keeps the upstream
