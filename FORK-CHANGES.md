@@ -27,8 +27,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
 | 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
 | 12 | Grant reject codes, and no leaf CONNECT with a revoked JWT | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf check is always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
+| 13 | MQTT request header block (upstream defect correction) | always on | `server/mqtt_soo_store_header_test.go` | `server/mqtt.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Section 11 records a correction of an upstream defect. Section 12 documents the reject codes and the leaf revoked-credential check.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11 and 13 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check.
 
 ---
 
@@ -1624,3 +1625,47 @@ again after each reconnect interval.
 ```sh
 go test -race -run 'AuthGrant(Reject|Disconnect|Client|Connected|Leaf)|AuthVerifyCallout|LeafRemoteRevoked' ./server ./server/authverify -count=1
 ```
+
+
+# 13. MQTT request header block
+
+This section corrects an upstream defect. Upstream `v2.15.2` contains it.
+
+The MQTT session manager sends its JetStream requests through an internal
+client. When a request has no header block of its own, the send loop adds a
+`Nats-Request-Info` header. It wrote `NATS/1.0\r\n`, the header line (which
+`http.Header.Write` ends with CRLF), and then two CRLF. Thus the block was
+`NATS/1.0\r\nNats-Request-Info: {...}\r\n\r\n\r\n`: it had an empty line
+before its end. The stream store removes `Nats-Request-Info` and keeps the
+rest, so a stream stored the block `NATS/1.0\r\n\r\n\r\n`. Each new MQTT
+session record (`$MQTT_sess`) and each transferred legacy session or retained
+record had it.
+
+Such a block is not strict (section 2.4). A server with `stamp_request_info`
+on drops the LEAF delivery of such a message, so a mirror, a source, or an
+ordered consumer of `$MQTT_sess` across a leaf link stops at the first new
+session record.
+
+The fork writes one CRLF after the header line. The block ends with one empty
+line. After the store removes `Nats-Request-Info` from a session record, only
+`NATS/1.0\r\n\r\n` stays, and the store keeps no header block. The change is
+always on. It also changes the bytes with stamping off: a new session record
+has no header block (before: a 14-byte block), and each MQTT JetStream
+request has 2 fewer header bytes.
+MQTT reads the JSON body of a session record and named headers of the other
+records, so no reader sees a change. Session records that a server stored
+before the correction keep the old block.
+
+Leaf links: a hub with stamping on drops a LEAF message with a block that is
+not strict (section 2.4). Thus, without the correction, the hub drops each
+MQTT JetStream request without its own header block that an MQTT server
+behind a leaf link sends to the JetStream domain of the hub (static reading,
+not tested). The correction removes this drop when the leaf server runs it.
+
+```sh
+go test -race ./server -run 'TestMQTTStampRequestInfoStoreHeaderBlocks' -count=1
+```
+
+The test runs MQTT QoS 1 and QoS 2 publishes, retained messages and a
+retained delete, and a session with stamping on. It checks that each stored
+header block in the MQTT streams is strict.

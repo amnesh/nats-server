@@ -2437,7 +2437,9 @@ func (as *mqttAccountSessionManager) sendJSAPIrequests(s *Server, c *client, acc
 	hdrStart := bytes.Buffer{}
 	hdrStart.WriteString(hdrLine)
 	http.Header{ClientInfoHdr: []string{string(b)}}.Write(&hdrStart)
-	hdrStart.WriteString(CR_LF)
+	// Fork: one empty line ends the block. Header.Write ends the line with
+	// CRLF, so a second CRLF here made an empty line inside the block. A
+	// stream stored that block in each session record (FORK-CHANGES 13).
 	hdrStart.WriteString(CR_LF)
 	hdrb := hdrStart.Bytes()
 
