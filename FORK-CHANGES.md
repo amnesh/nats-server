@@ -447,9 +447,16 @@ The check runs before the stream stores the message or proposes it:
   batch or a fast batch, for each replica count. An atomic batch commit checks
   each staged message, so the stream stores no message of the batch.
 - `processJetStreamMsgWithBatch` (`server/stream.go`), where the stream does
-  its other consistency checks: a stream without a Raft group, and a
-  trace-only message. The check does not run when a follower applies a Raft
-  entry.
+  its other consistency checks, and only for a new message, which has no
+  Raft entry sequence and timestamp (`lseq` and `ts` are 0): a stream without
+  a Raft group, and a trace-only message.
+
+The check never runs at a Raft apply. An apply has the sequence and the
+timestamp of the entry, so the check in `processJetStreamMsgWithBatch` does
+not run, also on a follower with the feature on. This is also true after a
+scale-down to R1: the server removes the Raft node, and the apply loop can
+still apply an entry that the old leader acknowledged. That entry is stored
+also when the old leader had the feature off and this server has it on.
 
 The check reads the block that the stream gets, before the server removes its
 own `Nats-Request-Info` copy. Before the check, `processInboundJetStreamMsg`
@@ -462,8 +469,11 @@ stream, and the messages that the store makes (subject delete markers and
 scheduled messages). A reject of mirror or source ingest only moves the stop
 from the leaf link to the ingest of the stream, and a reject of a scheduled
 message can stop its schedule. The restart recovery of a partial atomic batch
-write also stores without the check: the staged messages carry the batch
-headers, and they got the check at their commit.
+write also stores without the check, because the staged messages carry the
+batch headers. They got the check at their commit only if the feature was on
+at that commit. A batch that a server committed while the feature was off,
+and that the server recovers after a restart with the feature on, is stored
+without the check.
 
 Result of a failed check:
 
@@ -686,7 +696,8 @@ Trust the header only under these conditions:
   `checkMsgHeadersPreClusteredProposal` (clustered publish, atomic and fast
   batches).
 - `server/stream.go` — the store check call in `processJetStreamMsgWithBatch`
-  (a stream without a Raft group, and a trace-only message).
+  (a new message on a stream without a Raft group, and a trace-only message;
+  never a Raft apply).
 - `server/server.go` — the `Server.stampReqInfo` atomic mirror, set at startup and
   on reload.
 - `server/opts.go` — `Options.StampRequestInfo` + the `stamp_request_info` key.
@@ -737,7 +748,10 @@ Trust the header only under these conditions:
   `TestJetStreamStampRequestInfoStoreKeepsServerHeaderBlocks` (KV and object
   store operations, counters, TTL and subject delete markers, schedules,
   atomic and fast batches, republish, mirror, and source store strict blocks
-  with stamping on), and
+  with stamping on),
+  `TestJetStreamStampRequestInfoStoreSkipsRaftApplyForm` (a call with the
+  sequence and timestamp of a Raft entry stores a loose block, and a call
+  with both 0 rejects it), and
   `TestJetStreamStampRequestInfoStoreSkipsMirrorAndSourceIngest` (loose blocks
   stored with stamping off, then a reload to stamping on: a mirror and a
   source store them, and the stream that gets the republish of the mirror
@@ -1779,13 +1793,31 @@ not tested). The correction removes this drop when the leaf server runs it.
 The store check of section 2.4 needs this correction: without it, the check
 rejects each new session record while stamping is on.
 
-Upgrade order: a server without the correction writes the first session
-record of a new MQTT client ID with the old block. When the leader of
-`$MQTT_sess` has the store check and stamping on, it rejects that record, and
-the MQTT CONNECT on the old server fails. Existing sessions still save,
-because their records have a strict `Nats-Expected-Last-Subject-Sequence`
-block. Upgrade each server that serves MQTT before a server with the store
-check and stamping on can lead `$MQTT_sess`.
+Upgrade order: a server without the correction writes these records with the
+old block:
+
+- the first session record of a new MQTT client ID (`$MQTT_sess`);
+- a session record that it transfers from a legacy per-session stream
+  (`$MQTT_sess`);
+- a retained message that it transfers from the legacy retained format
+  (`$MQTT_rmsgs`).
+
+When the leader of `$MQTT_sess` or `$MQTT_rmsgs` has the store check and
+stamping on, it rejects these records. Then the MQTT CONNECT of a new client
+ID on the old server fails, and the transfer logs an error. Existing sessions
+still save, because their records have a strict
+`Nats-Expected-Last-Subject-Sequence` block.
+
+Rolling upgrade of a cluster in which each server serves MQTT. Use one of
+these procedures:
+
+1. Upgrade all servers with `stamp_request_info` off. Then turn it on with a
+   reload on each server. While the feature is off, the server does not do
+   the ingress check of section 2.4 (the protection of `.5`), and it does not
+   stamp requests.
+2. Keep the leaders of `$MQTT_sess` and `$MQTT_rmsgs` on servers without the
+   store check until you upgraded all servers. Move a leader with a stream
+   leader stepdown that names a preferred old server.
 
 ```sh
 go test -race ./server -run 'TestMQTTStampRequestInfoStoreHeaderBlocks' -count=1

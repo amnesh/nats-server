@@ -178,8 +178,10 @@ func storeRejectsHeaderBlock(s *Server, hdr []byte, sourced bool) bool {
 //
 // The callers are checkMsgHeadersPreClusteredProposal (a clustered publish
 // before its proposal, and each atomic or fast batch message) and
-// processJetStreamMsgWithBatch (a stream without a Raft node, and a
-// trace-only message). The callers can hold the stream lock. Thus this
+// processJetStreamMsgWithBatch (a new message, with lseq and ts of 0, on a
+// stream without a Raft node, and a trace-only message). A Raft apply never
+// gets this check: the leader decided before the proposal. The callers can
+// hold the stream lock. Thus this
 // function takes no stream lock and reads only mset.srv and mset.acc, which do
 // not change after the stream is created.
 func (mset *stream) rejectStoreHeaderBlock(name string, hdr []byte, sourced bool) *ApiError {

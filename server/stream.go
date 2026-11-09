@@ -6668,7 +6668,10 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 
 	// Fork: no loose header block while stamping is on (soo-changes.go).
 	// Clustered and batch messages get this check before their proposal.
-	if canConsistencyCheck {
+	// Only a new message has lseq and ts of 0. A Raft apply has the entry
+	// sequence and timestamp, also after a scale-down to R1 removes the node
+	// while the apply loop still applies an entry: do not reject it there.
+	if canConsistencyCheck && lseq == 0 && ts == 0 {
 		if apiErr := mset.rejectStoreHeaderBlock(name, hdr, sourced); apiErr != nil {
 			if canRespond {
 				resp.PubAck = &PubAck{Stream: name}

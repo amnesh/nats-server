@@ -349,6 +349,43 @@ func TestJetStreamStampRequestInfoStoreRejectsLooseHeaderBlock(t *testing.T) {
 	}
 }
 
+// The store check runs in processJetStreamMsgWithBatch only for the form of a
+// new message: lseq and ts are 0. A Raft apply has the entry sequence and
+// timestamp. After a scale-down to R1 removes the Raft node, the apply loop
+// can still apply an entry that the old leader acknowledged; the stream then
+// has no Raft node, like this single-server stream. The check must not reject
+// that entry, also when this server has stamping on and the old leader had it
+// off. A call with lseq and ts of 0 still gets the check.
+func TestJetStreamStampRequestInfoStoreSkipsRaftApplyForm(t *testing.T) {
+	s := runStoreHeaderServer(t, true)
+	l := &storeHeaderLogger{}
+	s.SetLogger(l, false, false)
+	nc, _ := jsClientConnect(t, s)
+	defer nc.Close()
+	addStream(t, nc, &StreamConfig{Name: "APPLY", Subjects: []string{"apply.>"}, Storage: FileStorage})
+	mset := storeHeaderStream(t, s, "APPLY")
+	require_False(t, mset.IsClustered())
+
+	// The apply form: the first entry has lseq 0 and a timestamp, a later
+	// entry has the last sequence.
+	ts := time.Now().UnixNano()
+	for i, hdr := range looseStoreHeaderBlocks {
+		err := mset.processJetStreamMsg("apply.a", _EMPTY_, []byte(hdr), []byte("x"), uint64(i), ts+int64(i), nil, false, true)
+		require_NoError(t, err)
+	}
+	require_Equal(t, storeHeaderMsgs(t, s, "APPLY"), uint64(len(looseStoreHeaderBlocks)))
+	for i, hdr := range storedHeaderBlocks(t, s, s.GlobalAccount(), "APPLY") {
+		require_Equal(t, string(hdr), looseStoreHeaderBlocks[i])
+	}
+	require_Equal(t, l.rejects("APPLY"), 0)
+
+	// The form of a new message gets the check.
+	err := mset.processJetStreamMsg("apply.b", _EMPTY_, []byte(looseStoreHeaderBlocks[0]), []byte("x"), 0, 0, nil, false, true)
+	require_Error(t, err, NewJSBadRequestError())
+	require_Equal(t, storeHeaderMsgs(t, s, "APPLY"), uint64(len(looseStoreHeaderBlocks)))
+	require_Equal(t, l.rejects("APPLY"), 1)
+}
+
 // Header blocks that the server and nats.go write pass the store check.
 // With stamping on, each internal writer stores its messages, and each stored
 // header block is strict: KV and object store operations, message counters,

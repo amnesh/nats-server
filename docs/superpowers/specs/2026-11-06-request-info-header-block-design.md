@@ -93,9 +93,12 @@ without a Raft group) rejects a header block that is not strict, with
 `requestInfoHeaderBlockValid`, for each client kind and each input path. The
 check runs before the store and before the Raft proposal:
 `checkMsgHeadersPreClusteredProposal` covers a clustered publish and each
-atomic or fast batch message; `processJetStreamMsgWithBatch` covers a stream
-without a Raft group and a trace-only message. It never runs when a follower
-applies an entry, so the replicas do not diverge.
+atomic or fast batch message; `processJetStreamMsgWithBatch` covers a new
+message (`lseq` and `ts` are 0) on a stream without a Raft group and a
+trace-only message. It never runs at a Raft apply, so the replicas do not
+diverge. An apply has the sequence and the timestamp of the entry. This is
+also true after a scale-down to R1 removes the Raft node while the apply loop
+still applies an entry that the old leader acknowledged (P6-U32 review L1).
 
 The check skips sourced messages: the mirror and source ingest of the stream
 (a reject there only moves the stop into the ingest), and the messages that
@@ -105,6 +108,12 @@ reads the block that the stream gets, after `removeHeaderStatusIfPresent` in
 `processInboundJetStreamMsg` and before the server removes its own
 `Nats-Request-Info`. Thus a short inline status becomes no header block, and
 the N1 frame becomes `NATS/1.0\r\n\r\n\r\n`, which the check rejects.
+
+The restart recovery of a partial atomic batch write stores without the
+check, because the staged messages carry the batch headers. They got the
+check at their commit only if the feature was on at that commit; a batch
+committed while the feature was off and recovered after a restart with the
+feature on is stored without the check (P6-U32 review L3).
 
 Result: a publish with a reply gets a `PubAck` with `JSBadRequestErr` (400,
 10003), an existing upstream error, so the upstream error code table does not
@@ -118,12 +127,15 @@ blocks are strict. The MQTT request header block was not strict (an empty
 line before its end, so each new session record stored
 `NATS/1.0\r\n\r\n\r\n`). The fork corrects it (FORK-CHANGES section 13);
 without the correction the store check rejects each new MQTT session record.
-A server without the correction can still send such a record over a route,
-so upgrade each MQTT server before a server with the store check can lead
-`$MQTT_sess`. An MQTT retained record copies the CONNECT user name into
-`Nmqtt-RSrc` without a check (upstream); a user name with a CR or an LF makes
-a block that is not strict, and the store check rejects that retained message
-while stamping is on.
+A server without the correction can still send such a record over a route:
+a new session record, a transferred legacy session record (`$MQTT_sess`), or
+a transferred legacy retained message (`$MQTT_rmsgs`). Thus upgrade all MQTT
+servers with stamping off and then turn it on, or keep the leaders of these
+streams on old servers until all servers have the correction
+(FORK-CHANGES section 13). An MQTT retained record copies the CONNECT user
+name into `Nmqtt-RSrc` without a check (upstream); a user name with a CR or
+an LF makes a block that is not strict, and the store check rejects that
+retained message while stamping is on.
 
 ## Limits that stay
 
@@ -191,4 +203,7 @@ while stamping is on.
   atomic and fast batch, republish, mirror, source, and MQTT messages store
   strict blocks with stamping on; legacy loose blocks (stored with stamping
   off, then a reload) go into a mirror and a source, and the stream that gets
-  the republish of the mirror rejects them.
+  the republish of the mirror rejects them. Review L1: a store call with the
+  sequence and timestamp of a Raft entry (the apply form, also on a stream
+  without a Raft node) stores a loose block, and a call with both 0 rejects
+  it.
