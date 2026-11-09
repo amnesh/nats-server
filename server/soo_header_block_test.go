@@ -219,3 +219,99 @@ func TestStampRequestInfoRemovesEveryClientCopy(t *testing.T) {
 		t.Fatalf("Payload changed: %q", out[c.pa.hdr:])
 	}
 }
+
+// The store check rejects a header block that is not strict only while
+// stamping is on and only for a message that is not sourced. Mirror and
+// source ingest (sourced) are not checked, also with a block that the check
+// rejects otherwise (option 4 of the leaf stall probe, P6-U32).
+func TestRequestInfoStoreHeaderBlockDecision(t *testing.T) {
+	mk := func(stamp bool) *Server {
+		s := &Server{opts: &Options{StampRequestInfo: stamp}}
+		s.stampReqInfo.Store(stamp)
+		return s
+	}
+	strict := []string{
+		"NATS/1.0\r\n\r\n",
+		"NATS/1.0\r\nNats-Msg-Id: 1\r\n\r\n",
+		"NATS/1.0 503\r\nA: b\r\n\r\n",
+	}
+	loose := []string{
+		// The N1 frame after removeHeaderStatusIfPresent in
+		// processInboundJetStreamMsg: the stream gets this block.
+		"NATS/1.0\r\n\r\n\r\n",
+		"NATS/1.0\r\nX-Trace: t\nNats-Request-Info: x\r\n\r\n",
+		"NATS/1.0\r\nX-Trace: t\r\n\r\nNats-Request-Info: x\r\n\r\n",
+		"NATS/1.0\r\nNats-Request-Info: x\r\n",
+		"NATS/1.0 5\r\nA: b\r\n\r\n",
+		"A: b\r\n\r\n",
+	}
+	for _, stamp := range []bool{true, false} {
+		for _, sourced := range []bool{true, false} {
+			s := mk(stamp)
+			for _, hdr := range strict {
+				if storeRejectsHeaderBlock(s, []byte(hdr), sourced) {
+					t.Errorf("stamp=%v sourced=%v: strict block %q rejected", stamp, sourced, hdr)
+				}
+			}
+			for _, hdr := range loose {
+				want := stamp && !sourced
+				if got := storeRejectsHeaderBlock(s, []byte(hdr), sourced); got != want {
+					t.Errorf("stamp=%v sourced=%v: block %q: reject = %v, want %v", stamp, sourced, hdr, got, want)
+				}
+			}
+			if storeRejectsHeaderBlock(s, nil, sourced) {
+				t.Errorf("stamp=%v sourced=%v: no header rejected", stamp, sourced)
+			}
+		}
+	}
+	if storeRejectsHeaderBlock(nil, []byte(loose[0]), false) {
+		t.Error("no server: want no check")
+	}
+}
+
+// A store reject returns JSBadRequestErr and logs one rate-limited warning.
+// The warning names the account and the stream and contains no subject and no
+// header bytes.
+func TestRequestInfoStoreHeaderBlockWarning(t *testing.T) {
+	s := &Server{opts: &Options{StampRequestInfo: true}}
+	s.stampReqInfo.Store(true)
+	l := &captureWarnLogger{warn: make(chan string, 4)}
+	s.SetLogger(l, false, false)
+	mset := &stream{srv: s, acc: &Account{Name: "ACC"}}
+	hdr := []byte("NATS/1.0\r\nX-Trace: t\r\n\r\nNats-Request-Info: {\"user\":\"forged\"}\r\n\r\n")
+
+	if apiErr := mset.rejectStoreHeaderBlock("ORDERS", []byte("NATS/1.0\r\nA: b\r\n\r\n"), false); apiErr != nil {
+		t.Fatalf("Strict block rejected: %v", apiErr)
+	}
+	if apiErr := mset.rejectStoreHeaderBlock("ORDERS", hdr, true); apiErr != nil {
+		t.Fatalf("Sourced block rejected: %v", apiErr)
+	}
+	apiErr := mset.rejectStoreHeaderBlock("ORDERS", hdr, false)
+	if apiErr == nil {
+		t.Fatal("Want a reject")
+	}
+	if !IsNatsErr(apiErr, JSBadRequestErr) || apiErr.Code != 400 || apiErr.ErrCode != 10003 {
+		t.Fatalf("Want JSBadRequestErr (400, 10003), got %+v", apiErr)
+	}
+	select {
+	case w := <-l.warn:
+		if !strings.Contains(w, "'ACC > ORDERS'") {
+			t.Errorf("Warning %q does not name the account and the stream", w)
+		}
+		for _, banned := range []string{"NATS/1.0", "Nats-Request-Info", "forged", "X-Trace"} {
+			if strings.Contains(w, banned) {
+				t.Errorf("Warning %q contains header bytes %q", w, banned)
+			}
+		}
+	default:
+		t.Fatal("Want a warning for the reject")
+	}
+	if mset.rejectStoreHeaderBlock("ORDERS", hdr, false) == nil {
+		t.Fatal("Want a second reject")
+	}
+	select {
+	case w := <-l.warn:
+		t.Fatalf("Want no second warning for the stream in the interval, got %q", w)
+	default:
+	}
+}

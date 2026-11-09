@@ -1,6 +1,7 @@
 # Request Info header block check
 
-Status: implementation and local verification (AMNET P6 unit U27).
+Status: implementation and local verification (AMNET P6 unit U27; store
+check amendment P6-U32).
 
 ## Defect
 
@@ -58,9 +59,10 @@ the rate-limit key, so distinct subjects add no log lines. The logs of the
 check contain no header bytes. Upstream message-trace setup can log a header
 value (`Nats-Trace-Origin-Account`) before the check.
 
-When the feature is off, nothing changes (upstream behavior). Routes and
-gateways are not checked; each server that accepts CLIENT or LEAF
-connections must enable the feature.
+When the feature is off, nothing changes (upstream behavior). The ingress
+check does not check routes and gateways; each server that accepts CLIENT or
+LEAF connections must enable the feature. The store check (below) covers a
+message for a stream that comes over a route or a gateway.
 
 ## Message-trace setup (amendment, fork review R3)
 
@@ -76,6 +78,53 @@ line, and nats.go reads one value, the server stamp. A block with another
 defect (a bare LF, an inner empty line, a short status) keeps it after the
 change, and the check rejects it.
 
+## Store check (amendment, P6-U32)
+
+Defect: a stored block that is not strict stops a mirror or a source across a
+leaf link into a server with the feature on (stall probe of 2026-11-08). The
+receiver drops each delivery, and the reader creates its consumer again at
+the same stream sequence without end. With only the ingress check, a route or
+a gateway from a server with the feature off, and an internal client, can
+still give a stream such a block.
+
+Policy (owner option 4): when the feature is on, the server that stores a
+message for a stream (the stream leader, or the only server of a stream
+without a Raft group) rejects a header block that is not strict, with
+`requestInfoHeaderBlockValid`, for each client kind and each input path. The
+check runs before the store and before the Raft proposal:
+`checkMsgHeadersPreClusteredProposal` covers a clustered publish and each
+atomic or fast batch message; `processJetStreamMsgWithBatch` covers a stream
+without a Raft group and a trace-only message. It never runs when a follower
+applies an entry, so the replicas do not diverge.
+
+The check skips sourced messages: the mirror and source ingest of the stream
+(a reject there only moves the stop into the ingest), and the messages that
+the store makes (subject delete markers and scheduled messages; a reject can
+stop a schedule). The upstream `sourced` flag marks all of them. The check
+reads the block that the stream gets, after `removeHeaderStatusIfPresent` in
+`processInboundJetStreamMsg` and before the server removes its own
+`Nats-Request-Info`. Thus a short inline status becomes no header block, and
+the N1 frame becomes `NATS/1.0\r\n\r\n\r\n`, which the check rejects.
+
+Result: a publish with a reply gets a `PubAck` with `JSBadRequestErr` (400,
+10003), an existing upstream error, so the upstream error code table does not
+change. A publish without a reply is dropped. Each reject logs the
+rate-limited warning
+`Rejected a message with a malformed header block for stream '<account> > <stream>'`
+(the statement is the key; no subject, no header bytes).
+
+Server writers: `genHeader`, `client.setHeader`, `setHeader`, and the fixed
+blocks are strict. The MQTT request header block was not strict (an empty
+line before its end, so each new session record stored
+`NATS/1.0\r\n\r\n\r\n`). The fork corrects it (FORK-CHANGES section 13);
+without the correction the store check rejects each new MQTT session record.
+A server without the correction can still send such a record over a route,
+so upgrade each MQTT server before a server with the store check can lead
+`$MQTT_sess`. An MQTT retained record copies the CONNECT user name into
+`Nmqtt-RSrc` without a check (upstream); a user name with a CR or an LF makes
+a block that is not strict, and the store check rejects that retained message
+while stamping is on.
+
 ## Limits that stay
 
 - No stamp and no strip on a message without a reply subject or on a
@@ -85,10 +134,14 @@ change, and the check rejects it.
   example a JetStream push delivery, has a reply subject that does not prove
   a server stamp.
 - A stream can hold a block that is not strict. Sources: data stored before
-  the check was on, a message that came over a route or a gateway from a
-  server without the check, and a stream snapshot restore (the restore
-  payload carries the stored messages, so the check does not read them).
-  Server-written header blocks have the strict form. A server with the check
+  the store check was on, a message that a stream leader with the feature off
+  stored, a stream snapshot restore (the restore payload carries the stored
+  messages, so no check reads them), the mirror or source ingest of such a
+  block or a scheduled message made from it, and an MQTT session record from
+  before the MQTT correction. Server-written header blocks have the strict
+  form, except an MQTT retained record with a client user name that has a CR
+  or an LF. With the store check on each stream leader, a route or a gateway no
+  longer adds such a block. A server with the check
   drops the LEAF delivery of such a message. A mirror, a source, or an
   ordered consumer (for example a legacy nats.go KV watch) across a leaf
   link then sees a sequence gap, creates its consumer again at the same
@@ -98,7 +151,8 @@ change, and the check rejects it.
   sequence. Recovery: delete that message at the origin, or purge the stream
   up to the next sequence, or turn the feature off on the receiving server.
   Prevention: run the fixed fork with the feature on all servers before data
-  enters the streams.
+  enters the streams; the store check needs the feature on each server that
+  can lead a stream.
 
 ## Verification
 
@@ -125,3 +179,16 @@ change, and the check rejects it.
   error, and a block that trace setup changes passes with one server stamp.
 - Fork review R2: a unit test of the LEAF warning text (subject and reply,
   no header bytes) and of its rate-limit key.
+- P6-U32 store check: unit tests of the decision (stamping, sourced, and
+  block) and of the warning (error, text, rate-limit key). A two-server
+  cluster with stamping on only at the stream leader: a raw client of the
+  other server publishes loose blocks to R1 and R2 streams (dropped without a
+  reply, `JSBadRequestErr` with a reply, no stored message on any peer), and
+  R1 and R2 mirrors and sources on the leader ingest a loose block. A single
+  server: a direct store call, an internal ACCOUNT client, an atomic batch
+  commit, and a fast batch reject a loose block with stamping on and store
+  it with stamping off; KV, object store, counter, TTL and marker, schedule,
+  atomic and fast batch, republish, mirror, source, and MQTT messages store
+  strict blocks with stamping on; legacy loose blocks (stored with stamping
+  off, then a reload) go into a mirror and a source, and the stream that gets
+  the republish of the mirror rejects them.

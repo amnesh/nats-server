@@ -6666,6 +6666,20 @@ func (mset *stream) processJetStreamMsgWithBatch(subject, reply string, hdr, msg
 		}
 	}
 
+	// Fork: no loose header block while stamping is on (soo-changes.go).
+	// Clustered and batch messages get this check before their proposal.
+	if canConsistencyCheck {
+		if apiErr := mset.rejectStoreHeaderBlock(name, hdr, sourced); apiErr != nil {
+			if canRespond {
+				resp.PubAck = &PubAck{Stream: name}
+				resp.Error = apiErr
+				b, _ := json.Marshal(resp)
+				outq.sendMsg(reply, b)
+			}
+			return apiErr
+		}
+	}
+
 	// If we have received this message across an account we may have request information attached.
 	// For now remove. TODO(dlc) - Should this be opt-in or opt-out?
 	if len(hdr) > 0 {

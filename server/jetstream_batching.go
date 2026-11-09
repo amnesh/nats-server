@@ -557,6 +557,10 @@ func checkMsgHeadersPreClusteredProposal(
 			err := fmt.Errorf("JetStream header size exceeds limits for '%s > %s'", jsa.acc().Name, name)
 			return hdr, msg, 0, NewJSStreamHeaderExceedsMaximumError(), err
 		}
+		// Fork: no loose header block while stamping is on (soo-changes.go).
+		if apiErr := mset.rejectStoreHeaderBlock(name, hdr, sourced); apiErr != nil {
+			return hdr, msg, 0, apiErr, apiErr
+		}
 		// Counter increments.
 		// Only supported on counter streams, and payload must be empty (if not coming from a source).
 		var ok bool

@@ -16,7 +16,7 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | # | Feature | Enable with | New files | Touched upstream files |
 |---|---|---|---|---|
 | 1 | **Authentication Verification Callout** (`authverify`) | `authorization { auth_verification: true }` | `server/authverify/` (pkg), `server/auth_verification.go` | `server/opts.go`, `server/auth.go` |
-| 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go` |
+| 2 | **Request Info Stamping** (userinfo on all requests) | `stamp_request_info: true` (hot-reloadable) | `server/soo-changes.go` | `server/client.go`, `server/leafnode.go`, `server/opts.go`, `server/reload.go`, `server/server.go`, `server/stream.go`, `server/jetstream_batching.go` |
 | 3 | Custom Listeners/Dialers (transport injection) | programmatic (`Options`) | — | listener/dialer plumbing (see commit `6f42d0a4f`) |
 | 4 | **Scoped Resource Permission Groups** (`template.xpermissions`) | add signed groups to a scoped signing key template | `server/auth_xpermissions.go`, `server/auth_xpermissions_compile.go` | `server/accounts.go`, `server/server.go`, `server/auth.go`, `server/auth_callout.go` |
 | 5 | **Leafnode scaling** (isolated hubs with 60k+ leaves) | always on; the isolation fast paths apply with `leafnodes { isolate: true }` or a remote's `request_isolation`. Optional: `leafnodes { sync_consumers_check_interval: "250ms" }` (off by default, hot-reloadable) | `server/leafnode_isolation.go`, `server/leafnode_dupindex.go`, `server/leafnode_synccheck.go` | `server/leafnode.go`, `server/sublist.go`, `server/accounts.go`, `server/client.go`, `server/server.go`, `server/opts.go`, `server/reload.go` |
@@ -407,10 +407,11 @@ Result of a failed check:
 The logs of the check contain no header bytes: the CLIENT error and the LEAF
 warning name only the subject (and, for LEAF, the reply). Upstream code can
 log a header value before the check: message-trace setup logs the value of
-`Nats-Trace-Origin-Account`. Routes and gateways are not checked: each server
-that accepts CLIENT or LEAF connections must enable the feature. When the
-feature is disabled, the server does not check header blocks (upstream
-behavior).
+`Nats-Trace-Origin-Account`. This ingress check does not check routes and
+gateways: each server that accepts CLIENT or LEAF connections must enable the
+feature. The store check (below) also covers a message for a stream that comes
+over a route or a gateway. When the feature is disabled, the server does not
+check header blocks (upstream behavior).
 
 The check reads the header block that the parser gives to
 `processInboundClientMsg` and `processInboundLeafMsg`. Message-trace setup
@@ -427,13 +428,96 @@ reads one value, the server stamp. A subject mapping also runs before the
 check. A CLIENT close does not stop the parse of the same read buffer; a
 later message in that buffer also gets the check and the stamp.
 
-Header blocks that the server writes (status, flow control, heartbeat, and
-stream headers) have the strict form. A stream can still hold a block that
-is not strict. Such a block can come from data that a stream stored before
-the check was on, from a message that came over a route or a gateway from a
-server without the check, or from a stream snapshot restore
-(`$JS.API.STREAM.RESTORE` carries the stored messages in its payload, so the
-check does not read their header blocks). A server with the check drops the
+### Store check
+
+When the feature is enabled, the server that stores a message for a stream
+also checks its header block, with the same rules
+(`requestInfoHeaderBlockValid`). This server is the stream leader, or the only
+server of a stream without a Raft group (a single server, or an R1 stream in a
+cluster). The check applies to each message that is not sourced, from each
+client kind: a CLIENT or LEAF publish, a message over a route or a gateway
+from a server with the feature off or without the check, and a message from
+an internal client (for example a republish, kind JETSTREAM, or an internal
+account publish, kind ACCOUNT).
+
+The check runs before the stream stores the message or proposes it:
+
+- `checkMsgHeadersPreClusteredProposal` (`server/jetstream_batching.go`): a
+  clustered publish before its Raft proposal, and each message of an atomic
+  batch or a fast batch, for each replica count. An atomic batch commit checks
+  each staged message, so the stream stores no message of the batch.
+- `processJetStreamMsgWithBatch` (`server/stream.go`), where the stream does
+  its other consistency checks: a stream without a Raft group, and a
+  trace-only message. The check does not run when a follower applies a Raft
+  entry.
+
+The check reads the block that the stream gets, before the server removes its
+own `Nats-Request-Info` copy. Before the check, `processInboundJetStreamMsg`
+removes an inline status (`removeHeaderStatusIfPresent`). Thus the block
+`NATS/1.0 5\r\n\r\n` becomes no header block and is stored without one, and
+the N1 frame becomes `NATS/1.0\r\n\r\n\r\n`, which the check rejects.
+
+These messages are not checked (`sourced`): the mirror and source ingest of the
+stream, and the messages that the store makes (subject delete markers and
+scheduled messages). A reject of mirror or source ingest only moves the stop
+from the leaf link to the ingest of the stream, and a reject of a scheduled
+message can stop its schedule. The restart recovery of a partial atomic batch
+write also stores without the check: the staged messages carry the batch
+headers, and they got the check at their commit.
+
+Result of a failed check:
+
+- A publish with a reply subject (on a stream without `NoAck`) gets a
+  `PubAck` with the error `JSBadRequestErr`: code 400, error code 10003,
+  description `bad request`. This is an upstream error. The fork adds no error
+  code, so the upstream error code table does not change. A fast batch gets
+  the error as the `PubAck` of its first message or in a `BatchFlowErr` flow
+  message.
+- A publish without a reply subject is dropped.
+- For each reject, the server logs a rate-limited warning:
+  `Rejected a message with a malformed header block for stream '<account> > <stream>'`.
+  The statement is the rate-limit key, so the server writes one line for
+  each stream in each interval (1 s by default). The warning contains no
+  subject and no header bytes.
+- The message trace event of a traced message gets the error.
+
+Header blocks that the server writes pass the check. `genHeader` and
+`http.Header.Write` end each line with CRLF and replace a CR or an LF in a
+value with a space. `setHeader` and `client.setHeader` keep a strict block
+strict with each value that the server sets. The fixed blocks (status, flow
+control, heartbeat, subject delete marker, direct get, republish, and stream
+headers) are strict. One upstream builder was not strict: the MQTT request
+header block (section 13). The store check needs that correction. Without
+it, the check rejects each new MQTT session record, and an MQTT client with a
+session cannot connect.
+
+One server writer copies a client value into a header line without a check:
+an MQTT retained record writes the CONNECT user name in `Nmqtt-RSrc`
+(upstream). MQTT accepts a user name with a CR or an LF. Such a user name makes
+a block that is not strict, so the store check rejects that retained message
+while stamping is on, and MQTT logs that it cannot store the retained
+message. A user name with a CRLF pair adds a strict header line to the record.
+This is an upstream defect, and the fork does not correct it.
+
+When the feature is disabled, the store check does nothing (upstream
+behavior).
+
+### Blocks that a stream can still hold
+
+A stream can still hold a block that is not strict. Such a block can come
+from:
+
+- data that a stream stored before the store check was on;
+- a message that a stream leader with the feature off stored;
+- a stream snapshot restore (`$JS.API.STREAM.RESTORE` carries the stored
+  messages in its payload, so no check reads their header blocks);
+- the mirror or source ingest of such a block, and a scheduled message that
+  the store makes from such a block;
+- an MQTT session record that a server stored before the correction of
+  section 13.
+
+When each stream leader runs the store check with the feature on, a route or a
+gateway can no longer add such a block. A server with the check drops the
 LEAF delivery of such a message. For a mirror, a source, or an ordered
 consumer (for example a legacy nats.go KV watch) across a leaf link, the
 drop causes a sequence gap. The reader then creates its consumer again at
@@ -449,8 +533,10 @@ arrive.
   the next sequence. Another option is to turn the feature off on the
   receiving server.
 - Prevent: run the fixed fork with the feature on all servers before data
-  enters the streams. Before you turn the check on, examine the streams that
-  cross a leaf link.
+  enters the streams. The store check needs the feature on each server that
+  can lead a stream. For MQTT, see the upgrade order in section 13. Before
+  you turn the check on, examine the streams that cross a leaf link, also the
+  mirrors and sources of such streams.
 
 ## 2.5 What gets stamped
 
@@ -584,6 +670,8 @@ Trust the header only under these conditions:
   `getClientInfoForRequest`, `skipRequestInfoStamp` + the skip-prefix list.
   `requestInfoHeaderBlockValid`, `malformedRequestInfoHeader`, and
   `rejectMalformedRequestInfoHeader` are the header block check (section 2.4).
+  `storeRejectsHeaderBlock` (the decision) and `rejectStoreHeaderBlock` (the
+  warning and the `PubAck` error) are the store check.
   `getConnectRawAuthUser` and `getConnectAuthUser` serve the auth callout
   request, auth error events, and the authentication error log; they keep the
   upstream name order only while `calloutDecidesIdentity` is true.
@@ -594,6 +682,11 @@ Trust the header only under these conditions:
   `getAuthUser` and `getAuthUserLabel` do the same for log labels.
 - `server/leafnode.go` — leaf inbound call sites (the header block check first,
   then the stamp).
+- `server/jetstream_batching.go` — the store check call in
+  `checkMsgHeadersPreClusteredProposal` (clustered publish, atomic and fast
+  batches).
+- `server/stream.go` — the store check call in `processJetStreamMsgWithBatch`
+  (a stream without a Raft group, and a trace-only message).
 - `server/server.go` — the `Server.stampReqInfo` atomic mirror, set at startup and
   on reload.
 - `server/opts.go` — `Options.StampRequestInfo` + the `stamp_request_info` key.
@@ -633,6 +726,27 @@ Trust the header only under these conditions:
   subject prefix, with and without a reply subject.
   `TestStampRequestInfoLeafDropWarningNamesSubject` checks the LEAF warning
   text and its rate-limit key.
+- Store check tests: `TestRequestInfoStoreHeaderBlockDecision` (the decision
+  for each combination of stamping, sourced, and block) and
+  `TestRequestInfoStoreHeaderBlockWarning` (the error, the warning text, and
+  its rate-limit key) in `server/soo_header_block_test.go`.
+  `server/jetstream_soo_store_header_test.go`:
+  `TestJetStreamStampRequestInfoStoreRejectsLooseHeaderBlock` (a direct store
+  call, an internal ACCOUNT client with and without a reply, an atomic batch
+  commit, and a fast batch, with stamping on and off),
+  `TestJetStreamStampRequestInfoStoreKeepsServerHeaderBlocks` (KV and object
+  store operations, counters, TTL and subject delete markers, schedules,
+  atomic and fast batches, republish, mirror, and source store strict blocks
+  with stamping on), and
+  `TestJetStreamStampRequestInfoStoreSkipsMirrorAndSourceIngest` (loose blocks
+  stored with stamping off, then a reload to stamping on: a mirror and a
+  source store them, and the stream that gets the republish of the mirror
+  rejects them). `server/jetstream_cluster_soo_store_header_test.go`:
+  `TestJetStreamClusterStampRequestInfoStoreHeaderBlock` (a two-server
+  cluster: a client of the server with stamping off publishes to R1 and R2
+  streams with their leader on the server with stamping on, and R1 and R2
+  mirrors and sources on that server ingest a loose block). The MQTT test is
+  in section 13.
 
 ---
 
@@ -1661,6 +1775,17 @@ not strict (section 2.4). Thus, without the correction, the hub drops each
 MQTT JetStream request without its own header block that an MQTT server
 behind a leaf link sends to the JetStream domain of the hub (static reading,
 not tested). The correction removes this drop when the leaf server runs it.
+
+The store check of section 2.4 needs this correction: without it, the check
+rejects each new session record while stamping is on.
+
+Upgrade order: a server without the correction writes the first session
+record of a new MQTT client ID with the old block. When the leader of
+`$MQTT_sess` has the store check and stamping on, it rejects that record, and
+the MQTT CONNECT on the old server fails. Existing sessions still save,
+because their records have a strict `Nats-Expected-Last-Subject-Sequence`
+block. Upgrade each server that serves MQTT before a server with the store
+check and stamping on can lead `$MQTT_sess`.
 
 ```sh
 go test -race ./server -run 'TestMQTTStampRequestInfoStoreHeaderBlocks' -count=1

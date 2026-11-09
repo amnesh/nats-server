@@ -142,6 +142,59 @@ func (c *client) rejectMalformedRequestInfoHeader(msg []byte) bool {
 	return true
 }
 
+// storeRejectsHeaderBlock is the decision of the store check. A stream must
+// not store a message when the server that stores it has stamping on, the
+// message is not sourced, and its header block is not in the strict wire form
+// (requestInfoHeaderBlockValid).
+//
+// The ingress check above covers only CLIENT and LEAF messages on a server
+// with stamping on. A message can also come to the stream over a route or a
+// gateway from a server with stamping off, or from an internal client (for
+// example a republish). A stored block that is not strict stops a mirror, a
+// source, or an ordered consumer across a leaf link into a server with
+// stamping on: that server drops each delivery, and the reader creates its
+// consumer again at the same stream sequence without end. The store check
+// stops such a block before the stream stores it.
+//
+// sourced is true for the stream's own mirror and source ingest, and for the
+// messages that the store makes (subject delete markers and scheduled
+// messages). These are not checked. A reject of mirror or source ingest only
+// moves the stop from the leaf link to the ingest of the stream, and a reject
+// of a scheduled message can stop its schedule.
+func storeRejectsHeaderBlock(s *Server, hdr []byte, sourced bool) bool {
+	if sourced || len(hdr) == 0 || s == nil || !s.stampReqInfo.Load() {
+		return false
+	}
+	return !requestInfoHeaderBlockValid(hdr)
+}
+
+// rejectStoreHeaderBlock applies the store check to a message for stream name
+// before the stream stores it or proposes it. On a reject it logs a
+// rate-limited warning that names the account and the stream, and returns the
+// error for the PubAck: JSBadRequestErr (code 400, error code 10003, "bad
+// request"). Otherwise it returns nil. The statement of the warning is the
+// rate-limit key, so the server writes one line for each stream in each
+// interval. The warning contains no subject and no header bytes.
+//
+// The callers are checkMsgHeadersPreClusteredProposal (a clustered publish
+// before its proposal, and each atomic or fast batch message) and
+// processJetStreamMsgWithBatch (a stream without a Raft node, and a
+// trace-only message). The callers can hold the stream lock. Thus this
+// function takes no stream lock and reads only mset.srv and mset.acc, which do
+// not change after the stream is created.
+func (mset *stream) rejectStoreHeaderBlock(name string, hdr []byte, sourced bool) *ApiError {
+	s := mset.srv
+	if !storeRejectsHeaderBlock(s, hdr, sourced) {
+		return nil
+	}
+	var accName string
+	if mset.acc != nil {
+		accName = mset.acc.Name
+	}
+	s.RateLimitWarnf("Rejected a message with a malformed header block for stream '%s > %s'", accName, name)
+	return NewJSBadRequestError()
+}
+
 func (c *client) stampRequestInfoHeaderIfNeeded(msg []byte) []byte {
 	// Hot path: when disabled (the default), pay only one atomic load. The
 	// mirror is kept in sync with opts.StampRequestInfo by setOpts (which runs
