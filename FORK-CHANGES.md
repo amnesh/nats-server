@@ -1793,14 +1793,18 @@ JWT, so it does not come back.
   remote. The test-only `LeafNode.connDelay` option replaces the delay.
 - A peer that does not know the code still sees an authorization violation.
   A server without the code treats value 5 from the static callout as
-  `CodeDenied`. A client or a leaf server without the text reads it as
-  `Authorization Violation`; such a leaf retries at each reconnect interval,
-  as for `CodeDenied`.
+  `CodeDenied`, because it maps each unknown code to `CodeDenied` (static
+  reading of the older code; the rows for code 99 test this rule on this
+  server). A client without the text reads it as `Authorization Violation`.
+  A leaf server without the text retries at each reconnect interval, as for
+  `CodeDenied` (static reading, not tested).
 
 Tests: rows in `TestAuthGrantRejectWire`, `TestAuthGrantDisconnectWire`, and
 `TestAuthVerifyCalloutRejectCodes` check the wire text and the close state.
 `TestAuthGrantClientAccountDisabledCodeStops` checks that a nats.go client
-gets `ErrAuthorization` and stops, at CONNECT and after a planned close.
+gets `ErrAuthorization` and stops, at CONNECT and after a planned close. It
+passes with nats.go v1.53.1 (`go.mod`) and, in one run with a copied module
+file, with v1.54.0.
 `TestAuthGrantLeafAccountDisabledWaitsAndReconnects` lowers the delay to
 500 ms. At CONNECT and after a planned close, each next attempt of the leaf
 comes at least 500 ms after the previous one, and the leaf connects again with
@@ -2057,7 +2061,13 @@ VerificationPending bool `json:"verification_pending,omitempty"`
   until it closes and leaves the open list.
 - Client and leaf connections get it. An accepted leaf is only in the
   account list (`Connz` with `acc`) during the wait. It enters the server
-  list when its CONNECT completes.
+  list when its CONNECT completes (static reading; the test reads the
+  account list).
+- A host counts a connection as admitted only when the connection has its
+  account and its user and no marker. A client before its CONNECT is in the
+  server list with no account and no marker. The marker is set just before
+  the server registers the user and the account, and a rejected connection
+  keeps it until it closes, so the marker covers more than the wait itself.
 - Only the open list has it. A closed connection record has no marker.
 - With `omitempty`, the output of an admitted connection does not change.
   The HTTP monitor output and the system request reply use the same
