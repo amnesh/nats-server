@@ -721,6 +721,7 @@ type sourceInfo struct {
 	lreq  time.Time           // The last time setupMirrorConsumer/setupSourceConsumer was called.
 	qch   chan struct{}       // Quit channel.
 	sip   bool                // Setup in progress.
+	wake  chan struct{}       // Fork: closed by a leaf link event to end the wait of the setup in progress.
 	rc    bool                // Recreate based on a stream identity mismatch.
 	wg    sync.WaitGroup      // WaitGroup for the consumer's go routine.
 	sf    string              // The subject filter.
@@ -3365,6 +3366,15 @@ func (mset *stream) retryDisconnectedSyncConsumers() {
 		return time.Since(time.Unix(0, si.last.Load())) > sourceHealthCheckInterval
 	}
 	shouldRetry := func(si *sourceInfo) bool {
+		// Fork: the request in progress can have gone out before this leaf
+		// link was up, and then no reply comes. Wake its wait. The setup then
+		// sends a new request with no failure count and no backoff.
+		if si != nil && si.sip && si.wake != nil {
+			close(si.wake)
+			si.wake = nil
+			si.fails = 0
+			return false
+		}
 		if si != nil && !si.sip && (si.sub == nil || clientClosed(si.sub.client) || stale(si)) {
 			// Skip if a recreate is already scheduled and we can't cancel it.
 			if t, ok := mset.sourceSetupSchedules[si.iname]; ok {
@@ -3960,6 +3970,8 @@ func (mset *stream) setupMirrorConsumer() error {
 	mirror.msgs = nil
 	mirror.err = nil
 	mirror.sip = true
+	wake, sent := make(chan struct{}), mirror.lreq
+	mirror.wake = wake
 
 	if durableDeliverSubject != _EMPTY_ {
 		// Send the consumer reset request
@@ -3984,15 +3996,20 @@ func (mset *stream) setupMirrorConsumer() error {
 
 		var retry bool
 		var timedOut bool
+		var woken bool
+		var wakeEnd <-chan time.Time
 		defer func() {
 			mset.mu.Lock()
 			// Check that this is still valid and if so, clear the "setup in progress" flag.
 			if mset.mirror != nil {
 				mset.mirror.sip = false
+				mset.mirror.wake = nil
 				// If we need to retry, schedule now
 				// If sub is not nil means we re-established somewhere else so do not re-attempt here.
 				if retry && mset.mirror.sub == nil {
-					mset.mirror.fails++
+					if !woken {
+						mset.mirror.fails++
+					}
 					// Cancel here since we can not do anything with this consumer at this point.
 					mset.cancelSourceInfo(mset.mirror)
 					mset.scheduleSetupMirrorConsumerRetry()
@@ -4173,6 +4190,16 @@ func (mset *stream) setupMirrorConsumer() error {
 			}
 			mset.mu.Unlock()
 			ready.Wait()
+		case <-wake:
+			// Fork: a leaf link came up. Wait for a reply only until the
+			// request throttle lets a new request go. Thus each request gets
+			// that time for its reply, also during a burst of leaf events.
+			wake = nil
+			wakeEnd = time.After(time.Until(sent.Add(sourceConsumerRetryThreshold)))
+			goto SELECT
+		case <-wakeEnd:
+			mset.unsubscribe(crSub)
+			retry, woken = true, true
 		case <-time.After(timeout):
 			mset.unsubscribe(crSub)
 			// We already waited long enough, let's retry now.
@@ -4477,6 +4504,8 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 	si.msgs = nil
 	si.err = nil
 	si.sip = true
+	wake, sent := make(chan struct{}), si.lreq
+	si.wake = wake
 
 	// Three API levels can be tried:
 	// - API level 5: stream recreation detection.
@@ -4507,15 +4536,18 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 		var retry bool
 		var recreate bool
 		var timedOut bool
+		var woken bool
+		var wakeEnd <-chan time.Time
 		defer func() {
 			mset.mu.Lock()
 			// Check that this is still valid and if so, clear the "setup in progress" flag.
 			if si := mset.sources[iname]; si != nil {
 				si.sip = false
+				si.wake = nil
 				// If we need to retry, schedule now
 				// If sub is not nil means we re-established somewhere else so do not re-attempt here.
 				if retry && si.sub == nil {
-					if !recreate {
+					if !recreate && !woken {
 						si.fails++
 					}
 					// Cancel here since we can not do anything with this consumer at this point.
@@ -4702,6 +4734,16 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 				si.sub = sub
 			}
 			mset.mu.Unlock()
+		case <-wake:
+			// Fork: a leaf link came up. Wait for a reply only until the
+			// request throttle lets a new request go. Thus each request gets
+			// that time for its reply, also during a burst of leaf events.
+			wake = nil
+			wakeEnd = time.After(time.Until(sent.Add(sourceConsumerRetryThreshold)))
+			goto SELECT
+		case <-wakeEnd:
+			mset.unsubscribe(crSub)
+			retry, woken = true, true
 		case <-time.After(timeout):
 			mset.unsubscribe(crSub)
 			// We already waited long enough, let's retry now.

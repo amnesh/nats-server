@@ -28,8 +28,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
 | 12 | Grant reject codes, and no leaf CONNECT with a revoked JWT | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf check is always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
 | 13 | MQTT request header block (upstream defect correction) | always on | `server/mqtt_soo_store_header_test.go` | `server/mqtt.go` |
+| 14 | Source and mirror request after a leaf link connects (upstream defect correction) | always on | `server/jetstream_leafnode_late_link_test.go` | `server/stream.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11 and 13 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check.
 
 ---
 
@@ -877,6 +878,7 @@ Upstream calls `checkInternalSyncConsumers` on the readloop of every leafnode
 connect (hub side) and of every INFO that a solicited leafnode receives. It
 locks every stream of the account that has a mirror or sources, and for each
 disconnected or stale source it cancels the backoff and schedules a new setup.
+For a source with a request in progress, it wakes the wait (section 14).
 A connect therefore costs O(sourcing streams + their sources). With one hub
 stream that sources from every leaf, a start of N leaves costs O(N²) and holds
 that stream's lock on the readloops.
@@ -1370,11 +1372,11 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
   with a `SignatureCB`. Feature 7 is an API that does nothing until it is
-  called. Three changes are always on: the verified JWT identity rule of
+  called. These changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
   or `user`; it changes reported identity and log labels), the upstream
-  defect correction of section 11, and the leaf revoked-credential check of
-  section 12.1. Otherwise an
+  defect corrections of sections 11, 13, and 14, and the leaf
+  revoked-credential check of section 12.1. Otherwise an
   unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
@@ -1384,8 +1386,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4, 5, 6, 7 and 8, and sections 11 and 12
-  go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  # Features 1, 2, 4, 5, 6, 7 and 8, and sections 11, 12 and 14
+  go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamLeafNodeLateLink|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 
@@ -1826,3 +1828,103 @@ go test -race ./server -run 'TestMQTTStampRequestInfoStoreHeaderBlocks' -count=1
 The test runs MQTT QoS 1 and QoS 2 publishes, retained messages and a
 retained delete, and a session with stamping on. It checks that each stored
 header block in the MQTT streams is strict.
+
+
+# 14. Source and mirror request after a leaf link connects
+
+This section corrects an upstream defect. Upstream `v2.15.2` contains it. On
+2026-11-20, upstream `release/v2.15.3` (`ab05672b`, `v2.15.3-RC.1`) and
+`main` (`d163ae74`) still contained it.
+
+A stream source or a mirror sends one consumer create request (a reset
+request for a durable consumer) and waits for the reply: 30 s
+(`srcConsumerWaitTime`), or 5 s for a reset. When no leaf link to the
+origin exists, no reply comes. After the wait, the source counts one
+failure and waits for the backoff of `calculateRetryBackoff` (10 s for
+each failure, at most 2 minutes). A leaf connect or a leaf INFO runs
+`retryDisconnectedSyncConsumers` (section 5.3). That function skipped a
+source with a request in progress (`sip`), so a link that came up during
+the wait did not help. On `v2.15.3-amnesh.6`, a link that came up just
+after the request gave the data 40 s after the link (the 30 s wait and the
+10 s backoff). A replication probe measured 35 s for a link that came up
+5 s after the request. A server that restarts with a stored mirror or
+source and no link sends the request during its start, so it has the same
+delay.
+
+Now `retryDisconnectedSyncConsumers` wakes the wait of a request in
+progress and sets the failure count to 0. The wait then continues only
+until the request throttle (`sourceConsumerRetryThreshold`, 2 s after the
+request) lets a new request go. A reply that arrives before that is used.
+When the wait ends with no reply, the setup removes the reply subscription
+of the old request, counts no failure, and schedules a new request with no
+backoff (only the 100 to 200 ms jitter). The new request has a new reply
+subject, so a late reply to the old request has no subscriber and does not
+change the source. The consumer that the old request made on the origin
+gets no subscriber, and the origin deletes it after its inactive threshold
+(10 s), as after an upstream timeout. One run measured the delete 10 s
+after the late reply (a test like the late reply test below, not
+committed).
+
+From link up to the data, the tests measure about 2.1 s when the link
+comes up just after the request, and 0.15 to 0.2 s when it comes up more
+than 2 s after the request. Sources and mirrors, a first request and a
+retry, and a mirror or source that a restart restores use the same path.
+
+What does not change:
+
+- With no leaf link event, the wait, the failure count, and the backoff
+  are as upstream.
+- A reply with an error after a wake counts a failure, as upstream.
+- The 2 s throttle stays. A leaf event does not send requests more often
+  than one for each 2 s for each source, and each request can get its
+  reply for 2 s. Thus a burst of leaf connects cannot end each request
+  before its reply.
+- The check runs only on the server that gets the leaf connect or INFO,
+  and only the stream leader acts. In a cluster, a stream leader on
+  another server still waits (an upstream limit, also for sources without
+  a request in progress).
+
+Cost:
+
+- Each leaf connect or INFO in the account wakes each request in progress
+  of each source and mirror in the account. A request is woken at most one
+  time.
+- While leaf events continue, a source or mirror whose origin cannot be
+  reached sends a request about every 2 s, not one for each 30 s wait and
+  backoff. Nothing receives such a request. On a hub with one stream that
+  sources from many leaves (section 5), a connect burst thus gives up to
+  one request each 2 s for each source, also for the leaves that are not
+  connected yet.
+- After a wake, the new request waits for its jitter timer. Each later
+  leaf event stops this timer and starts it again, as upstream does for a
+  scheduled setup. Without the coalesced check of section 5.3, a burst
+  with less than 100 ms between leaf events can delay the new request
+  until the burst ends.
+- When the origin is reachable but needs more than 2 s for the reply, a
+  leaf event can cause one more consumer create request. On an origin
+  stream with limits retention and no cluster, each request makes a new
+  direct consumer.
+
+Code and tests:
+
+- `server/stream.go`: the field `sourceInfo.wake`; the wake in
+  `shouldRetry` of `retryDisconnectedSyncConsumers`; the wait in
+  `setupMirrorConsumer` and `trySetupSourceConsumer`.
+- `server/jetstream_leafnode_late_link_test.go`, with a hub and a leaf
+  that turns its remote on and off with a config reload:
+  `TestJetStreamLeafNodeLateLinkEndsRequestWait` (a source and a mirror;
+  the link comes up just after the first request, or 2.5 s after it),
+  `TestJetStreamLeafNodeLateLinkAfterOutage` (an outage longer than the
+  first backoff, with a failure count of 1 and a retry in progress at link
+  up; the request wait is 3 s in the test),
+  `TestJetStreamLeafNodeLateLinkAfterRestart` (a leaf server restarts with
+  a stored mirror or source and its link off; the link comes up at least
+  3 s after the restored request), and `TestJetStreamLeafNodeLateLinkLateReply` (a
+  late reply to the first request reaches the hub; the source keeps its
+  consumer, and on the origin only that consumer has interest). Each test
+  expects the data within 5 s after link up. Without the correction, each
+  test fails at that check.
+
+```sh
+go test -race ./server -run 'TestJetStreamLeafNodeLateLink' -count=1
+```
