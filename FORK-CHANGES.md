@@ -1878,8 +1878,8 @@ What does not change:
 - A reply with an error after a wake counts a failure, as upstream.
 - The 2 s throttle stays. A leaf event does not send requests more often
   than one for each 2 s for each source, and each request can get its
-  reply for 2 s. Thus a burst of leaf connects cannot end each request
-  before its reply.
+  reply for 2 s. Thus a burst of leaf connects does not end a request
+  that an origin answers within 2 s.
 - The check runs only on the server that gets the leaf connect or INFO,
   and only the stream leader acts. In a cluster, a stream leader on
   another server still waits (an upstream limit, also for sources without
@@ -1901,10 +1901,17 @@ Cost:
   scheduled setup. Without the coalesced check of section 5.3, a burst
   with less than 100 ms between leaf events can delay the new request
   until the burst ends.
-- When the origin is reachable but needs more than 2 s for the reply, a
-  leaf event can cause one more consumer create request. On an origin
-  stream with limits retention and no cluster, each request makes a new
-  direct consumer.
+- When the origin is reachable but needs more than 2 s for the reply,
+  each leaf event during a request ends that request at 2 s. If leaf
+  events in the account come during each request, the source gets no
+  consumer until the events stop. Before the change, each request had
+  30 s. This is the main trade-off of the 2 s end.
+- Each request that the origin gets makes a consumer there. On an origin
+  stream with limits retention and no cluster, it is a new direct
+  consumer for each request. A consumer of an ended request has no
+  subscriber, and the origin deletes it after 10 s. Thus a slow origin
+  under leaf event churn can hold up to about five such consumers for
+  each source.
 
 Code and tests:
 
