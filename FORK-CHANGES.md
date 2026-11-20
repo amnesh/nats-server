@@ -29,8 +29,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 12 | Grant reject codes, and no leaf CONNECT with a revoked JWT | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf check is always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
 | 13 | MQTT request header block (upstream defect correction) | always on | `server/mqtt_soo_store_header_test.go` | `server/mqtt.go` |
 | 14 | Source and mirror request after a leaf link connects (upstream defect correction) | always on | `server/jetstream_leafnode_late_link_test.go` | `server/stream.go` |
+| 15 | `Server.RefreshClientTraceLevel` (trace flag of open connections) | programmatic | `server/client_trace_refresh.go` | `server/reload.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check. Section 15 documents an API for a host that changes the logger at run time.
 
 ---
 
@@ -1371,8 +1372,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   active only for account JWTs carrying `template.xpermissions`. Feature 5 is
   always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
-  with a `SignatureCB`. Feature 7 is an API that does nothing until it is
-  called. These changes are always on: the verified JWT identity rule of
+  with a `SignatureCB`. Features 7 and 15 are APIs that do nothing until
+  they are called. These changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
   or `user`; it changes reported identity and log labels), the upstream
   defect corrections of sections 11, 13, and 14, and the leaf
@@ -1386,8 +1387,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   forward and re-run the feature tests:
 
   ```sh
-  # Features 1, 2, 4, 5, 6, 7 and 8, and sections 11, 12 and 14
-  go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamLeafNodeLateLink|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
+  # Features 1, 2, 4, 5, 6, 7 and 8, and sections 11, 12, 14 and 15
+  go test -race -run 'AuthGrant|AuthVerify|LeafRemoteRevoked|RequestInfo|ClientInfoForRequest|SharesRequestUserInfo|AuthCalloutSentinelKeepsConnectUser|AuthHookRejectionNamesVerifiedSubject|AuthUserLogLabels|XPermissions|LeafNodeIsolated|LeafNodeSharedLeaf|LeafNodeNonLeafSubs|LeafNodeRequestedIsolation|LeafNodeDuplicateIndex|LeafNodeSyncCheck|LeafNodeSignatureCBReload|LeafNodeTsub|JetStreamLeafNodeLateLink|RefreshClientTraceLevel|JetStreamAccountSetJetStreamLimits|JetStreamSubjectRollupOnly' \
       ./server ./server/authverify ./test -count=1
   ```
 
@@ -1927,4 +1928,48 @@ Code and tests:
 
 ```sh
 go test -race ./server -run 'TestJetStreamLeafNodeLateLink' -count=1
+```
+
+
+# 15. `Server.RefreshClientTraceLevel`
+
+An open connection keeps the trace flag that it read when it connected
+(`client.trace`, set by `setTraceLevel`). The parser reads this flag. Only a
+config reload sets it again (`reloadClientTraceLevel`), and that function
+returns at once when `Options.NoLog` is set. A host that embeds the server
+sets `NoLog` and gives its logger with `SetLoggerV2`. When this host turns
+trace on, the connections that are already open do not trace. When it
+turns trace off, they stop the trace lines, because `client.Tracef` checks
+the server flag, but the parser still does the trace work.
+
+```go
+// RefreshClientTraceLevel makes each open connection use the present trace
+// setting of the server.
+func (s *Server) RefreshClientTraceLevel()
+```
+
+- Call it after `SetLogger` or `SetLoggerV2`. It also applies when `NoLog`
+  is set.
+- It sets the same connections as a config reload: the system client (from
+  the `sysTrace` flag), the clients (also MQTT and WebSocket),
+  `grTmpClients`, the leaf nodes, the routes, and the gateways. Internal
+  clients of JetStream and of accounts keep their flag, as after a reload.
+- A connection that is between `initClient` and its entry in the server
+  maps when the flag changes can keep the old flag, as after a reload.
+- It locks the server and each connection. Do not call it from a logger
+  method or from another server callback.
+
+Code and tests:
+
+- `server/client_trace_refresh.go`: `Server.RefreshClientTraceLevel`.
+  `server/reload.go`: the body of `reloadClientTraceLevel` after its
+  `NoLog` check is now `setClientsTraceLevel`, which both use.
+- `server/client_trace_refresh_test.go`: `TestRefreshClientTraceLevel`
+  runs a server with `NoLog` and a logger from `SetLoggerV2`. With trace on
+  and no refresh, the open connection gives no trace line. After the
+  refresh, it gives one. After trace off and the refresh, it gives none,
+  and its cached flag is off.
+
+```sh
+go test -race ./server -run 'TestRefreshClientTraceLevel' -count=1
 ```

@@ -2207,7 +2207,13 @@ func (s *Server) reloadClientTraceLevel() {
 	if opts.NoLog {
 		return
 	}
+	s.setClientsTraceLevel()
+}
 
+// setClientsTraceLevel sets the cached trace flag of every client from the
+// server flags. Fork: split from reloadClientTraceLevel for
+// RefreshClientTraceLevel, which also applies with NoLog.
+func (s *Server) setClientsTraceLevel() {
 	// Create a list of all clients.
 	// Update their trace level when not holding server or gateway lock
 
