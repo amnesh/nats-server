@@ -217,6 +217,7 @@ func (s *Server) authGrantConnection(c *client, juc *jwt.UserClaims, acc *Accoun
 		c.closeConnection(GrantRejected)
 		return false
 	}
+	c.clearVerificationPending()
 	return true
 }
 

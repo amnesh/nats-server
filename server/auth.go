@@ -1186,6 +1186,7 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) (au
 		}
 
 		nkey = buildInternalNkeyUser(juc, allowedConnTypes, acc)
+		s.markVerificationPending(c, juc, acc, opts, grantMode)
 		if err = c.registerJWTUser(nkey, grantMode, accountMode); err != nil {
 			return false
 		}

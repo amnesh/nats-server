@@ -30,8 +30,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 13 | MQTT request header block (upstream defect correction) | always on | `server/mqtt_soo_store_header_test.go` | `server/mqtt.go` |
 | 14 | Source and mirror request after a leaf link connects (upstream defect correction) | always on | `server/jetstream_leafnode_late_link_test.go` | `server/stream.go` |
 | 15 | `Server.RefreshClientTraceLevel` (trace flag of open connections) | programmatic | `server/client_trace_refresh.go` | `server/reload.go` |
+| 16 | `Connz` marker for a connection that waits for its verification verdict | with auth verification (feature 1) or grant mode (feature 8) | `server/auth_verification_pending.go` | `server/auth.go`, `server/auth_verification.go`, `server/auth_grant.go`, `server/client.go`, `server/monitor.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf checks for a revoked JWT and a disabled account. Section 15 documents an API for a host that changes the logger at run time.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf checks for a revoked JWT and a disabled account. Section 15 documents an API for a host that changes the logger at run time. Section 16 documents the `Connz` marker of a connection that waits for its verification verdict.
 
 ---
 
@@ -1373,7 +1374,8 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   always on and sends the same interest as upstream. Its coalesced source/mirror check is off unless
   `sync_consumers_check_interval` is set. Feature 6 applies only to remotes
   with a `SignatureCB`. Features 7 and 15 are APIs that do nothing until
-  they are called. These changes are always on: the verified JWT identity rule of
+  they are called. The marker of feature 16 shows only for a connection
+  with auth verification or grant mode. These changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
   or `user`; it changes reported identity and log labels), the upstream
   defect corrections of sections 11, 13, and 14, the leaf
@@ -2027,4 +2029,59 @@ Code and tests:
 
 ```sh
 go test -race ./server -run 'TestRefreshClientTraceLevel' -count=1
+```
+
+
+# 16. `Connz` marker for a connection that waits for its verdict
+
+On the JWT path, the server registers the user and the account of a
+connection before the verdict of auth verification (section 1) or of the
+grant hook (section 8) arrives. `Connz` lists such a connection with its
+account and its authorized user, also through
+`$SYS.REQ.SERVER.<id>.CONNZ`. Before this change, no field separated it from
+an admitted connection. A host that counts connections from `Connz` thus
+counted a connection that the server could still reject.
+
+`ConnInfo` gets one field:
+
+```go
+// Fork: the connection waits for the verdict of auth verification or of
+// the grant hook. It is not admitted yet, and the server can reject it.
+VerificationPending bool `json:"verification_pending,omitempty"`
+```
+
+- The server sets the marker before it registers the user and the account
+  of a JWT connection that gets a verdict: a grant-mode connection, or a
+  connection in the scope of auth verification. It removes the marker when
+  the verdict admits the connection. A rejected connection keeps the marker
+  until it closes and leaves the open list.
+- Client and leaf connections get it. An accepted leaf is only in the
+  account list (`Connz` with `acc`) during the wait. It enters the server
+  list when its CONNECT completes.
+- Only the open list has it. A closed connection record has no marker.
+- With `omitempty`, the output of an admitted connection does not change.
+  The HTTP monitor output and the system request reply use the same
+  `ConnInfo`.
+- A config reload authenticates an admitted connection again with the cached
+  verdict, and it sets no marker.
+
+Code and tests:
+
+- `server/auth_verification_pending.go`: `markVerificationPending` and
+  `clearVerificationPending`. Hooks: `server/auth.go` (the mark before
+  `registerJWTUser`), `server/auth_verification.go`
+  (`authVerifyConnection`), `server/auth_grant.go` (`authGrantConnection`),
+  `server/client.go` (the field `verificationPending`), and
+  `server/monitor.go` (the `ConnInfo` field and the open loop of `Connz`).
+- `server/auth_verification_pending_test.go`:
+  `TestAuthVerifyConnzVerificationPending` (a verification service holds its
+  verdict; `Connz` through the server call, with and without the account
+  filter, and through the system request shows the marker; after an admit,
+  the marker is absent, also in the raw JSON and after an authentication
+  again as at a config reload; after a reject, the connection leaves the open
+  list) and `TestAuthGrantConnzVerificationPending` (a grant hook holds its
+  verdict, for a client and a leaf, with an admit and a reject).
+
+```sh
+go test -race ./server -run 'ConnzVerificationPending' -count=1
 ```

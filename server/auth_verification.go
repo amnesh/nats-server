@@ -85,7 +85,11 @@ func (s *Server) authVerifyConnection(c *client, juc *jwt.UserClaims, acc *Accou
 		}
 		return true, _EMPTY_
 	}
-	return s.processAuthVerification(c, juc, acc, ujwt)
+	ok, reason := s.processAuthVerification(c, juc, acc, ujwt)
+	if ok {
+		c.clearVerificationPending()
+	}
+	return ok, reason
 }
 
 // cacheAuthVerify records the admit verdict for c so a later reload re-auth can

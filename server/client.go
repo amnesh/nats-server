@@ -351,6 +351,8 @@ type client struct {
 	authVerify    *authVerifyState
 	authGrant     *authGrantState
 	authGrantMode atomic.Bool
+	// Waits for its verification verdict, see auth_verification_pending.go.
+	verificationPending bool
 }
 
 type rrTracking struct {

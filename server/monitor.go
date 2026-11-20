@@ -149,6 +149,9 @@ type ConnInfo struct {
 	Tags           jwt.TagList    `json:"tags,omitempty"`
 	MQTTClient     string         `json:"mqtt_client,omitempty"` // This is the MQTT client id
 	Proxy          *ProxyInfo     `json:"proxy,omitempty"`
+	// Fork: the connection waits for the verdict of auth verification or of
+	// the grant hook. It is not admitted yet, and the server can reject it.
+	VerificationPending bool `json:"verification_pending,omitempty"`
 
 	// Internal
 	rtt int64 // For fast sorting
@@ -457,6 +460,7 @@ func (s *Server) Connz(opts *ConnzOptions) (*Connz, error) {
 		client.mu.Lock()
 		ci := &conns[i]
 		ci.fill(client, client.nc, c.Now, auth)
+		ci.VerificationPending = client.verificationPending
 		// Fill in subscription data if requested.
 		if len(client.subs) > 0 {
 			if subsDet {
