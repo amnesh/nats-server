@@ -26,12 +26,12 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 9 | Subject-only rollup | `feature_flags { js_subject_rollup_only: true }` | `server/jetstream_subject_rollup*_test.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/stream.go`, `server/jetstream_batching.go` |
 | 10 | Native inbox capture policy | `feature_flags { js_reject_inbox_capture: true }` | `server/jetstream_inbox_capture*.go` | `server/feature_flags.go`, `server/jetstream.go`, `server/client.go`, `server/events.go`, `server/leafnode.go`, `server/jetstream_api.go`, `server/jetstream_cluster.go`, `server/stream.go`, `server/stream_backup.go` |
 | 11 | Leaf removal during the initial interest window (upstream defect correction) | always on | `server/leafnode_tsub_test.go` | `server/leafnode.go` |
-| 12 | Grant reject codes, and no leaf CONNECT with a revoked JWT | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf check is always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
+| 12 | Grant reject codes, no leaf CONNECT with a revoked JWT, and a long leaf delay for a disabled account | a reject code from the grant hook, `DisconnectClient`, or the static callout `code`; the leaf checks are always on | `server/auth_reject_codes.go`, `server/leafnode_revoked.go`, `server/leafnode_account_disabled.go` | `server/authverify/grant.go`, `server/authverify/req.go`, `server/auth.go`, `server/auth_grant.go`, `server/auth_verification.go`, `server/client.go`, `server/monitor.go`, `server/websocket.go`, `server/leafnode.go` |
 | 13 | MQTT request header block (upstream defect correction) | always on | `server/mqtt_soo_store_header_test.go` | `server/mqtt.go` |
 | 14 | Source and mirror request after a leaf link connects (upstream defect correction) | always on | `server/jetstream_leafnode_late_link_test.go` | `server/stream.go` |
 | 15 | `Server.RefreshClientTraceLevel` (trace flag of open connections) | programmatic | `server/client_trace_refresh.go` | `server/reload.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf revoked-credential check. Section 15 documents an API for a host that changes the logger at run time.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf checks for a revoked JWT and a disabled account. Section 15 documents an API for a host that changes the logger at run time.
 
 ---
 
@@ -1376,8 +1376,9 @@ Adding a macro for another resource is a one-line addition to `permMacros`
   they are called. These changes are always on: the verified JWT identity rule of
   section 2.5 (operator mode, when a JWT connection also sends CONNECT `nkey`
   or `user`; it changes reported identity and log labels), the upstream
-  defect corrections of sections 11, 13, and 14, and the leaf
-  revoked-credential check of section 12.1. Otherwise an
+  defect corrections of sections 11, 13, and 14, the leaf
+  revoked-credential check of section 12.1, and the leaf delay for a disabled
+  account of section 12.3. Otherwise an
   unconfigured server behaves like upstream.
 - Features 1, 2 and 4 keep their logic in dedicated files (`server/authverify/`,
   `server/soo-changes.go`, `server/auth_xpermissions.go`, and
@@ -1676,11 +1677,13 @@ appended. The grant hook (`GrantVerdict.Code`), the static callout, and
 | `CodeRetry` | 2 | `Authorization Temporarily Unavailable` | `AuthorizationUnavailable` | none | `AuthorizationUnavailable` |
 | `CodeQuarantined` | 3 | `Account Quarantined` | `AccountQuarantined` | none | `AccountQuarantined` |
 | `CodeRevoked` | 4 | `User Authentication Revoked` | `Revocation` | `User Authentication Revoked` | `Revocation` |
+| `CodeAccountDisabled` | 5 | `Authorization Violation - Account Disabled` | `AccountDisabled` | `Authorization Violation - Account Disabled` | `AccountDisabled` |
 
-The new close states `AuthorizationUnavailable` and `AccountQuarantined` come
-after `ResourceLimit`. Their strings are `Authorization Unavailable` and
-`Account Quarantined`. A WebSocket close uses status 1008 (policy violation)
-for both, as for `Revocation`. An admission rejection sends the `$SYS` auth
+The new close states `AuthorizationUnavailable`, `AccountQuarantined`, and
+`AccountDisabled` come after `ResourceLimit`. Their strings are
+`Authorization Unavailable`, `Account Quarantined`, and `Account Disabled`. A
+WebSocket close uses status 1008 (policy violation) for them, as for
+`Revocation`. An admission rejection sends the `$SYS` auth
 error events (`$SYS.SERVER.<id>.CLIENT.AUTH.ERR`, and
 `$SYS.ACCOUNT.CLIENT.AUTH.ERR` in the account) with the close state string as
 the reason. The planned close sends the normal disconnect event with the
@@ -1698,8 +1701,14 @@ Client behavior with nats.go v1.53.1:
 - nats.go classifies `User Authentication Revoked` as `ErrAuthRevoked`. It
   stops after the second equal rejection on one server, unless the client sets
   `IgnoreAuthErrorAbort`.
+- nats.go classifies `Authorization Violation - Account Disabled` as
+  `ErrAuthorization`, because the text starts with `Authorization Violation`
+  (also v1.54.0). It stops after the second equal rejection on one server.
+  After a planned close it gets the error while connected, reconnects one
+  time, and stops at the next rejection.
 - A leaf remote reconnects after `LeafNode.ReconnectInterval` for every code,
-  but it does not send CONNECT again with a revoked JWT (section 12.1).
+  but it does not send CONNECT again with a revoked JWT (section 12.1), and
+  it waits 30 s after `CodeAccountDisabled` (section 12.3).
 
 Only `CodeRevoked` sends the revoked text at admission. A JWT that the account
 JWT revokes (upstream `checkUserRevoked`) still gets `Authorization Violation`
@@ -1745,6 +1754,8 @@ again after each reconnect interval.
 - `server/leafnode_revoked.go` holds the digest check. Hooks in
   `server/leafnode.go`: the `leaf` and `leafNodeCfg` fields, `sendLeafConnect`,
   `leafProcessErr`, and `leafNodeResumeConnectProcess`.
+- `server/leafnode_account_disabled.go` holds the delay of section 12.3. Hook
+  in `server/leafnode.go`: `leafProcessErr`.
 - `server/auth_grant_transport_test.go` covers both wire paths, the nats.go
   client retry and stop, and the leaf retry. `server/auth_verification_test.go`
   (`TestAuthVerifyCalloutRejectCodes`) covers the static `code` and the `$SYS`
@@ -1752,10 +1763,47 @@ again after each reconnect interval.
   both revocation moments: the hub gets no authentication attempt with the
   revoked JWT over three check periods while the remote keeps dialing, and a
   reissued JWT for the same user key connects at the next check.
+  `server/auth_reject_account_disabled_test.go` covers section 12.3.
 
 ```sh
 go test -race -run 'AuthGrant(Reject|Disconnect|Client|Connected|Leaf)|AuthVerifyCallout|LeafRemoteRevoked' ./server ./server/authverify -count=1
 ```
+
+## 12.3 Account disabled
+
+`CodeAccountDisabled` (value 5) is for an account that the host disables for
+some time and enables again later. `CodeDenied` does not fit: a leaf remote
+sends CONNECT again at each reconnect interval (1 s by default) with no end.
+`CodeRevoked` does not fit: a leaf remote never sends CONNECT again with that
+JWT, so it does not come back.
+
+- The wire text is `Authorization Violation - Account Disabled`, at
+  admission and at a planned close. The close state is `AccountDisabled`
+  (`Account Disabled`).
+- A client stops after the second equal error, as for `CodeDenied`.
+- A soliciting leaf that gets the text, at CONNECT or at a planned close, sets
+  the connect delay of its remote to `leafAccountDisabledDelay` (30 s), in the
+  form of the other delays of `leafProcessErr`. After the delay, it sends
+  CONNECT again with the same credentials. When the host admits the account
+  again, the leaf connects at its next attempt, with no restart and no JWT
+  change. Thus a leaf comes back about 30 s after the host enables the
+  account at the latest, and a disabled account costs one CONNECT for each 30 s for each
+  remote. The test-only `LeafNode.connDelay` option replaces the delay.
+- A peer that does not know the code still sees an authorization violation.
+  A server without the code treats value 5 from the static callout as
+  `CodeDenied`. A client or a leaf server without the text reads it as
+  `Authorization Violation`; such a leaf retries at each reconnect interval,
+  as for `CodeDenied`.
+
+Tests: rows in `TestAuthGrantRejectWire`, `TestAuthGrantDisconnectWire`, and
+`TestAuthVerifyCalloutRejectCodes` check the wire text and the close state.
+`TestAuthGrantClientAccountDisabledCodeStops` checks that a nats.go client
+gets `ErrAuthorization` and stops, at CONNECT and after a planned close.
+`TestAuthGrantLeafAccountDisabledWaitsAndReconnects` lowers the delay to
+500 ms. At CONNECT and after a planned close, each next attempt of the leaf
+comes at least 500 ms after the previous one, and the leaf connects again with
+the same JWT when the hook admits it. A control with `CodeDenied` retries
+three times in less than 500 ms.
 
 
 # 13. MQTT request header block

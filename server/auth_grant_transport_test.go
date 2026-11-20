@@ -151,6 +151,7 @@ func TestAuthGrantRejectWire(t *testing.T) {
 		{"retry", authverify.CodeRetry, "-ERR 'Authorization Temporarily Unavailable'\r\n", AuthorizationUnavailable},
 		{"quarantined", authverify.CodeQuarantined, "-ERR 'Account Quarantined'\r\n", AccountQuarantined},
 		{"revoked", authverify.CodeRevoked, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"account disabled", authverify.CodeAccountDisabled, "-ERR 'Authorization Violation - Account Disabled'\r\n", AccountDisabled},
 		{"unknown", authverify.RejectCode(99), "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 		{"negative", authverify.RejectCode(-1), "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 	} {
@@ -191,6 +192,7 @@ func TestAuthGrantDisconnectWire(t *testing.T) {
 		{"retry", authverify.CodeRetry, "", AuthorizationUnavailable},
 		{"quarantined", authverify.CodeQuarantined, "", AccountQuarantined},
 		{"revoked", authverify.CodeRevoked, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"account disabled", authverify.CodeAccountDisabled, "-ERR 'Authorization Violation - Account Disabled'\r\n", AccountDisabled},
 		{"unknown", authverify.RejectCode(99), "-ERR 'Authorization Violation'\r\n", GrantRejected},
 	} {
 		t.Run(test.name, func(t *testing.T) {

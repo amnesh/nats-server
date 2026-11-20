@@ -365,6 +365,7 @@ func TestAuthVerifyCalloutRejectCodes(t *testing.T) {
 		{"retry", `"reject":true,"code":2`, "-ERR 'Authorization Temporarily Unavailable'\r\n", AuthorizationUnavailable},
 		{"quarantined", `"reject":true,"code":3`, "-ERR 'Account Quarantined'\r\n", AccountQuarantined},
 		{"revoked", `"reject":true,"code":4`, "-ERR 'User Authentication Revoked'\r\n", Revocation},
+		{"account disabled", `"reject":true,"code":5`, "-ERR 'Authorization Violation - Account Disabled'\r\n", AccountDisabled},
 		{"unknown", `"reject":true,"code":99`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 		{"negative", `"reject":true,"code":-1`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},
 		{"malformed", `"reject":true,"code":"4"`, "-ERR 'Authorization Violation'\r\n", AuthenticationViolation},

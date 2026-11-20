@@ -230,6 +230,7 @@ const (
 	ResourceLimit
 	AuthorizationUnavailable
 	AccountQuarantined
+	AccountDisabled
 )
 
 // Some flags passed to processMsgResults

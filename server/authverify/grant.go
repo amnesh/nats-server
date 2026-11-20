@@ -31,6 +31,11 @@ const (
 	CodeQuarantined
 	// CodeRevoked rejects a revoked credential.
 	CodeRevoked
+	// CodeAccountDisabled rejects a connection of an account that the host
+	// disabled for some time. A client stops after the second equal error. A
+	// leaf remote waits a long delay before each next connect, and it connects
+	// again when the host admits the account again.
+	CodeAccountDisabled
 )
 
 // GrantRequest describes a verified connection in a grant-mode account.

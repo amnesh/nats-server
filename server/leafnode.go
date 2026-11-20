@@ -3720,6 +3720,7 @@ func (c *client) leafProcessErr(errStr string) {
 		return
 	}
 	c.leafProcessRevokedErr(errStr)
+	c.leafProcessAccountDisabledErr(errStr)
 
 	// We will look for Loop detected error coming from the other side.
 	// If we solicit, set the connect delay.

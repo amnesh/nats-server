@@ -2724,6 +2724,8 @@ func (reason ClosedState) String() string {
 		return "Authorization Unavailable"
 	case AccountQuarantined:
 		return "Account Quarantined"
+	case AccountDisabled:
+		return "Account Disabled"
 	}
 
 	return "Unknown State"

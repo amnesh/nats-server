@@ -23,18 +23,21 @@ import (
 // "authorization violation", "user authentication revoked", or one of the
 // expired texts as an authentication error and stops reconnecting after the
 // same error twice on one server. It only retries for the retry and
-// quarantine texts.
+// quarantine texts. The account disabled text starts with the denied text, so
+// a client or a peer that does not know it sees an authorization violation.
 const (
-	authRejectDeniedText      = "Authorization Violation"
-	authRejectRetryText       = "Authorization Temporarily Unavailable"
-	authRejectQuarantinedText = "Account Quarantined"
-	authRejectRevokedText     = "User Authentication Revoked"
+	authRejectDeniedText          = "Authorization Violation"
+	authRejectRetryText           = "Authorization Temporarily Unavailable"
+	authRejectQuarantinedText     = "Account Quarantined"
+	authRejectRevokedText         = "User Authentication Revoked"
+	authRejectAccountDisabledText = authRejectDeniedText + " - Account Disabled"
 )
 
 var (
 	errAuthGrantRetry       = errors.New("auth grant retry")
 	errAuthGrantQuarantined = errors.New("auth grant quarantined")
 	errAuthGrantRevoked     = errors.New("auth grant revoked")
+	errAuthGrantDisabled    = errors.New("auth grant account disabled")
 )
 
 // authRejectCodeError returns the authentication error of a reject code from
@@ -50,6 +53,8 @@ func authRejectCodeError(code authverify.RejectCode) error {
 		return errAuthGrantQuarantined
 	case authverify.CodeRevoked:
 		return errAuthGrantRevoked
+	case authverify.CodeAccountDisabled:
+		return errAuthGrantDisabled
 	default:
 		return nil
 	}
@@ -66,6 +71,8 @@ func authRejectClosedState(err error) (ClosedState, bool) {
 		return AccountQuarantined, true
 	case errAuthGrantRevoked:
 		return Revocation, true
+	case errAuthGrantDisabled:
+		return AccountDisabled, true
 	default:
 		return 0, false
 	}
@@ -83,6 +90,8 @@ func authRejectWireText(reason ClosedState) string {
 		return authRejectQuarantinedText
 	case Revocation:
 		return authRejectRevokedText
+	case AccountDisabled:
+		return authRejectAccountDisabledText
 	default:
 		return authRejectDeniedText
 	}
@@ -102,6 +111,8 @@ func authRejectDisconnect(code authverify.RejectCode) (ClosedState, string) {
 		return AccountQuarantined, _EMPTY_
 	case authverify.CodeRevoked:
 		return Revocation, authRejectRevokedText
+	case authverify.CodeAccountDisabled:
+		return AccountDisabled, authRejectAccountDisabledText
 	default:
 		return GrantRejected, authRejectDeniedText
 	}

@@ -759,7 +759,7 @@ func (c *client) wsEnqueueCloseMessage(reason ClosedState) {
 		status = wsCloseStatusNormalClosure
 	case AuthenticationTimeout, AuthenticationViolation, SlowConsumerPendingBytes, SlowConsumerWriteDeadline,
 		MaxAccountConnectionsExceeded, MaxConnectionsExceeded, MaxControlLineExceeded, MaxSubscriptionsExceeded,
-		MissingAccount, AuthenticationExpired, Revocation, AuthorizationUnavailable, AccountQuarantined:
+		MissingAccount, AuthenticationExpired, Revocation, AuthorizationUnavailable, AccountQuarantined, AccountDisabled:
 		status = wsCloseStatusPolicyViolation
 	case TLSHandshakeError:
 		status = wsCloseStatusTLSHandshake
