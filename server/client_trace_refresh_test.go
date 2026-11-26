@@ -95,14 +95,22 @@ func TestRefreshClientTraceLevel(t *testing.T) {
 
 // The setup of a leaf link, a route, or a gateway connection writes the
 // temporary client map while a host calls RefreshClientTraceLevel. The
-// refresh must read that map with its lock. Run this test with -race.
+// refresh must read that map with its lock, and it must set the trace flag
+// of each temporary client. Run this test with -race.
 func TestRefreshClientTraceLevelWithTempClients(t *testing.T) {
 	opts := DefaultOptions()
 	opts.NoLog = true
 	s := RunServer(opts)
 	defer s.Shutdown()
+	s.SetLoggerV2(&traceLineLogger{}, false, true, false)
 
-	const firstID, numIDs, rounds = uint64(1_000_000), 8, 200
+	const keptID, firstID, numIDs, rounds = uint64(999_999), uint64(1_000_000), 8, 200
+	// This client stays in the temporary map through each refresh.
+	kept := &client{srv: s, kind: LEAF}
+	if !s.addToTempClients(keptID, kept) {
+		t.Fatalf("the server did not add the kept temporary client")
+	}
+	defer s.removeFromTempClients(keptID)
 	clients := make([]*client, numIDs)
 	for i := range clients {
 		// setTraceLevel reads c.srv.
@@ -129,4 +137,11 @@ func TestRefreshClientTraceLevelWithTempClients(t *testing.T) {
 		s.RefreshClientTraceLevel()
 	}
 	wg.Wait()
+
+	kept.mu.Lock()
+	trace := kept.trace
+	kept.mu.Unlock()
+	if !trace {
+		t.Fatalf("the refresh did not set the trace flag of a temporary client")
+	}
 }
