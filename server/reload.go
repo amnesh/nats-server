@@ -2217,8 +2217,12 @@ func (s *Server) setClientsTraceLevel() {
 	// Create a list of all clients.
 	// Update their trace level when not holding server or gateway lock
 
+	// Fork: grTmpClients changes with only s.grMu held, so read it with
+	// s.grMu. The order is s.mu, then s.grMu, as in Shutdown.
 	s.mu.Lock()
+	s.grMu.Lock()
 	clientCnt := 1 + len(s.clients) + len(s.grTmpClients) + s.numRoutes() + len(s.leafs)
+	s.grMu.Unlock()
 	s.mu.Unlock()
 
 	s.gateway.RLock()
@@ -2232,12 +2236,17 @@ func (s *Server) setClientsTraceLevel() {
 		clients = append(clients, s.sys.client)
 	}
 
-	cMaps := []map[uint64]*client{s.clients, s.grTmpClients, s.leafs}
+	cMaps := []map[uint64]*client{s.clients, s.leafs}
 	for _, m := range cMaps {
 		for _, c := range m {
 			clients = append(clients, c)
 		}
 	}
+	s.grMu.Lock()
+	for _, c := range s.grTmpClients {
+		clients = append(clients, c)
+	}
+	s.grMu.Unlock()
 	s.forEachRoute(func(c *client) {
 		clients = append(clients, c)
 	})
