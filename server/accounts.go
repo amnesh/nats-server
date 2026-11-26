@@ -2244,6 +2244,9 @@ func (a *Account) unsubscribeInternal(sub *subscription) {
 	// removeAllServiceImportSubs can replace a.ic and close the old client,
 	// which keeps its subscriptions in the account sublist. Do not read a.ic
 	// and make no new client.
+	if sub == nil {
+		return
+	}
 	if c := sub.client; c != nil {
 		c.processUnsub(sub.sid)
 	}

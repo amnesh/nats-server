@@ -23,8 +23,8 @@ import (
 // removeAllServiceImportSubs clears the internal client of the account. Two
 // goroutines then remove their internal subscriptions at the same time, as
 // two deferred unsubscribeInternal calls do after a cleanup of the account.
-// Each must read the internal client with the account lock. Run this test
-// with -race.
+// Each must unsubscribe through the client that the subscription records,
+// and must not read a.ic. Run this test with -race.
 func TestUnsubscribeInternalAfterAccountClear(t *testing.T) {
 	s := RunServer(DefaultOptions())
 	defer s.Shutdown()
@@ -85,6 +85,7 @@ func TestUnsubscribeInternalAfterAccountClearRemovesInterest(t *testing.T) {
 	for _, sub := range subs {
 		acc.unsubscribeInternal(sub)
 	}
+	acc.unsubscribeInternal(nil) // A nil subscription must not panic.
 
 	for _, subject := range subjects {
 		if r := acc.sl.Match(subject); len(r.psubs)+len(r.qsubs) != 0 {
