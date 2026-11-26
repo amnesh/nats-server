@@ -31,9 +31,9 @@ upstream NATS Server so that developers can use, operate, and maintain them.
 | 14 | Source and mirror request after a leaf link connects (upstream defect correction) | always on | `server/jetstream_leafnode_late_link_test.go` | `server/stream.go` |
 | 15 | `Server.RefreshClientTraceLevel` (trace flag of open connections) | programmatic | `server/client_trace_refresh.go` | `server/reload.go` |
 | 16 | `Connz` marker for a connection that waits for its verification verdict | with auth verification (feature 1) or grant mode (feature 8) | `server/auth_verification_pending.go` | `server/auth.go`, `server/auth_verification.go`, `server/auth_grant.go`, `server/client.go`, `server/monitor.go` |
-| 17 | Internal account client read with the account lock (upstream defect correction) | always on | `server/account_internal_client_test.go` | `server/accounts.go` |
+| 17 | Internal unsubscribe through the client that holds the subscription (upstream defect correction) | always on | `server/account_internal_client_test.go` | `server/accounts.go` |
 
-Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf checks for a revoked JWT and a disabled account. Section 15 documents an API for a host that changes the logger at run time. Section 16 documents the `Connz` marker of a connection that waits for its verification verdict. Section 17 records a correction of an upstream data race.
+Features 1, 2, 4 and 5 are documented in full below. Feature 3 is summarized in between. Features 6 and 7 are documented after feature 5. Grant mode is documented in section 8. Sections 11, 13, and 14 record corrections of upstream defects. Section 12 documents the reject codes and the leaf checks for a revoked JWT and a disabled account. Section 15 documents an API for a host that changes the logger at run time. Section 16 documents the `Connz` marker of a connection that waits for its verification verdict. Section 17 records a correction of an upstream data race and of a subscription that stayed after an unsubscribe.
 
 ---
 
@@ -2112,25 +2112,32 @@ go test -race ./server -run 'ConnzVerificationPending' -count=1
 ```
 
 
-# 17. Internal account client read with the account lock (upstream defect correction)
+# 17. Internal unsubscribe through the client that holds the subscription (upstream defect correction)
 
 `Account.unsubscribeInternal` removes an internal subscription of an
 account. It called `internalClient()` with no lock. That function reads
 `a.ic` and, when it is nil, makes a new client and writes `a.ic`. Its
 comment says that the caller holds the account lock.
-`removeAllServiceImportSubs` sets `a.ic` to nil with the account lock and
-closes the old client, which removes each subscription of that client.
-After this clear, two goroutines that remove their subscriptions at the
-same time both read `a.ic` and both write a new client. This is a data
-race on `a.ic`. The race detector found it for two deferred
-`unsubscribeInternal` calls of `tryDeleteSourcingConsumer` after the
-removal of an account.
+`removeAllServiceImportSubs` sets `a.ic` to nil with the account lock,
+removes the service import subscriptions, and closes the old client. A
+closed `ACCOUNT` client does not clear its other subscriptions
+(`closeConnection` runs `clearAccountSubs` only for `CLIENT`, `LEAF`, and
+`JETSTREAM`), so they stay in the account sublist with their callbacks.
+After this clear, upstream had two defects:
 
-The rule: `unsubscribeInternal` reads `a.ic` only while it holds the
-account lock (`a.mu.RLock`). It releases the lock before `processUnsub`,
-as `subscribeInternalEx` does. It makes no new client: when `a.ic` is nil,
-the account was cleared, and the subscriptions went with the closed
-client. The callers (`server/auth_callout.go`,
+- Two goroutines that remove their subscriptions at the same time both
+  read `a.ic` and both write a new client. This is a data race on `a.ic`.
+  The race detector found it for two deferred `unsubscribeInternal` calls
+  of `tryDeleteSourcingConsumer` after the removal of an account.
+- The unsubscribe went to the new client, which does not hold the
+  subscription. The subscription stayed in the account sublist, and its
+  callback still got messages.
+
+The rule: `unsubscribeInternal` unsubscribes through the client that the
+subscription records (`sub.client`, set when the subscription is made). It
+does not read `a.ic` and makes no new client. The old client keeps the
+subscription in its `subs` map after the close, so `processUnsub` removes
+it from the account sublist. The callers (`server/auth_callout.go`,
 `server/auth_verification.go`, and `server/stream.go`) hold no account
 lock when they call it.
 
@@ -2145,6 +2152,11 @@ Code and tests:
   then removes the two subscriptions from two goroutines after one start
   signal. Before the change, the race detector reports a data race that
   names `internalClient`. Run it with `-race`.
+  `TestUnsubscribeInternalAfterAccountClearRemovesInterest` makes two
+  internal subscriptions, clears the account, and removes them. The
+  account sublist has no interest in the two subjects, the account has no
+  new internal client, and a publish to the two subjects calls no
+  callback (a barrier message comes after them on the same send loop).
 
 ```sh
 go test -race ./server -run 'TestUnsubscribeInternalAfterAccountClear' -count=1

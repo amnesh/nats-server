@@ -2240,13 +2240,12 @@ func (a *Account) subscribeInternal(subject string, cb msgHandler) (*subscriptio
 
 // Unsubscribe from an internal account subscription.
 func (a *Account) unsubscribeInternal(sub *subscription) {
-	// Fork: read the internal client with the account lock. Make no new
-	// client: a cleared account closed the client of the subscription.
-	a.mu.RLock()
-	ic := a.ic
-	a.mu.RUnlock()
-	if ic != nil {
-		ic.processUnsub(sub.sid)
+	// Fork: unsubscribe through the client that holds the subscription.
+	// removeAllServiceImportSubs can replace a.ic and close the old client,
+	// which keeps its subscriptions in the account sublist. Do not read a.ic
+	// and make no new client.
+	if c := sub.client; c != nil {
+		c.processUnsub(sub.sid)
 	}
 }
 
