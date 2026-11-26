@@ -92,3 +92,41 @@ func TestRefreshClientTraceLevel(t *testing.T) {
 	}
 	s.mu.RUnlock()
 }
+
+// The setup of a leaf link, a route, or a gateway connection writes the
+// temporary client map while a host calls RefreshClientTraceLevel. The
+// refresh must read that map with its lock. Run this test with -race.
+func TestRefreshClientTraceLevelWithTempClients(t *testing.T) {
+	opts := DefaultOptions()
+	opts.NoLog = true
+	s := RunServer(opts)
+	defer s.Shutdown()
+
+	const firstID, numIDs, rounds = uint64(1_000_000), 8, 200
+	clients := make([]*client, numIDs)
+	for i := range clients {
+		// setTraceLevel reads c.srv.
+		clients[i] = &client{srv: s, kind: LEAF}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range rounds {
+			for i, c := range clients {
+				if !s.addToTempClients(firstID+uint64(i), c) {
+					t.Errorf("the server did not add temporary client %d", i)
+					return
+				}
+			}
+			for i := range clients {
+				s.removeFromTempClients(firstID + uint64(i))
+			}
+		}
+	}()
+	for range rounds {
+		s.RefreshClientTraceLevel()
+	}
+	wg.Wait()
+}

@@ -2019,17 +2019,31 @@ func (s *Server) RefreshClientTraceLevel()
   maps when the flag changes can keep the old flag, as after a reload.
 - It locks the server and each connection. Do not call it from a logger
   method or from another server callback.
+- It reads the temporary client map `grTmpClients` only while it holds
+  `s.grMu`, in the order `s.mu`, then `s.grMu`, as `Shutdown` does. The
+  setup of a leaf link, a route, or a gateway connection writes this map
+  with only `s.grMu` (`addToTempClients`, `removeFromTempClients`). Tag
+  `v2.15.3-amnesh.7` read the map without `s.grMu`. This was a data race,
+  and a concurrent map write could stop the process. The config reload
+  (`reloadClientTraceLevel`) uses the same function, so the repair also
+  applies to it. Upstream `v2.15.2` has the same reads without the lock in
+  its reload.
 
 Code and tests:
 
 - `server/client_trace_refresh.go`: `Server.RefreshClientTraceLevel`.
   `server/reload.go`: the body of `reloadClientTraceLevel` after its
-  `NoLog` check is now `setClientsTraceLevel`, which both use.
+  `NoLog` check is now `setClientsTraceLevel`, which both use. It holds
+  `s.grMu` for the length of `grTmpClients` and for the copy of its
+  clients.
 - `server/client_trace_refresh_test.go`: `TestRefreshClientTraceLevel`
   runs a server with `NoLog` and a logger from `SetLoggerV2`. With trace on
   and no refresh, the open connection gives no trace line. After the
   refresh, it gives one. After trace off and the refresh, it gives none,
-  and its cached flag is off.
+  and its cached flag is off. `TestRefreshClientTraceLevelWithTempClients`
+  adds and removes temporary clients in one goroutine while the test calls
+  `RefreshClientTraceLevel`. Without `s.grMu` in `setClientsTraceLevel`,
+  the race detector reports a data race. Run it with `-race`.
 
 ```sh
 go test -race ./server -run 'TestRefreshClientTraceLevel' -count=1
